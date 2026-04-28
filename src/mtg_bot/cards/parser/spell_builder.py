@@ -40,14 +40,20 @@ from __future__ import annotations
 import re
 
 from mtg_bot.cards.base import (
+    BiosynthicBurstEffect,
     CardPrinting,
     ConditionalIfVoid,
     CostReduction,
     CutPropulsionEffect,
     DealDamageAnyTarget,
+    DealDamageToTargetCreatureSpacecraftBoosted,
+    DepressurizeEffect,
+    DiplomaticRelationsEffect,
     Effect,
+    FocusFireEffect,
     ModalChooseOne,
     MutinousMassacreEffect,
+    PumpCreaturesYouControlUntilEOT,
     PumpTargetCreatureUntilEOT,
     Sequence,
     SingularityRuptureEffect,
@@ -378,6 +384,76 @@ _WHOLE_SPELL_EXACT_TEXT: dict[str, Effect] = {
         "Destroy all creatures, then any number of target players "
         "each mill half their library, rounded down."
     ): SingularityRuptureEffect(),
+    # Depressurize: -3/-0 UEOT + state-based death check ("if power is 0
+    # or less, destroy it"). The engine class folds the pump and the
+    # conditional destroy into one resolve step, so the parser maps the
+    # full two-sentence text to the single bespoke class.
+    (
+        "Target creature gets -3/-0 until end of turn. "
+        "Then if that creature's power is 0 or less, destroy it."
+    ): DepressurizeEffect(power_penalty=3),
+    # Focus Fire: variable-X burn whose X reads "2 plus the number of
+    # creatures and/or Spacecraft you control". The bespoke engine
+    # class computes X at resolve time; the parser dispatches on the
+    # printed surface form.
+    (
+        "Focus Fire deals X damage to target attacking or blocking "
+        "creature, where X is 2 plus the number of creatures and/or "
+        "Spacecraft you control."
+    ): FocusFireEffect(base=2),
+    # Diplomatic Relations: pump-and-grant-vigilance on your creature
+    # plus a fight-shaped damage rider where the chosen first target
+    # deals damage equal to its (post-pump) power to a chosen second
+    # target an opponent controls. Two-target spell — the bespoke
+    # class threads both targets through one resolve step.
+    (
+        "Target creature you control gets +1/+0 and gains vigilance "
+        "until end of turn. It deals damage equal to its power to "
+        "target creature an opponent controls."
+    ): DiplomaticRelationsEffect(),
+    # Biosynthic Burst: counter + grant-three-keywords + untap on a
+    # creature you control. The static class wires the +1/+1 counter,
+    # the reach/trample/indestructible UEOT grant, and the untap into
+    # one resolve.
+    (
+        "Put a +1/+1 counter on target creature you control. "
+        "It gains reach, trample, and indestructible until end of "
+        "turn. Untap it."
+    ): BiosynthicBurstEffect(),
+    # Zealous Display: anthem + opp-turn-untap rider. The
+    # ``also_untap_if_not_your_turn`` flag on the engine class fires
+    # only when the spell resolves on an opponent's turn, untapping
+    # every creature that received the pump.
+    (
+        "Creatures you control get +2/+0 until end of turn. "
+        "If it's not your turn, untap those creatures."
+    ): PumpCreaturesYouControlUntilEOT(
+        power_bonus=2,
+        toughness_bonus=0,
+        also_untap_if_not_your_turn=True,
+    ),
+    # Dual-Sun Technique: grant double strike + conditional draw rider
+    # ("If it has a +1/+1 counter on it, draw a card"). The engine
+    # class's ``draw_if_target_has_plus_one_counter`` field captures
+    # the rider; the keyword grant rides the standard pump path.
+    (
+        "Target creature you control gains double strike until end of "
+        "turn. If it has a +1/+1 counter on it, draw a card."
+    ): PumpTargetCreatureUntilEOT(
+        power_bonus=0,
+        toughness_bonus=0,
+        granted_keywords=frozenset({"double strike"}),
+        you_control_only=True,
+        draw_if_target_has_plus_one_counter=1,
+    ),
+    # Invasive Maneuvers: bare burn with a Spacecraft-state boost
+    # ("It deals 5 damage instead if you control a Spacecraft").
+    # The bespoke class picks ``base`` vs ``boosted`` by inspecting
+    # the controller's battlefield at resolve time.
+    (
+        "Invasive Maneuvers deals 3 damage to target creature. "
+        "It deals 5 damage instead if you control a Spacecraft."
+    ): DealDamageToTargetCreatureSpacecraftBoosted(base=3, boosted=5),
 }
 
 
