@@ -55,8 +55,11 @@ from __future__ import annotations
 from mtg_bot.cards.base import (
     BiosynthicBurstEffect,
     ConditionalIfVoid,
+    CreateXTokensOfTargetPermanentWithHasteEndStepSac,
     DealDamageToTargetCreatureSpacecraftBoosted,
+    DealDamageToTargetCreatureWithExcessLanderRider,
     DepressurizeEffect,
+    DestroyTargetNonlandPermanentWithLanderForController,
     DiplomaticRelationsEffect,
     DrawCards,
     EachOpponentLosesLife,
@@ -64,8 +67,13 @@ from mtg_bot.cards.base import (
     LoseLife,
     PumpCreaturesYouControlUntilEOT,
     PumpTargetCreatureUntilEOT,
+    ReturnTargetCreatureToOwnersHand,
+    ReturnUpToNSmallCreaturesFromGraveyardWithCounters,
+    SeedshipImpactEffect,
     Sequence,
     Surveil,
+    SystemsOverrideEffect,
+    ZeroPointBalladEffect,
 )
 from mtg_bot.cards.parser.spell_builder import (
     _parse_spell_oracle_text,
@@ -371,6 +379,159 @@ def test_dispatch_hymn_of_the_faller_returns_sequence_with_void_rider():
             else_effect=None,
         ),
     ))
+
+
+def test_desculpting_blast_claimed_by_parser():
+    # Desculpting Blast ``{1}{U}`` Instant — bounce-target-permanent
+    # plus a Drone-token rider for the attacking-permanent branch.
+    assert "Desculpting Blast" in _claimed_names()
+
+
+def test_emergency_eject_claimed_by_parser():
+    # Emergency Eject ``{2}{W}`` Instant — destroy + a Lander-for-
+    # the-destroyed-permanent's-controller rider.
+    assert "Emergency Eject" in _claimed_names()
+
+
+def test_orbital_plunge_claimed_by_parser():
+    # Orbital Plunge ``{3}{R}`` Sorcery — 6-damage burn + excess-
+    # damage Lander rider.
+    assert "Orbital Plunge" in _claimed_names()
+
+
+def test_seedship_impact_claimed_by_parser():
+    # Seedship Impact ``{1}{G}`` Instant — destroy artifact-or-
+    # enchantment + small-mv Lander rider.
+    assert "Seedship Impact" in _claimed_names()
+
+
+def test_scout_for_survivors_claimed_by_parser():
+    # Scout for Survivors ``{2}{W}`` Sorcery — return up to three
+    # small creature cards from graveyard to battlefield with a
+    # +1/+1 counter on each.
+    assert "Scout for Survivors" in _claimed_names()
+
+
+def test_zero_point_ballad_claimed_by_parser():
+    # Zero Point Ballad ``{X}{B}`` Sorcery — variable-X wrath +
+    # life-pay + reanimation-on-large-X rider.
+    assert "Zero Point Ballad" in _claimed_names()
+
+
+def test_systems_override_claimed_by_parser():
+    # Systems Override ``{2}{R}`` Sorcery — gain-control + untap +
+    # haste plus a Spacecraft-only ten-charge-counter rider.
+    assert "Systems Override" in _claimed_names()
+
+
+def test_devastating_onslaught_claimed_by_parser():
+    # Devastating Onslaught ``{X}{X}{R}`` Sorcery — variable-X
+    # token-copy spell with haste and end-step sac.
+    assert "Devastating Onslaught" in _claimed_names()
+
+
+def test_full_bore_claimed_by_parser():
+    # Full Bore ``{R}`` Instant — pump-your-creature with warp-
+    # conditional extra keywords (trample, haste).
+    assert "Full Bore" in _claimed_names()
+
+
+def test_dispatch_desculpting_blast_returns_engine_class():
+    eff = _try_whole_spell_exact_text(
+        "Return target nonland permanent to its owner's hand. "
+        "If it was attacking, create a 1/1 colorless Drone artifact "
+        "creature token with flying and \"This token can block only "
+        "creatures with flying.\""
+    )
+    assert eff == ReturnTargetCreatureToOwnersHand(
+        allow_nonland_permanent=True,
+        create_drone_if_was_attacking=True,
+    )
+
+
+def test_dispatch_emergency_eject_returns_engine_class():
+    eff = _try_whole_spell_exact_text(
+        "Destroy target nonland permanent. "
+        "Its controller creates a Lander token."
+    )
+    assert eff == DestroyTargetNonlandPermanentWithLanderForController()
+
+
+def test_dispatch_orbital_plunge_returns_engine_class():
+    # ``amount=6`` matches the printed damage; the bespoke class
+    # gates the Lander rider on excess damage at resolve time.
+    eff = _try_whole_spell_exact_text(
+        "Orbital Plunge deals 6 damage to target creature. "
+        "If excess damage was dealt this way, create a Lander token."
+    )
+    assert eff == DealDamageToTargetCreatureWithExcessLanderRider(amount=6)
+
+
+def test_dispatch_seedship_impact_returns_engine_class():
+    eff = _try_whole_spell_exact_text(
+        "Destroy target artifact or enchantment. "
+        "If its mana value was 2 or less, create a Lander token."
+    )
+    assert eff == SeedshipImpactEffect()
+
+
+def test_dispatch_scout_for_survivors_returns_engine_class():
+    # ``max_n=3`` and ``max_total_mv=3`` from the printed bounds.
+    eff = _try_whole_spell_exact_text(
+        "Return up to three target creature cards with total mana "
+        "value 3 or less from your graveyard to the battlefield. "
+        "Put a +1/+1 counter on each of them."
+    )
+    assert eff == ReturnUpToNSmallCreaturesFromGraveyardWithCounters(
+        max_n=3, max_total_mv=3,
+    )
+
+
+def test_dispatch_zero_point_ballad_returns_engine_class():
+    eff = _try_whole_spell_exact_text(
+        "Destroy all creatures with toughness X or less. You lose "
+        "X life. If X is 6 or more, return a creature card put into "
+        "a graveyard this way to the battlefield under your control."
+    )
+    assert eff == ZeroPointBalladEffect()
+
+
+def test_dispatch_systems_override_returns_engine_class():
+    eff = _try_whole_spell_exact_text(
+        "Gain control of target artifact or creature until end of "
+        "turn. Untap that permanent. It gains haste until end of "
+        "turn. If it's a Spacecraft, put ten charge counters on it. "
+        "If you do, remove ten charge counters from it at the "
+        "beginning of the next end step."
+    )
+    assert eff == SystemsOverrideEffect()
+
+
+def test_dispatch_devastating_onslaught_returns_engine_class():
+    eff = _try_whole_spell_exact_text(
+        "Create X tokens that are copies of target artifact or "
+        "creature you control. Those tokens gain haste until end "
+        "of turn. Sacrifice them at the beginning of the next end "
+        "step."
+    )
+    assert eff == CreateXTokensOfTargetPermanentWithHasteEndStepSac()
+
+
+def test_dispatch_full_bore_returns_engine_class():
+    # The warp-conditional grant lands on the engine class's
+    # ``granted_keywords_if_warp_cast`` field; the base pump is
+    # +3/+2 UEOT on a creature you control.
+    eff = _try_whole_spell_exact_text(
+        "Target creature you control gets +3/+2 until end of turn. "
+        "If that creature was cast for its warp cost, it also gains "
+        "trample and haste until end of turn."
+    )
+    assert eff == PumpTargetCreatureUntilEOT(
+        power_bonus=3,
+        toughness_bonus=2,
+        you_control_only=True,
+        granted_keywords_if_warp_cast=frozenset({"trample", "haste"}),
+    )
 
 
 def test_dispatch_strips_hymn_of_the_faller_reminder():

@@ -44,10 +44,13 @@ from mtg_bot.cards.base import (
     CardPrinting,
     ConditionalIfVoid,
     CostReduction,
+    CreateXTokensOfTargetPermanentWithHasteEndStepSac,
     CutPropulsionEffect,
     DealDamageAnyTarget,
     DealDamageToTargetCreatureSpacecraftBoosted,
+    DealDamageToTargetCreatureWithExcessLanderRider,
     DepressurizeEffect,
+    DestroyTargetNonlandPermanentWithLanderForController,
     DiplomaticRelationsEffect,
     DrawCards,
     EachOpponentLosesLife,
@@ -58,9 +61,14 @@ from mtg_bot.cards.base import (
     MutinousMassacreEffect,
     PumpCreaturesYouControlUntilEOT,
     PumpTargetCreatureUntilEOT,
+    ReturnTargetCreatureToOwnersHand,
+    ReturnUpToNSmallCreaturesFromGraveyardWithCounters,
+    SeedshipImpactEffect,
     Sequence,
     SingularityRuptureEffect,
     Surveil,
+    SystemsOverrideEffect,
+    ZeroPointBalladEffect,
     make_instant,
     make_sorcery,
 )
@@ -495,6 +503,94 @@ _WHOLE_SPELL_EXACT_TEXT: dict[str, Effect] = {
             else_effect=LoseLife(amount=2),
         ),
     )),
+    # Desculpting Blast: bounce-target-permanent + a Drone-token
+    # rider for the attacking-permanent branch. The bespoke engine
+    # class folds the rider into one resolve step.
+    (
+        "Return target nonland permanent to its owner's hand. "
+        "If it was attacking, create a 1/1 colorless Drone artifact "
+        "creature token with flying and \"This token can block only "
+        "creatures with flying.\""
+    ): ReturnTargetCreatureToOwnersHand(
+        allow_nonland_permanent=True,
+        create_drone_if_was_attacking=True,
+    ),
+    # Emergency Eject: destroy + Lander-for-controller rider. The
+    # Lander goes to the destroyed permanent's CONTROLLER (not the
+    # spell's caster), which the bespoke engine class threads
+    # through resolution.
+    (
+        "Destroy target nonland permanent. "
+        "Its controller creates a Lander token."
+    ): DestroyTargetNonlandPermanentWithLanderForController(),
+    # Orbital Plunge: 6-damage burn + excess-damage Lander rider.
+    # The bespoke engine class checks whether excess damage was
+    # dealt (target's toughness < 6 at resolve time) and creates
+    # the Lander only on excess.
+    (
+        "Orbital Plunge deals 6 damage to target creature. "
+        "If excess damage was dealt this way, create a Lander token."
+    ): DealDamageToTargetCreatureWithExcessLanderRider(amount=6),
+    # Seedship Impact: destroy artifact-or-enchantment + small-mv
+    # Lander rider. The bespoke engine class gates the Lander on
+    # the destroyed permanent's mana value (≤ 2).
+    (
+        "Destroy target artifact or enchantment. "
+        "If its mana value was 2 or less, create a Lander token."
+    ): SeedshipImpactEffect(),
+    # Scout for Survivors: return up to three small creature cards
+    # from graveyard to battlefield, each with a +1/+1 counter.
+    (
+        "Return up to three target creature cards with total mana "
+        "value 3 or less from your graveyard to the battlefield. "
+        "Put a +1/+1 counter on each of them."
+    ): ReturnUpToNSmallCreaturesFromGraveyardWithCounters(
+        max_n=3, max_total_mv=3,
+    ),
+    # Zero Point Ballad: variable-X wrath + life-pay + reanimation
+    # rider. The bespoke engine class folds all three into one
+    # resolve step.
+    (
+        "Destroy all creatures with toughness X or less. You lose "
+        "X life. If X is 6 or more, return a creature card put into "
+        "a graveyard this way to the battlefield under your control."
+    ): ZeroPointBalladEffect(),
+    # Systems Override: gain-control + untap + grant-haste plus a
+    # Spacecraft-only charge-counter rider. The bespoke engine
+    # class threads all four steps through one resolve, including
+    # the end-step counter-removal scheduling.
+    (
+        "Gain control of target artifact or creature until end of "
+        "turn. Untap that permanent. It gains haste until end of "
+        "turn. If it's a Spacecraft, put ten charge counters on it. "
+        "If you do, remove ten charge counters from it at the "
+        "beginning of the next end step."
+    ): SystemsOverrideEffect(),
+    # Devastating Onslaught: variable-X token-copy spell with haste
+    # and end-step sac. The X-formula sits on the spell's mana cost
+    # ({X}{X}{R}) and is resolved through the engine class at cast
+    # time.
+    (
+        "Create X tokens that are copies of target artifact or "
+        "creature you control. Those tokens gain haste until end "
+        "of turn. Sacrifice them at the beginning of the next end "
+        "step."
+    ): CreateXTokensOfTargetPermanentWithHasteEndStepSac(),
+    # Full Bore: pump-your-creature with warp-conditional extra
+    # keywords. The ``granted_keywords_if_warp_cast`` field on the
+    # generic pump engine class fires only when the target was
+    # cast for its warp cost — a generic primitive that any future
+    # warp-conditional pump spell can reuse.
+    (
+        "Target creature you control gets +3/+2 until end of turn. "
+        "If that creature was cast for its warp cost, it also gains "
+        "trample and haste until end of turn."
+    ): PumpTargetCreatureUntilEOT(
+        power_bonus=3,
+        toughness_bonus=2,
+        you_control_only=True,
+        granted_keywords_if_warp_cast=frozenset({"trample", "haste"}),
+    ),
     # Hymn of the Faller: three-clause Sequence + Void ADDS-A-DRAW
     # rider. Unlike the existing Void replacement helpers (which swap
     # one effect for another), this rider runs an additional effect
