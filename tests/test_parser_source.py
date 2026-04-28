@@ -595,11 +595,13 @@ def test_source_claims_gravpack_monoist():
 
 def test_source_skips_cards_with_unsupported_clauses():
     """A card whose oracle text uses any clause beyond what the parser
-    supports must not be claimed. Decode Transmissions has a Void rider
-    with an unsupported life-loss/each-opponent-loses-life shape, so the
-    second clause fails and the whole spell is skipped."""
+    supports must not be claimed. Consult the Star Charts has a Kicker
+    preamble (unrecognized — only Convoke is on the spell-keyword
+    preamble whitelist) AND a multi-clause body whose ``Look at the
+    top X cards`` shape isn't a primitive in the unified grammar, so
+    the whole spell is skipped."""
     source = OracleParserCardSource()
-    assert "Decode Transmissions" not in source.claimed_names
+    assert "Consult the Star Charts" not in source.claimed_names
 
 
 def test_source_get_printings_returns_only_claimed():
@@ -1547,16 +1549,23 @@ def test_build_spell_printing_handles_honor():
 def test_build_spell_printing_skips_multi_line_with_unparseable_clause():
     """A multi-line spell whose first clause is fine but second is an
     unsupported shape is skipped — the all-or-nothing rule from the
-    creature builder applies to spells too."""
+    creature builder applies to spells too. Consult the Star Charts'
+    Kicker preamble would be dropped if it were on the recognized
+    spell-keyword whitelist (it isn't, only Convoke is), and even
+    if it were, the body's ``Look at the top X cards`` shape has no
+    primitive in the unified grammar, so the spell is skipped."""
     card = {
-        "name": "Decode Transmissions",
-        "mana_cost": "{2}{B}",
-        "type_line": "Sorcery",
+        "name": "Consult the Star Charts",
+        "mana_cost": "{1}{U}",
+        "type_line": "Instant",
         "oracle_text": (
-            "You draw two cards and lose 2 life.\n"
-            "Void — If a nonland permanent left the battlefield this turn "
-            "or a spell was warped this turn, instead you draw two cards "
-            "and each opponent loses 2 life."
+            "Kicker {1}{U} (You may pay an additional {1}{U} as you "
+            "cast this spell.)\n"
+            "Look at the top X cards of your library, where X is the "
+            "number of lands you control. Put one of those cards into "
+            "your hand. If this spell was kicked, put two of those "
+            "cards into your hand instead. Put the rest on the "
+            "bottom of your library in a random order."
         ),
     }
     assert _build_spell_printing(card) is None

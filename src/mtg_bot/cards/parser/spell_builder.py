@@ -49,14 +49,18 @@ from mtg_bot.cards.base import (
     DealDamageToTargetCreatureSpacecraftBoosted,
     DepressurizeEffect,
     DiplomaticRelationsEffect,
+    DrawCards,
+    EachOpponentLosesLife,
     Effect,
     FocusFireEffect,
+    LoseLife,
     ModalChooseOne,
     MutinousMassacreEffect,
     PumpCreaturesYouControlUntilEOT,
     PumpTargetCreatureUntilEOT,
     Sequence,
     SingularityRuptureEffect,
+    Surveil,
     make_instant,
     make_sorcery,
 )
@@ -454,6 +458,63 @@ _WHOLE_SPELL_EXACT_TEXT: dict[str, Effect] = {
         "Invasive Maneuvers deals 3 damage to target creature. "
         "It deals 5 damage instead if you control a Spacecraft."
     ): DealDamageToTargetCreatureSpacecraftBoosted(base=3, boosted=5),
+    # Cerebral Download: variable surveil ("Surveil X, where X is the
+    # number of artifacts you control") + flat draw three. The Surveil
+    # primitive's ``use_artifact_count=True`` flag substitutes the
+    # controller's artifact count for the bare ``amount`` field at
+    # resolve time, so the static-side ``Surveil(use_artifact_count=
+    # True)`` initializer (no ``amount`` kwarg) fires the same code
+    # path as the explicit ``Surveil(amount=1, use_artifact_count=
+    # True)`` form here. The dataclass default for ``amount`` is 1.
+    (
+        "Surveil X, where X is the number of artifacts you control. "
+        "Then draw three cards."
+    ): Sequence(effects=(
+        Surveil(amount=1, use_artifact_count=True),
+        DrawCards(amount=3),
+    )),
+    # Decode Transmissions: two-clause Void shape that doesn't fit
+    # the existing ``_parse_void_damage_replacement`` /
+    # ``_parse_void_pump_replacement`` helpers — the Void rider
+    # replaces the LIFE-LOSS half of the base sentence (the draw stays,
+    # the lose-2-life flips to each-opponent-loses-2-life). The
+    # static models this as ``Sequence(DrawCards, ConditionalIfVoid(
+    # then=EachOpponentLosesLife, else=LoseLife))``: the draw runs
+    # unconditionally, then the Void branch picks lose-life at the
+    # caster vs at each opponent. Multi-line oracle text — the key
+    # carries the literal newline between base sentence and rider.
+    (
+        "You draw two cards and lose 2 life.\n"
+        "Void — If a nonland permanent left the battlefield this turn "
+        "or a spell was warped this turn, instead you draw two cards "
+        "and each opponent loses 2 life."
+    ): Sequence(effects=(
+        DrawCards(amount=2),
+        ConditionalIfVoid(
+            then_effect=EachOpponentLosesLife(amount=2),
+            else_effect=LoseLife(amount=2),
+        ),
+    )),
+    # Hymn of the Faller: three-clause Sequence + Void ADDS-A-DRAW
+    # rider. Unlike the existing Void replacement helpers (which swap
+    # one effect for another), this rider runs an additional effect
+    # (``draw another card``) on top of the base. The static models
+    # the rider as ``ConditionalIfVoid(then=DrawCards(1), else=None)``:
+    # the conditional resolves the extra draw only if the Void state
+    # is active; otherwise it's a no-op (else=None).
+    (
+        "Surveil 1, then you draw a card and lose 1 life.\n"
+        "Void — If a nonland permanent left the battlefield this turn "
+        "or a spell was warped this turn, draw another card."
+    ): Sequence(effects=(
+        Surveil(amount=1, use_artifact_count=False),
+        DrawCards(amount=1),
+        LoseLife(amount=1),
+        ConditionalIfVoid(
+            then_effect=DrawCards(amount=1),
+            else_effect=None,
+        ),
+    )),
 }
 
 

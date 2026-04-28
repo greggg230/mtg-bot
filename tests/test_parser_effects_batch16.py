@@ -54,12 +54,18 @@ from __future__ import annotations
 
 from mtg_bot.cards.base import (
     BiosynthicBurstEffect,
+    ConditionalIfVoid,
     DealDamageToTargetCreatureSpacecraftBoosted,
     DepressurizeEffect,
     DiplomaticRelationsEffect,
+    DrawCards,
+    EachOpponentLosesLife,
     FocusFireEffect,
+    LoseLife,
     PumpCreaturesYouControlUntilEOT,
     PumpTargetCreatureUntilEOT,
+    Sequence,
+    Surveil,
 )
 from mtg_bot.cards.parser.spell_builder import (
     _parse_spell_oracle_text,
@@ -268,3 +274,125 @@ def test_dispatch_returns_none_for_depressurize_with_typo():
         "Target creature gets -3/-0 until end of turn. "
         "Then if that creature's power is 0 or fewer, destroy it."
     ) is None
+
+
+# ---------- Sequence-shaped whole-spell entries (Cerebral Download,
+#            Decode Transmissions, Hymn of the Faller) ----------
+#
+# These three spells share the property that the static side ships
+# them as a multi-effect ``Sequence(...)`` whose internal sentences
+# don't all parse as standalone effects. Cerebral Download's first
+# sentence is a variable surveil (``Surveil X, where X is the number
+# of artifacts you control``) — no per-clause primitive captures the
+# X-formula. Decode Transmissions has a Void rider that REPLACES
+# the lose-life half of a compound base (the existing void-rider
+# helpers swap whole effects, not half-effects). Hymn of the Faller
+# has a Void rider that ADDS a draw on top of the base (the existing
+# helpers swap, not add).
+#
+# All three are cleanly modeled by the static engine classes; the
+# whole-spell exact-text dispatcher is the natural fit because each
+# spell's surface text is a fixed verbatim block. Multi-line keys
+# carry the literal newline between header and rider; reminder text
+# is stripped per-clause before lookup.
+
+def test_cerebral_download_claimed_by_parser():
+    # Cerebral Download ``{4}{U}`` Instant — variable surveil + draw
+    # 3. The static models the surveil with ``Surveil(use_artifact_
+    # count=True)``; the X-formula is computed at resolve time.
+    assert "Cerebral Download" in _claimed_names()
+
+
+def test_decode_transmissions_claimed_by_parser():
+    # Decode Transmissions ``{2}{B}`` Sorcery — draw 2 + Void-
+    # replaceable lose-2 / each-opponent-loses-2.
+    assert "Decode Transmissions" in _claimed_names()
+
+
+def test_hymn_of_the_faller_claimed_by_parser():
+    # Hymn of the Faller ``{1}{B}`` Sorcery — surveil 1, draw 1,
+    # lose 1, plus a Void-conditional extra draw rider.
+    assert "Hymn of the Faller" in _claimed_names()
+
+
+def test_dispatch_cerebral_download_returns_sequence():
+    # The dispatcher returns the static-side Sequence directly. The
+    # ``amount=1`` on Surveil is the dataclass default and matches
+    # the static initializer (which omits the kwarg, falling back to
+    # the same default).
+    eff = _try_whole_spell_exact_text(
+        "Surveil X, where X is the number of artifacts you control. "
+        "Then draw three cards."
+    )
+    assert eff == Sequence(effects=(
+        Surveil(amount=1, use_artifact_count=True),
+        DrawCards(amount=3),
+    ))
+
+
+def test_dispatch_decode_transmissions_returns_sequence_with_conditional():
+    # The Void rider in Decode Transmissions only swaps the lose-life
+    # half of the base sentence; the draw runs unconditionally. The
+    # static models this as ``Sequence(DrawCards, ConditionalIfVoid(
+    # then=EachOpponentLosesLife, else=LoseLife))``. The dispatch key
+    # carries the literal newline between base and rider sentences.
+    eff = _try_whole_spell_exact_text(
+        "You draw two cards and lose 2 life.\n"
+        "Void — If a nonland permanent left the battlefield this turn "
+        "or a spell was warped this turn, instead you draw two cards "
+        "and each opponent loses 2 life."
+    )
+    assert eff == Sequence(effects=(
+        DrawCards(amount=2),
+        ConditionalIfVoid(
+            then_effect=EachOpponentLosesLife(amount=2),
+            else_effect=LoseLife(amount=2),
+        ),
+    ))
+
+
+def test_dispatch_hymn_of_the_faller_returns_sequence_with_void_rider():
+    # The Void rider in Hymn of the Faller ADDS an extra draw on top
+    # of the base (it doesn't swap an effect). The static models the
+    # rider as ``ConditionalIfVoid(then=DrawCards(1), else=None)``:
+    # the conditional resolves the extra draw only if the Void state
+    # is active; otherwise it's a no-op (else=None).
+    eff = _try_whole_spell_exact_text(
+        "Surveil 1, then you draw a card and lose 1 life.\n"
+        "Void — If a nonland permanent left the battlefield this turn "
+        "or a spell was warped this turn, draw another card."
+    )
+    assert eff == Sequence(effects=(
+        Surveil(amount=1, use_artifact_count=False),
+        DrawCards(amount=1),
+        LoseLife(amount=1),
+        ConditionalIfVoid(
+            then_effect=DrawCards(amount=1),
+            else_effect=None,
+        ),
+    ))
+
+
+def test_dispatch_strips_hymn_of_the_faller_reminder():
+    # End-to-end through ``_parse_spell_oracle_text``: the surveil-1
+    # parenthesized reminder ``(To surveil 1, ...)`` is per-clause
+    # stripped BEFORE the dispatcher key lookup. The Void rider line
+    # has no parenthesized reminder, so it survives intact.
+    text = (
+        "Surveil 1, then you draw a card and lose 1 life. "
+        "(To surveil 1, look at the top card of your library. "
+        "You may put it into your graveyard.)\n"
+        "Void — If a nonland permanent left the battlefield this turn "
+        "or a spell was warped this turn, draw another card."
+    )
+    assert _parse_spell_oracle_text(text, "Hymn of the Faller") == (
+        Sequence(effects=(
+            Surveil(amount=1, use_artifact_count=False),
+            DrawCards(amount=1),
+            LoseLife(amount=1),
+            ConditionalIfVoid(
+                then_effect=DrawCards(amount=1),
+                else_effect=None,
+            ),
+        ))
+    )
