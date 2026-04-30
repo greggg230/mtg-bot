@@ -111,8 +111,14 @@ from mtg_bot.effects.predicates import (
 
 
 _TRIGGERED_ABILITY_LINE = re.compile(
-    r"^(?:When|Whenever) (.+?), (.+)\.$"
+    r"^(?:When|Whenever) (.+?), (.+)\.\"?$"
 )
+# The optional trailing ``\"`` allows oracle lines whose effect phrase
+# ends with a quoted ability description — e.g. Station Monitor's
+# "…create a Drone token with flying and "This token can block only
+# creatures with flying."" where the outer closing double-quote follows
+# the period inside the quoted sub-text.  Standard trigger lines ending
+# with bare ``.`` are unchanged (the ``\"?`` matches zero quotes).
 
 
 # ETB-replacement-style "enters with counters" line.
@@ -566,6 +572,16 @@ _PREDICATE_TRIGGER_PHRASES: dict[
     "a creature you control with a +1/+1 counter on it dies": (
         Event.DIES,
         Subject(None, IsCreature() & HasCounter("+1/+1")) & Controlled(YOU),
+    ),
+    # ``Whenever you cast an artifact spell`` — Pinnacle Emissary's
+    # "whenever you cast an artifact spell, create a Drone token."
+    # ``Event.IS_CAST`` carries subjects ``("spell", "controller")``;
+    # ``Subject("spell", IsArtifact())`` matches the spell being cast
+    # and ``Controlled(YOU, subject="controller")`` gates on it being
+    # cast by the source's controller (vs an opponent).
+    "you cast an artifact spell": (
+        Event.IS_CAST,
+        Subject("spell", IsArtifact()) & Controlled(YOU, subject="controller"),
     ),
     # ``Whenever you cast your second spell each turn`` — phase 8
     # migrated from ``trigger="second_spell_each_turn"`` to the

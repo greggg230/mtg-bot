@@ -880,8 +880,15 @@ _TOKEN_COLOR_PATTERN = r"white|blue|black|red|green|colorless"
 _CREATE_CREATURE_TOKEN = re.compile(
     rf"^create ({_TOKEN_COUNT_PATTERN}) (tapped )?(\d+)/(\d+) "
     rf"({_TOKEN_COLOR_PATTERN}) ([A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*)*) "
-    rf"(artifact )?(enchantment )?creature tokens?$"
+    rf"(artifact )?(enchantment )?creature tokens?(?:\s+with\s+.+)?$",
+    re.DOTALL,
 )
+# The optional trailing ``(?:\s+with\s+.+)?`` allows oracle text that
+# appends the token's built-in abilities as a reminder (e.g. Station
+# Monitor's "…Drone artifact creature token with flying and 'This token
+# can block only creatures with flying.'"): the abilities are already
+# encoded in ``TOKEN_PRINTINGS`` so the trailing description is
+# redundant and can be safely ignored by the recognizer.
 # Bare-name token shape — ``create a Lander token`` /
 # ``create two Lander tokens``. The captured subtype IS the registry
 # key. Optional ``tapped`` sits between the count and the name (no EoE
