@@ -102,6 +102,7 @@ from mtg_bot.effects.predicates import (
 )
 from mtg_bot.cards.parser.printing_keywords import (
     _parse_restricts_noncreature_spells_line,
+    _parse_ward_line,
 )
 from mtg_bot.cards.parser.text import _strip_reminder_text
 from mtg_bot.cards.parser.triggers import _parse_triggered_ability_line
@@ -694,8 +695,6 @@ def _build_duskmourns_domination() -> CardPrinting:
 
 _ENCHANTMENT_BUILDERS: dict[str, "callable[[], CardPrinting]"] = {
     # Non-Aura
-    "Banishing Light": _build_banishing_light,
-    "Seam Rip": _build_seam_rip,
     "Loading Zone": _build_loading_zone,
     "Weftwalking": _build_weftwalking,
     "Sothera, the Supervoid": _build_sothera_the_supervoid,
@@ -704,7 +703,6 @@ _ENCHANTMENT_BUILDERS: dict[str, "callable[[], CardPrinting]"] = {
     "Bioengineered Future": _build_bioengineered_future,
     "Eusocial Engineering": _build_eusocial_engineering,
     "Leyline of Mutation": _build_leyline_of_mutation,
-    "Trapped in the Screen": _build_trapped_in_the_screen,
     # Auras
     "Moonlit Meditation": _build_moonlit_meditation,
     "Tractor Beam": _build_tractor_beam,
@@ -759,6 +757,12 @@ def _build_enchantment_printing(card: dict) -> CardPrinting | None:
 _UNIFIED_ENCHANTMENT_NAMES: frozenset[str] = frozenset({
     "Deafening Silence",
     "Burgeoning",
+    # Banishing Light / Seam Rip / Trapped in the Screen — ETB exile-until-
+    # source-leaves shapes.  The effect phrases are now in the grammar
+    # (``_EXILE_OPPONENTS_NONLAND_UNTIL_LEAVES`` in effects.py).
+    "Banishing Light",
+    "Seam Rip",
+    "Trapped in the Screen",
 })
 
 
@@ -781,6 +785,7 @@ def _build_enchantment_via_oracle_text(
     text = card.get("oracle_text", "")
     legendary = "Legendary" in card.get("type_line", "")
     restricts_noncreature_spells = False
+    ward: str | None = None
     triggers: list[TriggeredAbility] = []
 
     for raw_line in text.split("\n"):
@@ -789,6 +794,10 @@ def _build_enchantment_via_oracle_text(
             continue
         if _parse_restricts_noncreature_spells_line(line):
             restricts_noncreature_spells = True
+            continue
+        ward_cost = _parse_ward_line(line)
+        if ward_cost is not None:
+            ward = ward_cost
             continue
         parsed_trigger = _parse_triggered_ability_line(line, name=name)
         if parsed_trigger is not None:
@@ -813,5 +822,6 @@ def _build_enchantment_via_oracle_text(
         restricts_noncreature_spells_to_one_per_turn=(
             restricts_noncreature_spells
         ),
+        ward=ward,
         triggered_abilities=tuple(triggers),
     )

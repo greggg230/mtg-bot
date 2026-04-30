@@ -271,21 +271,6 @@ def _make_bespoke_creatures() -> dict[str, CardPrinting]:
                 ),
             ),
         ),
-        # All-Fates Stalker {3}{W} 2/3 Drix Assassin — warp {1}{W}.
-        # ETB exile target non-Assassin creature until Stalker leaves.
-        "All-Fates Stalker": make_creature(
-            "All-Fates Stalker", "{3}{W}", 2, 3,
-            warp="{1}{W}",
-            subtypes=("Drix", "Assassin"),
-            triggered_abilities=(
-                TriggeredAbility(
-                    event=Event.ENTERS, predicate=IsSelf(),
-                    effect=ExileTargetCreatureUntilSourceLeaves(
-                        excluded_subtypes=frozenset({"Assassin"}),
-                    ),
-                ),
-            ),
-        ),
         # Anticausal Vestige {6} 7/5 Eldrazi — warp {4}.
         # When it leaves the battlefield: draw + may put permanent to bf.
         "Anticausal Vestige": make_creature(
