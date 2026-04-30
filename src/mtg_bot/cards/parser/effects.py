@@ -59,6 +59,8 @@ from mtg_bot.cards.base import (
     ExileEachOpponentsGraveyard,
     ExileTargetCardFromGraveyard,
     ExileTargetCreature,
+    ExileTargetCreatureUntilSourceLeaves,
+    ExileOpponentsNonlandPermanentUntilLeaves,
     ExorciseEffect,
     FocusFireEffect,
     GainLife,
@@ -1658,6 +1660,35 @@ _EACH_OPPONENT_SACRIFICES_CREATURE = re.compile(
 _DEFENDING_PLAYER_MILLS_N_CARDS = re.compile(
     rf"^defending player mills (\d+|{_SMALL_CARDINAL_PATTERN}) cards?$"
 )
+# ETB exile-until-source-leaves family — Oblivion Ring / Banishing
+# Light shape.  Two regexes cover the two engine classes:
+#
+# 1. ``exile target [nonland permanent | artifact, creature, or
+#    enchantment] an opponent controls [with mana value N or less]
+#    until this [X] leaves the battlefield``
+#    → ``ExileOpponentsNonlandPermanentUntilLeaves(max_mv=N)``
+#    "artifact, creature, or enchantment" is treated as a synonym for
+#    "nonland permanent" (no planeswalkers/battles in the EoE pool).
+#
+# 2. ``exile [up to one] target [non-Subtype] creature [an opponent
+#    controls] until this [X] leaves the battlefield``
+#    → ``ExileTargetCreatureUntilSourceLeaves(excluded_subtypes=...,
+#                                              opponents_only=bool)``
+#
+# The trailing "until this [type] leaves" anchor uses a word-character
+# capture for the card type so it handles "creature", "enchantment",
+# "Aura", "permanent", and any future type without changes.
+_EXILE_OPPONENTS_NONLAND_UNTIL_LEAVES = re.compile(
+    r"^exile target (?:nonland permanent|artifact, creature, or enchantment) "
+    r"an opponent controls"
+    r"(?: with mana value (\d+) or less)?"
+    r" until this \w+ leaves the battlefield$"
+)
+_EXILE_CREATURE_UNTIL_LEAVES = re.compile(
+    r"^exile(?: up to one)? target(?: non-([A-Z][a-z]+))? creature"
+    r"( an opponent controls)?"
+    r" until this \w+ leaves the battlefield$"
+)
 # "Exile target creature or Spacecraft." — Gravkill's printed surface.
 # The static ``cards/eoe_spells.py`` Gravkill entry intentionally fudges
 # this to ``ExileTargetCreature()`` because Spacecraft aren't yet a
@@ -2632,6 +2663,22 @@ def _parse_effect(phrase: str) -> Effect | None:
         )
     if _COUNTER_TARGET_SPELL.match(phrase) is not None:
         return CounterTargetSpell()
+    # ETB exile-until-source-leaves shapes (Oblivion Ring / Banishing
+    # Light family).  Tried BEFORE the bare exile-target-creature
+    # branch so the more-specific "until … leaves" tail anchors
+    # correctly and the two families don't accidentally overlap.
+    m = _EXILE_OPPONENTS_NONLAND_UNTIL_LEAVES.match(phrase)
+    if m is not None:
+        max_mv = int(m.group(1)) if m.group(1) else 0
+        return ExileOpponentsNonlandPermanentUntilLeaves(max_mv=max_mv)
+    m = _EXILE_CREATURE_UNTIL_LEAVES.match(phrase)
+    if m is not None:
+        excluded = frozenset({m.group(1)}) if m.group(1) else frozenset()
+        opponents_only = m.group(2) is not None
+        return ExileTargetCreatureUntilSourceLeaves(
+            excluded_subtypes=excluded,
+            opponents_only=opponents_only,
+        )
     # ``exile target creature or Spacecraft`` — Gravkill's printed
     # surface. Tried BEFORE the bare ``exile target creature`` regex so
     # the Spacecraft-tail variant wins. Both produce the same engine
