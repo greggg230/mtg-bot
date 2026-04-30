@@ -103,6 +103,7 @@ from mtg_bot.effects.predicates import (
 from mtg_bot.cards.parser.printing_keywords import (
     _parse_restricts_noncreature_spells_line,
     _parse_ward_line,
+    _parse_warp_line,
 )
 from mtg_bot.cards.parser.text import _strip_reminder_text
 from mtg_bot.cards.parser.triggers import _parse_triggered_ability_line
@@ -699,9 +700,7 @@ _ENCHANTMENT_BUILDERS: dict[str, "callable[[], CardPrinting]"] = {
     "Weftwalking": _build_weftwalking,
     "Sothera, the Supervoid": _build_sothera_the_supervoid,
     "Terrasymbiosis": _build_terrasymbiosis,
-    "Weapons Manufacturing": _build_weapons_manufacturing,
     "Bioengineered Future": _build_bioengineered_future,
-    "Eusocial Engineering": _build_eusocial_engineering,
     "Leyline of Mutation": _build_leyline_of_mutation,
     # Auras
     "Moonlit Meditation": _build_moonlit_meditation,
@@ -763,6 +762,15 @@ _UNIFIED_ENCHANTMENT_NAMES: frozenset[str] = frozenset({
     "Banishing Light",
     "Seam Rip",
     "Trapped in the Screen",
+    # Eusocial Engineering — landfall trigger + warp cost. The trigger
+    # "a land you control enters" is in PREDICATE_TRIGGER_PHRASES and
+    # the Robot token creation is in TOKEN_PRINTINGS; warp support was
+    # added to _build_enchantment_via_oracle_text in wave 5.
+    "Eusocial Engineering",
+    # Weapons Manufacturing — nontoken-artifact-enters trigger + named
+    # Munitions token. Trigger phrase and named-token recognizer added
+    # in wave 5.
+    "Weapons Manufacturing",
 })
 
 
@@ -786,6 +794,7 @@ def _build_enchantment_via_oracle_text(
     legendary = "Legendary" in card.get("type_line", "")
     restricts_noncreature_spells = False
     ward: str | None = None
+    warp: str | None = None
     triggers: list[TriggeredAbility] = []
 
     for raw_line in text.split("\n"):
@@ -798,6 +807,10 @@ def _build_enchantment_via_oracle_text(
         ward_cost = _parse_ward_line(line)
         if ward_cost is not None:
             ward = ward_cost
+            continue
+        warp_cost = _parse_warp_line(line)
+        if warp_cost is not None:
+            warp = warp_cost
             continue
         parsed_trigger = _parse_triggered_ability_line(line, name=name)
         if parsed_trigger is not None:
@@ -823,5 +836,6 @@ def _build_enchantment_via_oracle_text(
             restricts_noncreature_spells
         ),
         ward=ward,
+        warp=warp,
         triggered_abilities=tuple(triggers),
     )

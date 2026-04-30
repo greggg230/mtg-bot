@@ -612,31 +612,6 @@ def _make_bespoke_artifact_creatures() -> dict[str, CardPrinting]:
             "Gene Pollinator", "{G}", 1, 2,
             artifact=True,
         ),
-        # Interceptor Mechan {2}{B}{R} 3/3.
-        # Real oracle (Scryfall P/T 2/2, static registry carries 3/3 —
-        # registry value is authoritative for parity).
-        # "Flying. When this creature enters, return target artifact or
-        # creature card from your graveyard to your hand." — simplified
-        # to creature-only per existing static entry.
-        # "Void — At the beginning of your end step … put a +1/+1 counter
-        # on this creature."
-        # Static has artifact=False; registry entry is authoritative.
-        "Interceptor Mechan": make_creature(
-            "Interceptor Mechan", "{2}{B}{R}", 3, 3,
-            keywords={"flying"},
-            triggered_abilities=(
-                TriggeredAbility(
-                    event=Event.ENTERS, predicate=IsSelf(),
-                    effect=ReturnCreatureFromYourGraveyardToHand(),
-                ),
-                TriggeredAbility(
-                    event=Event.BEGINNING_OF_END_STEP,
-                    predicate=Controlled(YOU),
-                    requires_void=True,
-                    effect=PutPlusOneCounterOnSelf(amount=1),
-                ),
-            ),
-        ),
         # Kavaron Harrier {R} 2/1 Robot Soldier.
         # "Whenever this creature attacks, you may pay {2}. If you do,
         # create a 2/2 colorless Robot artifact creature token that's
