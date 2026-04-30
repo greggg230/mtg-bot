@@ -130,6 +130,15 @@ from mtg_bot.effects.object_predicates import (
     IsLand,
     IsTapped,
 )
+from mtg_bot.effects.conditions import (
+    AtLeastNSpellsCastThisTurn,
+    ControlledArtifactEnteredThisTurn,
+)
+from mtg_bot.effects.modifiers import (
+    ContinuousModifier,
+    GrantKeyword,
+    RemoveKeyword,
+)
 from mtg_bot.effects.state_predicates import (
     Delirium,
     SpellsCastThisTurn,
@@ -1252,8 +1261,6 @@ def _build_creature_printing(card: dict) -> CardPrinting | None:
     is_token_doubler = False
     extra_etb_trigger = 0
     replaces_draw_with_extra_when_hand_at_most_one = False
-    attack_bypass_if_artifact_entered_this_turn = False
-    unblockable_if_two_spells_cast_this_turn = False
     dynamic_pt_formula: str | None = None
     text = card.get("oracle_text", "")
     for raw_line in text.split("\n"):
@@ -1392,29 +1399,38 @@ def _build_creature_printing(card: dict) -> CardPrinting | None:
             # ``As long as an artifact entered the battlefield under
             # your control this turn, this creature can attack as
             # though it didn't have defender.`` — Mechan Shieldmate's
-            # printed defender-bypass static. Flips the
-            # ``attack_bypass_if_artifact_entered_this_turn`` kwarg
-            # below; the engine consumes the flag in
-            # ``combat._can_attack_through_defender`` to let the source
-            # attack despite Defender once the controller's per-turn
-            # artifact-entered counter is positive. Idempotent: a
-            # malformed printing with the line twice ends up with the
-            # field set once.
-            attack_bypass_if_artifact_entered_this_turn = True
+            # printed defender-bypass. Expressed as a SELF-scope
+            # StaticAbility carrying a ContinuousModifier that removes
+            # "defender" from this creature while
+            # ControlledArtifactEnteredThisTurn() holds.
+            # effective_keywords then returns a set without "defender"
+            # and eligible_attackers' defender check passes naturally.
+            statics.append(StaticAbility(
+                scope=StaticScope.SELF,
+                condition=ControlledArtifactEnteredThisTurn(),
+                continuous_effect=ContinuousModifier(
+                    layer=6,
+                    payload=RemoveKeyword("defender"),
+                ),
+            ))
             continue
         if _parse_unblockable_if_two_spells_cast_this_turn_line(line):
             # ``This creature can't be blocked if you've cast two or
             # more spells this turn.`` — Illvoi Infiltrator's printed
-            # conditional-unblockable static. Flips the
-            # ``unblockable_if_two_spells_cast_this_turn`` kwarg below;
-            # the engine consumes the flag in ``combat`` (see
-            # ``unblockable_if_two_spells_cast_this_turn`` checks at
-            # declare-blockers / unblockability resolution) and treats
-            # the creature as unblockable once the controller has cast
-            # two or more spells this turn. Idempotent: a malformed
-            # printing with the line twice ends up with the field set
-            # once.
-            unblockable_if_two_spells_cast_this_turn = True
+            # conditional-unblockable. Expressed as a SELF-scope
+            # StaticAbility carrying a ContinuousModifier that grants
+            # "unblockable" while AtLeastNSpellsCastThisTurn(2) holds.
+            # combat.can_block checks "unblockable" in
+            # effective_keywords(state, attacker) and rejects all
+            # blocks; declare_blockers does the same safety check.
+            statics.append(StaticAbility(
+                scope=StaticScope.SELF,
+                condition=AtLeastNSpellsCastThisTurn(2),
+                continuous_effect=ContinuousModifier(
+                    layer=6,
+                    payload=GrantKeyword("unblockable"),
+                ),
+            ))
             continue
         dpt_key = _parse_emissary_escort_dynamic_pt_line(line)
         if dpt_key is not None:
@@ -1527,12 +1543,6 @@ def _build_creature_printing(card: dict) -> CardPrinting | None:
         extra_etb_trigger=extra_etb_trigger,
         replaces_draw_with_extra_when_hand_at_most_one=(
             replaces_draw_with_extra_when_hand_at_most_one
-        ),
-        attack_bypass_if_artifact_entered_this_turn=(
-            attack_bypass_if_artifact_entered_this_turn
-        ),
-        unblockable_if_two_spells_cast_this_turn=(
-            unblockable_if_two_spells_cast_this_turn
         ),
         dynamic_pt_formula=dynamic_pt_formula,
     )

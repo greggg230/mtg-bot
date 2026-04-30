@@ -783,14 +783,6 @@ class CardPrinting:
     # CR 613 layer walks.
     wipes_all_creature_abilities: bool = False
     sets_all_creature_pt_to_1_1: bool = False
-    # Conditional unblockable: "This creature can't be blocked if you've
-    # cast two or more spells this turn." (Illvoi Infiltrator). When True
-    # and the controller's Player.spells_cast_this_turn >= 2, combat.can_block
-    # rejects all blockers against this attacker. Differs from the
-    # ``temp_unblockable`` runtime flag (set by activated effects like
-    # Creeping Tar Pit / pump effects) — this is a static printed clause
-    # gated on a per-turn counter.
-    unblockable_if_two_spells_cast_this_turn: bool = False
     # "This creature must be blocked if able." (CR 509.1c). When True,
     # while this creature is attacking, the defending player must
     # assign at least one of their untapped creatures that could
@@ -803,16 +795,6 @@ class CardPrinting:
     # set; this requirement OBLIGATES at least one block. Matches DSK's
     # Fear of Being Hunted's static rider.
     must_be_blocked_if_able: bool = False
-    # Static attack-restriction relaxation: while True, this creature's
-    # "defender" keyword is ignored for attack-eligibility on any turn
-    # in which an artifact has entered the battlefield under its
-    # controller's control (tracked on
-    # ``Player.artifacts_entered_under_your_control_this_turn``).
-    # Matches Mechan Shieldmate's "as long as an artifact entered the
-    # battlefield under your control this turn, this creature can
-    # attack as though it didn't have defender." Consumed in
-    # ``combat.eligible_attackers``.
-    attack_bypass_if_artifact_entered_this_turn: bool = False
     # Protection from a single color (CR 702.16). When set on a
     # creature's printing, ``combat.can_block`` rejects any block
     # declared by an attacker (or against an attacker) whose
@@ -1016,8 +998,6 @@ def make_creature(
     replaces_draw_with_extra_when_hand_at_most_one: bool = False,
     warp_additional_life_cost: int = 0,
     warp_castable_from_graveyard: bool = False,
-    unblockable_if_two_spells_cast_this_turn: bool = False,
-    attack_bypass_if_artifact_entered_this_turn: bool = False,
     enters_as_copy_of_creature: bool = False,
     protection_from_color: str | None = None,
     impending: str | None = None,
@@ -1084,12 +1064,6 @@ def make_creature(
         ),
         warp_additional_life_cost=warp_additional_life_cost,
         warp_castable_from_graveyard=warp_castable_from_graveyard,
-        unblockable_if_two_spells_cast_this_turn=(
-            unblockable_if_two_spells_cast_this_turn
-        ),
-        attack_bypass_if_artifact_entered_this_turn=(
-            attack_bypass_if_artifact_entered_this_turn
-        ),
         enters_as_copy_of_creature=enters_as_copy_of_creature,
         protection_from_color=protection_from_color,
         impending_cost=parse_mana_cost(impending) if impending else None,

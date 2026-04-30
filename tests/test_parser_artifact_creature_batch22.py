@@ -10,7 +10,7 @@ Covered cards:
   2. Gene Pollinator — vanilla Artifact Creature 1/2 (simplified)
   3. Interceptor Mechan — flying + ETB return + void end-step counter
   4. Kavaron Harrier — attack trigger (KavaronHarrierAttackEffect)
-  5. Mechan Shieldmate — defender + attack_bypass_if_artifact_entered_this_turn
+  5. Mechan Shieldmate — defender + ControlledArtifactEnteredThisTurn ContinuousModifier
   6. Monoist Circuit-Feeder — flying + ETB (MonoistCircuitFeederETBEffect)
   7. Pinnacle Emissary — artifact-cast trigger + Warp {U}{R}
   8. Roving Actuator — void ETB (RovingActuatorETBEffect) + Warp {1}{R}

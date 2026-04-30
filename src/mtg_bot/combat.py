@@ -19,23 +19,8 @@ def eligible_attackers(state: GameState, player_id: int) -> list[GameObject]:
         and is_creature_now(o)
         and not o.tapped
         and (not o.summoning_sick or "haste" in effective_keywords(state, o))
-        and (
-            "defender" not in effective_keywords(state, o)
-            or _can_attack_through_defender(state, o)
-        )
+        and "defender" not in effective_keywords(state, o)
     ]
-
-
-def _can_attack_through_defender(state: GameState, obj: GameObject) -> bool:
-    """Return True if a static ability lets ``obj`` attack despite having
-    defender. Currently models Mechan Shieldmate's "as long as an
-    artifact entered the battlefield under your control this turn,
-    this creature can attack as though it didn't have defender."
-    """
-    if not obj.printing.attack_bypass_if_artifact_entered_this_turn:
-        return False
-    p = state.player_by_id(obj.controller_id)
-    return p.artifacts_entered_under_your_control_this_turn > 0
 
 
 def eligible_blockers(state: GameState, player_id: int) -> list[GameObject]:
@@ -55,11 +40,11 @@ def can_block(
     Flying: a creature with flying can only be blocked by creatures with flying
     or reach.
 
-    Conditional unblockable: a printing flagged with
-    ``unblockable_if_two_spells_cast_this_turn`` (Illvoi Infiltrator)
-    rejects all blocks while its controller has already cast two or more
-    spells this turn. This is a static printed clause checked at
-    block-declaration time, not a runtime ``temp_unblockable`` flag.
+    Unblockable: an attacker with "unblockable" in its effective keywords
+    rejects all blocks. The "unblockable" keyword is granted by
+    ContinuousModifier declarations (e.g. Illvoi Infiltrator's
+    "can't be blocked if you've cast two or more spells this turn") via
+    walk_continuous_modifiers inside effective_keywords.
 
     "Can block only creatures with flying" (EoE Drone token): a blocker
     whose printing carries this flag may only declare blocks against
@@ -81,10 +66,8 @@ def can_block(
     if "flying" in attacker_kws:
         if not ("flying" in blocker_kws or "reach" in blocker_kws):
             return False
-    if attacker.printing.unblockable_if_two_spells_cast_this_turn:
-        controller = state.player_by_id(attacker.controller_id)
-        if controller.spells_cast_this_turn >= 2:
-            return False
+    if "unblockable" in attacker_kws:
+        return False
     if blocker.printing.can_only_block_creatures_with_flying:
         if "flying" not in attacker_kws:
             return False
@@ -269,21 +252,14 @@ def declare_blockers(state: GameState, assignments: dict[int, int]) -> None:
     for blocker_id, attacker_id in assignments.items():
         blocker = next(o for o in state.battlefield if o.id == blocker_id)
         attacker = next(o for o in state.battlefield if o.id == attacker_id)
-        if attacker.temp_unblockable:
+        if attacker.temp_unblockable or "unblockable" in effective_keywords(
+            state, attacker
+        ):
             state.log.append(
                 f"{attacker.printing.name} can't be blocked — "
                 f"{blocker.printing.name}'s block is ignored"
             )
             continue
-        if attacker.printing.unblockable_if_two_spells_cast_this_turn:
-            ac = state.player_by_id(attacker.controller_id)
-            if ac.spells_cast_this_turn >= 2:
-                state.log.append(
-                    f"{attacker.printing.name} can't be blocked "
-                    f"(2+ spells cast this turn) — "
-                    f"{blocker.printing.name}'s block is ignored"
-                )
-                continue
         blocker.blocking = attacker_id
         attacker.blocked_by.append(blocker_id)
         state.log.append(f"{blocker.printing.name} blocks {attacker.printing.name}")

@@ -203,9 +203,10 @@ def test_defender_can_still_block():
 
 # --------------------------------------------------------------------------
 # Rule: MECHAN SHIELDMATE — defender that can attack the turn an artifact
-# entered the battlefield under your control. Drives the static
-# ``attack_bypass_if_artifact_entered_this_turn`` flag and the per-player
-# ``artifacts_entered_under_your_control_this_turn`` counter.
+# entered the battlefield under your control. Uses a SELF-scope
+# StaticAbility with ControlledArtifactEnteredThisTurn condition and a
+# ContinuousModifier(RemoveKeyword("defender")); effective_keywords drops
+# "defender" while the condition holds, so eligible_attackers passes.
 # --------------------------------------------------------------------------
 
 

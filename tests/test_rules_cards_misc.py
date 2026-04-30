@@ -2911,7 +2911,7 @@ def test_illvoi_infiltrator_declare_blockers_drops_block_and_logs():
     assert blocker.blocking is None
     assert inf.blocked_by == []
     assert any(
-        "can't be blocked (2+ spells cast this turn)" in line
+        "can't be blocked" in line and "Illvoi Infiltrator" in line
         for line in state.log
     ), state.log
     # Combat damage now hits the player and queues the draw trigger.

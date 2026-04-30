@@ -10,7 +10,7 @@ Covered creatures:
   2. Frenzied Baloth — trample + haste (static drops uncounterable / damage-prevention clauses)
   3. Harmonious Grovestrider — Ward {2}, dynamic P/T (lands you control)
   4. Uthros Psionicist — external cost reduction (second spell costs {2} less)
-  5. Illvoi Infiltrator — unblockable-if-two-spells flag + combat-damage trigger
+  5. Illvoi Infiltrator — AtLeastNSpellsCastThisTurn(2) ContinuousModifier + combat-damage trigger
   6. Station Monitor — second-spell trigger creates Drone token
   7. Cosmogrand Zenith — second-spell modal trigger (tokens OR counters)
   8. Starwinder — Warp {2}{U}{U} + combat-damage draw trigger
