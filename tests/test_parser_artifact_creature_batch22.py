@@ -12,7 +12,7 @@ Covered cards:
   4. Kavaron Harrier — attack trigger (KavaronHarrierAttackEffect)
   5. Mechan Shieldmate — defender + ControlledArtifactEnteredThisTurn ContinuousModifier
   6. Monoist Circuit-Feeder — flying + ETB (MonoistCircuitFeederETBEffect)
-  7. Pinnacle Emissary — artifact-cast trigger + Warp {U}{R}
+  7. Pinnacle Emissary — artifact-cast trigger + Warp {U}{R} (hybrid mana simplified)
   8. Roving Actuator — void ETB (RovingActuatorETBEffect) + Warp {1}{R}
   9. Rust Harvester — menace only (simplified vanilla)
  10. Selfcraft Mechan — ETB (SelfcraftMechanETBEffect)

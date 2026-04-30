@@ -190,23 +190,6 @@ def _make_bespoke_creatures() -> dict[str, CardPrinting]:
             ward="{2}",
             dynamic_pt_formula="harmonious_grovestrider",
         ),
-        # Station Monitor {W}{U} 2/2.
-        # Trigger: second spell each turn → create a 1/1 Drone token.
-        "Station Monitor": make_creature(
-            "Station Monitor", "{W}{U}", 2, 2,
-            triggered_abilities=(
-                TriggeredAbility(
-                    event=Event.IS_CAST,
-                    predicate=(
-                        Controlled(YOU, subject="controller")
-                        & StateBound(SpellsCastThisTurn(n=2))
-                    ),
-                    effect=CreateToken(
-                        token_printing=TOKEN_PRINTINGS["Drone"], count=1,
-                    ),
-                ),
-            ),
-        ),
         # Cosmogrand Zenith {2}{W} 2/4.
         # Trigger: second spell each turn → modal: two Human Soldier tokens
         # OR +1/+1 counter on each creature you control.
@@ -333,23 +316,6 @@ def _make_bespoke_creatures() -> dict[str, CardPrinting]:
                             event=Event.DIES, predicate=IsSelf(),
                             effect=PerigeeBeckonerDiesReturnTappedEffect(),
                         ),
-                    ),
-                ),
-            ),
-        ),
-        # Elegy Acolyte {2}{B}{B} 4/4 Human Cleric — lifelink.
-        # Void trigger: at beginning of end step, if void is active,
-        # create a 1/1 Robot token. (Combat-damage trigger dropped.)
-        "Elegy Acolyte": make_creature(
-            "Elegy Acolyte", "{2}{B}{B}", 4, 4,
-            keywords={"lifelink"},
-            triggered_abilities=(
-                TriggeredAbility(
-                    event=Event.BEGINNING_OF_END_STEP, predicate=Controlled(YOU),
-                    requires_void=True,
-                    effect=CreateToken(
-                        token_printing=TOKEN_PRINTINGS["Robot"],
-                        count=1,
                     ),
                 ),
             ),
@@ -716,10 +682,12 @@ def _make_bespoke_artifact_creatures() -> dict[str, CardPrinting]:
                 ),
             ),
         ),
-        # Pinnacle Emissary {1}{U}{R} 3/3.
-        # "Whenever you cast an artifact spell, create a 1/1 colorless
-        # Drone artifact creature token." Warp {U/R} — modeled as
-        # {U}{R} (hybrid mana not a separate cost structure).
+        # Pinnacle Emissary {1}{U}{R} 3/3 Artifact Creature.
+        # Trigger: artifact cast → create a 1/1 Drone token.
+        # Warp {U/R} — modeled as {U}{R}; the engine doesn't support
+        # hybrid mana ({U/R}) in parse_mana_cost, so the warp cost is
+        # simplified to its two-color equivalent. Stays bespoke until
+        # hybrid-mana support lands.
         "Pinnacle Emissary": make_creature(
             "Pinnacle Emissary", "{1}{U}{R}", 3, 3,
             artifact=True,

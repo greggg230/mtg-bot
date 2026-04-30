@@ -11,7 +11,7 @@ Covered creatures:
   3. Harmonious Grovestrider — Ward {2}, dynamic P/T (lands you control)
   4. Uthros Psionicist — external cost reduction (second spell costs {2} less)
   5. Illvoi Infiltrator — AtLeastNSpellsCastThisTurn(2) ContinuousModifier + combat-damage trigger
-  6. Station Monitor — second-spell trigger creates Drone token
+  6. Station Monitor — grammar-claimed (second-spell trigger → Drone token)
   7. Cosmogrand Zenith — second-spell modal trigger (tokens OR counters)
   8. Starwinder — Warp {2}{U}{U} + combat-damage draw trigger
   9. Timeline Culler — Haste, Warp {B} + pay 2 life, castable from graveyard

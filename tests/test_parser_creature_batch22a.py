@@ -16,7 +16,7 @@ Covered creatures:
   8. Perigee Beckoner — warp {1}{B}, ETB PumpTargetCreatureUntilEOT + granted trigger
   9. Honored Knight-Captain — ETB Human Soldier token + activated Equipment tutor
  10. Starfield Vocalist — warp {1}{U}, extra_etb_trigger=1
- 11. Elegy Acolyte — lifelink, void end-step Robot token
+ 11. Elegy Acolyte — grammar-claimed (lifelink + combat-damage draw + void Robot token)
  12. Pulsar Squadron Ace — ETB LookAtTopNRevealOrCounter(5, spacecraft)
 """
 
