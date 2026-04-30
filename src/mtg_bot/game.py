@@ -726,6 +726,20 @@ def effective_keywords(state: GameState, obj: GameObject) -> frozenset[str]:
             kws.clear()
         elif ce.kind == "grant_keyword" and ce.params:
             kws.add(ce.params[0])
+    # ContinuousModifier contributions from StaticAbility declarations.
+    # Walked after the registry-based layer-6 pass so the existing
+    # grant_keyword / lose_all_abilities ordering is preserved.  The
+    # modifier grammar's GrantKeyword / RemoveKeyword payloads are
+    # layer-6 operations; for the current EoE pool (Mechan Shieldmate
+    # RemoveKeyword("defender"), Illvoi Infiltrator
+    # GrantKeyword("unblockable")) no interaction with lose_all_abilities
+    # exists, so post-walk application is CR-correct.
+    from mtg_bot.effects.modifiers import GrantKeyword, RemoveKeyword, walk_continuous_modifiers
+    for _src_id, mod in walk_continuous_modifiers(state, obj):
+        if isinstance(mod.payload, GrantKeyword):
+            kws.add(mod.payload.keyword)
+        elif isinstance(mod.payload, RemoveKeyword):
+            kws.discard(mod.payload.keyword)
     # CR 122 named counters that grant keywords — currently just the
     # "flying counter" custom counter type (DSK Ghost Vacuum). The
     # counter is its own integer field on ``GameObject``; a positive
@@ -1844,11 +1858,9 @@ class Player:
     # player's control this turn. Reset at cleanup. Incremented by
     # ``actions.put_into_battlefield`` whenever an artifact (including
     # artifact creatures and artifact tokens) enters under their
-    # control. Used by Mechan Shieldmate's "as long as an artifact
-    # entered the battlefield under your control this turn, this
-    # creature can attack as though it didn't have defender" — see
-    # ``CardPrinting.attack_bypass_if_artifact_entered_this_turn`` and
-    # ``combat.eligible_attackers``.
+    # control. Read by ``ControlledArtifactEnteredThisTurn`` condition
+    # which gates Mechan Shieldmate's defender-removing
+    # ``ContinuousModifier`` via ``effective_keywords``.
     artifacts_entered_under_your_control_this_turn: int = 0
     has_lost: bool = False
     lost_reason: str = ""

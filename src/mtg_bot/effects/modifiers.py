@@ -263,14 +263,20 @@ class ContinuousModifier:
     While the source is on the battlefield (and the wrapping
     :class:`StaticAbility`'s condition is satisfied, when present),
     apply ``payload`` to every object satisfying ``subject_filter`` at
-    layer ``layer``. The CR 613 dispatcher (PR D) walks every active
+    layer ``layer``. The CR 613 dispatcher
+    (:func:`walk_continuous_modifiers`) walks every active
     ``ContinuousModifier`` per object query and folds the contributions
     in layer order.
+
+    ``subject_filter`` is an optional secondary predicate applied AFTER
+    the wrapping ``StaticAbility.applies_to`` scope check. When
+    ``None`` (the default for SELF-scope abilities), no additional
+    filtering is performed — ``applies_to`` is the sole gate.
     """
 
     layer: int  # 1..7 per CR 613.1
-    subject_filter: "ObjectPredicate"
     payload: LayerPayload
+    subject_filter: "ObjectPredicate | None" = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +554,43 @@ def _subject_filters_match(
     return True
 
 
+def walk_continuous_modifiers(
+    state: "GameState",
+    target: "GameObject",
+) -> "list[tuple[int, ContinuousModifier]]":
+    """Yield ``(source_id, ContinuousModifier)`` pairs whose wrapping
+    ``StaticAbility`` applies to ``target`` right now.
+
+    Walks every permanent on the battlefield. For each permanent,
+    walks its ``static_abilities`` looking for ones with a
+    ``continuous_effect`` slot populated. Delegates the scope /
+    condition / creature-check to ``StaticAbility.applies_to``. If
+    the modifier also carries a ``subject_filter``, that predicate is
+    evaluated as a secondary gate after ``applies_to`` passes.
+
+    The result list is ordered by source ``etb_timestamp`` so callers
+    that need layer-within-6 ordering can sort by source timestamp if
+    needed. For the current EoE pool (layer-6 keyword grants/removes)
+    the ordering only matters when a wipe and a grant interact — the
+    existing ``_layer6_entries_for`` path handles that; this function
+    provides a parallel contribution consumed after the existing walk.
+    """
+    out: list[tuple[int, ContinuousModifier]] = []
+    for source in state.battlefield:
+        for static in getattr(source.printing, "static_abilities", ()) or ():
+            cm = getattr(static, "continuous_effect", None)
+            if cm is None:
+                continue
+            if not static.applies_to(source, target, state):
+                continue
+            if cm.subject_filter is not None and not cm.subject_filter.test(
+                target, state
+            ):
+                continue
+            out.append((source.id, cm))
+    return out
+
+
 __all__ = [
     "EventTransform",
     "MultiplyCount",
@@ -564,4 +607,5 @@ __all__ = [
     "ContinuousModifier",
     "ReplacementEffect",
     "dispatch_replacement",
+    "walk_continuous_modifiers",
 ]
