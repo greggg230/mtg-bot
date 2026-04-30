@@ -386,3 +386,51 @@ class PerControlled(Condition):
 
     def multiplier(self, state, viewer_id, chosen_targets=None):
         return self._count(state, viewer_id)
+
+
+# ---------- continuous-effect gate variants ----------
+
+
+@dataclass(frozen=True)
+class ControlledArtifactEnteredThisTurn(Condition):
+    """An artifact entered the battlefield under ``viewer_id``'s control
+    this turn.
+
+    Reads ``Player.artifacts_entered_under_your_control_this_turn``,
+    which ``actions.put_into_battlefield`` increments whenever an
+    artifact (including artifact creatures and tokens) enters under
+    the player's control and resets at the cleanup step.
+
+    Models Mechan Shieldmate's "as long as an artifact entered the
+    battlefield under your control this turn" gate on its defender-
+    removing ``ContinuousModifier``.
+    """
+
+    def matches(self, state, viewer_id, chosen_targets=None):
+        return (
+            state.player_by_id(viewer_id)
+            .artifacts_entered_under_your_control_this_turn
+            > 0
+        )
+
+
+@dataclass(frozen=True)
+class AtLeastNSpellsCastThisTurn(Condition):
+    """The viewer has cast at least ``n`` spells this turn.
+
+    Reads ``Player.spells_cast_this_turn >= n``. Distinct from
+    ``NthSpellThisTurn`` (which checks equality at cast time) and
+    ``AnotherSpellCastThisTurn`` (which checks strictly positive):
+    this variant is a ``>=`` threshold gate evaluated after the fact,
+    suitable for static continuous effects whose condition is
+    "you have cast N or more spells this turn."
+
+    Models Illvoi Infiltrator's "if you've cast two or more spells
+    this turn" gate on its unblockable ``ContinuousModifier`` via
+    ``AtLeastNSpellsCastThisTurn(2)``.
+    """
+
+    n: int
+
+    def matches(self, state, viewer_id, chosen_targets=None):
+        return state.player_by_id(viewer_id).spells_cast_this_turn >= self.n

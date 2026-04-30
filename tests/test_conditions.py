@@ -16,8 +16,10 @@ import pytest
 from mtg_bot.effects.conditions import (
     AndCondition,
     AnotherSpellCastThisTurn,
+    AtLeastNSpellsCastThisTurn,
     AttackedWithThisTurn,
     Condition,
+    ControlledArtifactEnteredThisTurn,
     ControlPermanent,
     DuringYourTurn,
     NotCondition,
@@ -576,3 +578,76 @@ def test_is_land_compatible_with_per_differently_named_land():
     )
     state.battlefield.append(land)
     assert IsLand().test(land, state) is True
+
+
+# ---------- ControlledArtifactEnteredThisTurn ----------
+
+
+def test_controlled_artifact_entered_this_turn_matches_when_positive():
+    state = _new_state()
+    state.players[0].artifacts_entered_under_your_control_this_turn = 1
+    assert ControlledArtifactEnteredThisTurn().matches(state, 0) is True
+
+
+def test_controlled_artifact_entered_this_turn_matches_more_than_one():
+    state = _new_state()
+    state.players[0].artifacts_entered_under_your_control_this_turn = 3
+    assert ControlledArtifactEnteredThisTurn().matches(state, 0) is True
+
+
+def test_controlled_artifact_entered_this_turn_rejects_when_zero():
+    state = _new_state()
+    assert state.players[0].artifacts_entered_under_your_control_this_turn == 0
+    assert ControlledArtifactEnteredThisTurn().matches(state, 0) is False
+
+
+def test_controlled_artifact_entered_this_turn_scopes_to_viewer():
+    """P1's artifact-entered counter must not satisfy P0's condition."""
+    state = _new_state()
+    state.players[1].artifacts_entered_under_your_control_this_turn = 5
+    assert ControlledArtifactEnteredThisTurn().matches(state, 0) is False
+    assert ControlledArtifactEnteredThisTurn().matches(state, 1) is True
+
+
+# ---------- AtLeastNSpellsCastThisTurn ----------
+
+
+def test_at_least_n_spells_matches_exactly_n():
+    state = _new_state()
+    state.players[0].spells_cast_this_turn = 2
+    assert AtLeastNSpellsCastThisTurn(2).matches(state, 0) is True
+
+
+def test_at_least_n_spells_matches_more_than_n():
+    state = _new_state()
+    state.players[0].spells_cast_this_turn = 5
+    assert AtLeastNSpellsCastThisTurn(2).matches(state, 0) is True
+
+
+def test_at_least_n_spells_rejects_fewer_than_n():
+    state = _new_state()
+    state.players[0].spells_cast_this_turn = 1
+    assert AtLeastNSpellsCastThisTurn(2).matches(state, 0) is False
+
+
+def test_at_least_n_spells_rejects_zero():
+    state = _new_state()
+    assert state.players[0].spells_cast_this_turn == 0
+    assert AtLeastNSpellsCastThisTurn(2).matches(state, 0) is False
+
+
+def test_at_least_n_spells_scopes_to_viewer():
+    """P1's cast counter must not satisfy P0's condition."""
+    state = _new_state()
+    state.players[1].spells_cast_this_turn = 3
+    assert AtLeastNSpellsCastThisTurn(2).matches(state, 0) is False
+    assert AtLeastNSpellsCastThisTurn(2).matches(state, 1) is True
+
+
+def test_at_least_n_spells_n_equals_one():
+    """n=1 matches AnotherSpellCastThisTurn semantics (>= 1)."""
+    state = _new_state()
+    state.players[0].spells_cast_this_turn = 1
+    assert AtLeastNSpellsCastThisTurn(1).matches(state, 0) is True
+    state.players[0].spells_cast_this_turn = 0
+    assert AtLeastNSpellsCastThisTurn(1).matches(state, 0) is False
