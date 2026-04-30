@@ -891,6 +891,19 @@ _CREATE_CREATURE_TOKEN = re.compile(
 # can block only creatures with flying.'"): the abilities are already
 # encoded in ``TOKEN_PRINTINGS`` so the trailing description is
 # redundant and can be safely ignored by the recognizer.
+# Named artifact token shape — ``create a [color] artifact token named
+# [Name] [with abilities]``.  Weapons Manufacturing prints "create a
+# colorless artifact token named Munitions with 'When this token leaves
+# the battlefield, it deals 1 damage to any target.'"  The color words
+# and type words before ``token named`` are consumed but not validated;
+# the registry name (group 3) is the authoritative lookup key.  The
+# optional trailing ``with [abilities]`` is ignored — the abilities are
+# already encoded in ``TOKEN_PRINTINGS``.
+_CREATE_NAMED_ARTIFACT_TOKEN = re.compile(
+    rf"^create ({_TOKEN_COUNT_PATTERN}) (tapped )?(?:\w+ )*artifact tokens? named "
+    rf"([A-Z][A-Za-z]*)(?: with .+)?$",
+    re.DOTALL,
+)
 # Bare-name token shape — ``create a Lander token`` /
 # ``create two Lander tokens``. The captured subtype IS the registry
 # key. Optional ``tapped`` sits between the count and the name (no EoE
@@ -1163,6 +1176,14 @@ _RETURN_UP_TO_ONE_TARGET_CREATURE_TO_OWNERS_HAND = re.compile(
 _RETURN_UP_TO_N_NON_SPACECRAFT_CREATURES_TO_OWNERS_HANDS = re.compile(
     rf"^return up to (\d+|{_SMALL_CARDINAL_PATTERN}) target "
     rf"non-Spacecraft creatures to their owners' hands$"
+)
+# "Return target artifact or creature card from your graveyard to your
+# hand" — Interceptor Mechan's ETB body. Maps to
+# ``ReturnCreatureFromYourGraveyardToHand(or_artifact=True)``. Tried
+# BEFORE the bare ``return target creature card`` regex so the more-
+# specific ``artifact or creature`` widening lands first.
+_RETURN_TARGET_ARTIFACT_OR_CREATURE_GRAVEYARD_TO_HAND = re.compile(
+    r"^return target artifact or creature card from your graveyard to your hand$"
 )
 # "Return target creature card from your graveyard to your hand" —
 # graveyard-to-hand reanimation surface.
@@ -2130,6 +2151,23 @@ def _parse_create_token_effect(phrase: str) -> Effect | None:
             return None
         return CreateToken(
             token_printing=TOKEN_PRINTINGS[subtype],
+            count=count,
+            tapped=tapped,
+        )
+    # Named artifact token shape — ``create a [colors] artifact token
+    # named [Name] [with abilities]`` (Weapons Manufacturing's Munitions).
+    # Tried BEFORE the bare-name shape because the bare-name regex would
+    # accept "create a Munitions token" but NOT the longer "artifact token
+    # named …" surface. The abilities description is stripped by the regex.
+    m = _CREATE_NAMED_ARTIFACT_TOKEN.match(phrase)
+    if m is not None:
+        count = _parse_token_count(m.group(1))
+        tapped = m.group(2) is not None
+        name = m.group(3)
+        if name not in TOKEN_PRINTINGS:
+            return None
+        return CreateToken(
+            token_printing=TOKEN_PRINTINGS[name],
             count=count,
             tapped=tapped,
         )
@@ -3127,6 +3165,13 @@ def _parse_effect(phrase: str) -> Effect | None:
         # threshold; ``max_mv=0`` (unset) keeps the original unbounded
         # behaviour for Interceptor Mechan and the bare regex below.
         return ReturnCreatureFromYourGraveyardToHand(max_mv=int(m.group(1)))
+    # ``return target artifact or creature card from your graveyard to
+    # your hand`` — Interceptor Mechan's ETB. Tried before the bare
+    # ``creature card`` regex so the more-specific OR-disjunction wins.
+    if _RETURN_TARGET_ARTIFACT_OR_CREATURE_GRAVEYARD_TO_HAND.match(
+        phrase
+    ) is not None:
+        return ReturnCreatureFromYourGraveyardToHand(or_artifact=True)
     if _RETURN_CREATURE_OR_SPACECRAFT_GRAVEYARD_TO_HAND.match(
         phrase
     ) is not None:

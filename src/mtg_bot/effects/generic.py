@@ -1936,38 +1936,24 @@ class ReturnTargetArtifactCardFromYourGraveyardToHand(Effect):
 
 @dataclass(frozen=True)
 class ReturnCreatureFromYourGraveyardToHand(Effect):
-    """Target creature card from your graveyard goes to your hand.
-
-    Matches Interceptor Mechan's ETB (creature-only simplification of its
-    "artifact or creature" oracle text).
+    """Target creature (or artifact/Spacecraft) card from your graveyard
+    goes to your hand.
 
     ``max_mv`` (default 0 = "no cap") narrows the legal-target pool to
-    creature cards whose printed mana value is less than or equal to the
-    threshold. Models Savior of the Small's Survival reanimator —
-    ``return target creature card with mana value 3 or less from your
-    graveyard to your hand`` — and any future printing with the same
-    "with mana value N or less" rider. The threshold is inclusive on
-    the bound; ``max_mv=0`` keeps the original Interceptor Mechan
-    behaviour where every creature card in the graveyard qualifies.
+    cards whose printed mana value is ≤ the threshold.
 
     ``or_spacecraft`` widens the legal-target pool to also include
-    Spacecraft cards in the graveyard (regardless of whether the
-    Spacecraft is also a creature). Matches oracle text "return a
-    creature or Spacecraft card from your graveyard to your hand" —
-    Fell Gravship's ETB body. Mirrors the ``or_spacecraft`` flag on
-    ``DestroyTargetCreature`` (Embrace Oblivion) and the
-    ``ReturnUpToNNonSpacecraftCreatures`` filter Specimen Freighter
-    uses; when True, both creature-card and Spacecraft-card graveyard
-    entries surface as legal targets via the same
-    ``("graveyard_creature", id)`` target tuple, so the resolve path
-    stays unified across kinds.
+    Spacecraft cards in the graveyard. Matches "return target creature
+    or Spacecraft card" — Fell Gravship.
+
+    ``or_artifact`` widens the pool to also include artifact cards.
+    Matches Interceptor Mechan's "return target artifact or creature
+    card from your graveyard to your hand."
     """
 
     max_mv: int = 0
-    # When True, Spacecraft cards in the graveyard are also legal
-    # targets. Matches "return target creature or Spacecraft card from
-    # your graveyard to your hand" — Fell Gravship.
     or_spacecraft: bool = False
+    or_artifact: bool = False
 
     def requires_target(self) -> bool:
         return True
@@ -1982,6 +1968,7 @@ class ReturnCreatureFromYourGraveyardToHand(Effect):
             if (
                 c.printing.is_creature
                 or (self.or_spacecraft and c.printing.is_spacecraft)
+                or (self.or_artifact and c.printing.is_artifact)
             )
             and (self.max_mv == 0 or c.printing.mana_cost.total <= self.max_mv)
         ]
@@ -2012,9 +1999,15 @@ class ReturnCreatureFromYourGraveyardToHand(Effect):
         )
 
     def describe(self) -> str:
-        type_phrase = (
-            "creature or Spacecraft" if self.or_spacecraft else "creature"
-        )
+        extras = []
+        if self.or_artifact:
+            extras.append("artifact")
+        if self.or_spacecraft:
+            extras.append("Spacecraft")
+        if extras:
+            type_phrase = "artifact or creature" if "artifact" in extras else "creature or Spacecraft"
+        else:
+            type_phrase = "creature"
         if self.max_mv > 0:
             return (
                 f"return target {type_phrase} card with mana value "

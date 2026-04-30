@@ -583,6 +583,17 @@ _PREDICATE_TRIGGER_PHRASES: dict[
         Event.IS_CAST,
         Subject("spell", IsArtifact()) & Controlled(YOU, subject="controller"),
     ),
+    # ``Whenever a nontoken artifact you control enters`` — Weapons
+    # Manufacturing's trigger. ``Event.ENTERS`` carries ``("source",)``;
+    # ``IsNontoken()`` excludes token artifacts (Landers, Drones, etc.)
+    # so the enchantment doesn't go wide on its own token enters;
+    # ``~IsSelf()`` prevents the enchantment itself (an Enchantment, not
+    # an artifact) from triggering — belt-and-suspenders guard matching
+    # the bespoke factory's explicit predicate.
+    "a nontoken artifact you control enters": (
+        Event.ENTERS,
+        Subject(None, IsArtifact() & IsNontoken()) & Controlled(YOU) & ~IsSelf(),
+    ),
     # ``Whenever you cast your second spell each turn`` — phase 8
     # migrated from ``trigger="second_spell_each_turn"`` to the
     # predicate path. ``Event.IS_CAST`` carries subjects ``("spell",
