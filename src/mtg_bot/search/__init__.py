@@ -16,20 +16,12 @@ Module map:
 - ``strategy``   — ``SearchStrategy`` ABC + ``RandomChoice`` baseline.
 - ``mcts``       — ``MCTS`` implementation with UCB1 selection, chance-
                    node sampling, and evaluator-at-leaf. Also exposes
-                   ``choose_with_visits`` for ensemble wrappers (PIMC).
-- ``pimc``       — ``PIMC``: Perfect Information Monte Carlo. Wraps
-                   an inner MCTS, runs K determinized worlds per
-                   ``choose()``, aggregates visit counts. The
-                   integration point between the determinizer and the
-                   search; MTG-aware (talks to ``MtgGameStateAdapter``).
+                   ``choose_with_visits`` for ensemble wrappers.
 - ``ismcts``     — ``ISMCTS``: Single-Observer Information Set MCTS.
                    Single tree keyed by information-set hash; per-
-                   iteration determinization during selection. The
-                   modern replacement for ``PIMC`` — fixes strategy
-                   fusion, non-locality, and root-illegal phantom
-                   visits.
-- ``determinize`` — ``determinize(state, viewer_id, rng)`` root sampler
-                   used by PIMC. See ``docs/HIDDEN_INFO_MODEL.md``.
+                   iteration determinization during selection.
+- ``determinize`` — ``determinize(state, viewer_id, rng)`` root sampler.
+                   See ``docs/HIDDEN_INFO_MODEL.md``.
 - ``expansion``  — ``ExpansionPolicy`` ABC + ``FullEnumeration`` (classic)
                    and ``ProgressiveWidening`` (budget-aware) — pluggable
                    into MCTS for tunable tree growth.
@@ -88,7 +80,6 @@ from mtg_bot.search.heuristic_evaluator import MtgHeuristicEvaluator
 from mtg_bot.search.ismcts import ISMCTS
 from mtg_bot.search.mcts import MCTS
 from mtg_bot.search.nn_evaluator import NNEvaluator
-from mtg_bot.search.pimc import PIMC
 from mtg_bot.search.mtg_priors import (
     attack_aggressive_prior,
     block_biggest_attacker_first_prior,
@@ -121,7 +112,6 @@ __all__ = [
     "MtgGameStateAdapter",
     "MtgHeuristicEvaluator",
     "NNEvaluator",
-    "PIMC",
     "PlayerID",
     "ProgressiveWidening",
     "RandomChoice",
