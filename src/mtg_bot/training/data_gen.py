@@ -718,28 +718,11 @@ def _play_one_game_recording(
                     active_policy = np.zeros(
                         ACTION_VOCAB_SIZE, dtype=_DTYPE_POLICY,
                     )
-                    # Filter visits down to root-state legal decisions
-                    # before encoding. PIMC aggregates visits across K
-                    # determinized worlds; some decisions (notably
-                    # exile-zone casts whose legality depends on
-                    # hidden info — battlefield-granted warp filters,
-                    # etc.) are legal in some determinizations but not
-                    # the actual root. Without filtering, those visits
-                    # put policy mass on slots the action_mask
-                    # correctly excludes; the trainer's
-                    # masked_fill(~mask, -1e9) then makes masked CE
-                    # explode (~10k per affected row). The principled
-                    # fix is ISMCTS — see docs/ISMCTS_MIGRATION.md —
-                    # but this filter cleans the training data
-                    # immediately. Decisions that overflow an encoding
-                    # cap also get dropped here; if everything's gone,
-                    # fall through to no-policy-supervision for this
-                    # row.
-                    legal_now = set(adapter.legal_decisions())
+                    # Decisions that overflow an encoding cap get
+                    # dropped here; if everything's gone, fall through
+                    # to no-policy-supervision for this row.
                     counted = 0.0
                     for d, count in visits.items():
-                        if d not in legal_now:
-                            continue
                         try:
                             slot = encode(d, engine, active)
                         except EncodingOverflowError:
