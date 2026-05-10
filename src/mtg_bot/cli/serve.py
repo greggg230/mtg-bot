@@ -316,11 +316,17 @@ def create_app(
         workers calling concurrently can't get overlapping ranges.
 
         Stop-button propagation: when ``progress_dir`` is configured
-        and a ``.STOP_<run_id>`` sentinel exists, returns 410 Gone
-        with body ``{"stopped": True}``. Remotes treat 410 as a
-        clean drain signal — they exit their take-loop after
-        finishing their current game, the same way they handle 404
-        on a master shutdown.
+        and a ``.STOP_<run_id>`` sentinel exists, returns 200 with
+        body ``{"games": [], "remaining": 0, "closed": True,
+        "stopped": True}``. The remote shard's ``_take_one`` already
+        treats ``closed=True`` as a clean drain signal (same path as
+        the orchestrator's early-stop ``/queue/close`` POST), so the
+        worker exits its take-loop after finishing its current game.
+        We deliberately use 200 (not 410) because ``urllib.request.
+        urlopen`` raises ``HTTPError`` on any 4xx — a 410 here would
+        crash the shard via ``_urlopen_with_retry`` rather than
+        drain it cleanly. The ``stopped: True`` extra field is
+        diagnostic / informational; remotes don't need to read it.
         """
         data = request.get_json(silent=True) or {}
         run_id = data.get("run_id")
@@ -332,10 +338,11 @@ def create_app(
         ):
             return jsonify({
                 "stopped": True,
+                "closed": True,
                 "run_id": run_id,
                 "games": [],
                 "remaining": 0,
-            }), 410
+            })
         with _queues_lock:
             q = _queues.get(run_id)
             if q is None:
