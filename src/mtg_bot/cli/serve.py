@@ -194,6 +194,7 @@ def create_app(
     repo_root: Optional[Path] = None,
     progress_dir: Optional[Path] = None,
     runs_db_path: Optional[Path] = None,
+    shards_config_path: Optional[Path] = None,
 ) -> Flask:
     """Build the master HTTP server. ``progress_dir`` (when set)
     enables Stop-button propagation to remotes: each ``/queue/take``
@@ -208,6 +209,14 @@ def create_app(
     write endpoints serialize through ``mtg_bot.cli.runs.db.WRITE_LOCK``
     so concurrent POSTs from many remotes don't race the SQLite
     writer. Default ``None`` disables these endpoints (returns 404).
+
+    ``shards_config_path`` (when set) enables the dynamic worker
+    scaling endpoints (``GET /api/shards``, ``POST /api/shards/
+    <host>/workers``). The training UI uses these to bump
+    ``n_workers`` per shard between iters. **Phase 1 only**: the
+    write lands on disk immediately and the iterate loop's per-iter
+    refresh picks it up at the next iter boundary; the in-flight
+    iter is unchanged. Mid-iter scaling is Phase 2 (deferred).
     """
     # Local import to avoid scripts/ depending on the package at module
     # import time during early bootstrap.
@@ -218,6 +227,7 @@ def create_app(
     from mtg_bot.cli.runs.models import (  # noqa: WPS433
         Artifact, Event, ProgressUpdate, Run,
     )
+    from mtg_bot.training import shards_config_edit  # noqa: WPS433
 
     app = Flask(__name__)
 
@@ -550,6 +560,69 @@ def create_app(
             conn.close()
         return jsonify({"runs": rows})
 
+    # ---- dynamic worker scaling (Phase 1) -----------------------
+    # Enabled iff ``shards_config_path`` is set. Phase 1 semantics:
+    # the POST mutates the on-disk shards-config file immediately,
+    # and iterate's per-iter refresh picks the change up at the next
+    # iter boundary. The CURRENTLY RUNNING iter is unaffected (its
+    # multiprocessing.Pool is already sized). Phase 2 will support
+    # mid-iter rescale by switching to a queue + spawn/kill worker
+    # pattern; explicitly out of scope here.
+
+    def _shards_disabled():
+        return jsonify({
+            "error": "shards-config not configured on this server",
+        }), 404
+
+    @app.route("/api/shards", methods=["GET"])
+    def api_shards_get():
+        """Return the current contents of the shards-config file
+        (the ``{"shards": [...]}`` JSON dict). Used by the training
+        UI to know which hosts exist and what their current
+        n_workers values are independent of any in-flight iter's
+        per-shard progress JSON."""
+        if shards_config_path is None:
+            return _shards_disabled()
+        if not shards_config_path.is_file():
+            return jsonify({
+                "error": f"shards-config not found: {shards_config_path}",
+            }), 404
+        try:
+            raw = shards_config_edit.read_shards_config_raw(
+                shards_config_path,
+            )
+        except (OSError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 500
+        return jsonify(raw)
+
+    @app.route("/api/shards/<host>/workers", methods=["POST"])
+    def api_shards_set_workers(host: str):
+        """Update the n_workers field for the shard with
+        ``host == <host>``. Body: ``{"n_workers": N}`` with N in
+        ``[1, 64]``. Returns 400 on invalid value, 404 on unknown
+        host. The mutation persists across server / iterate
+        restarts because it writes through to the on-disk JSON."""
+        if shards_config_path is None:
+            return _shards_disabled()
+        data = request.get_json(silent=True) or {}
+        if "n_workers" not in data:
+            return jsonify({"error": "n_workers required"}), 400
+        try:
+            updated = shards_config_edit.update_shard_n_workers(
+                shards_config_path, host, data["n_workers"],
+            )
+        except shards_config_edit.ShardsConfigEditError as exc:
+            msg = str(exc)
+            if msg.startswith("unknown host"):
+                return jsonify({"error": msg}), 404
+            return jsonify({"error": msg}), 400
+        return jsonify({
+            "ok": True,
+            "host": host,
+            "n_workers": int(data["n_workers"]),
+            "shards": updated.get("shards", []),
+        })
+
     @app.route("/repo.bundle")
     def repo_bundle():
         """Stream the master's repo as a git bundle — every ref,
@@ -645,6 +718,19 @@ def main(argv=None) -> None:  # pragma: no cover
             "disable the run-DB endpoints entirely."
         ),
     )
+    parser.add_argument(
+        "--shards-config", type=Path,
+        default=Path("shards_config.json"),
+        help=(
+            "Path to the shards-config JSON file iterate reads at "
+            "the top of each iter. When set, the server exposes "
+            "GET /api/shards and POST /api/shards/<host>/workers "
+            "for the training UI's dynamic worker-scale controls. "
+            "Phase 1 only: writes take effect on the NEXT iter (the "
+            "in-flight iter is unchanged). Pass an empty string to "
+            "disable these endpoints. Default: shards_config.json."
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo_url = args.repo_url or _detect_repo_url(args.repo_root)
@@ -668,6 +754,11 @@ def main(argv=None) -> None:  # pragma: no cover
         # ``--runs-db-path ''`` collapses to ``Path('.')``; treat as
         # explicit-disable.
         runs_db_path = None
+    shards_config_path: Optional[Path] = args.shards_config
+    if shards_config_path is not None and str(shards_config_path) == ".":
+        # ``--shards-config ''`` collapses to ``Path('.')``; treat as
+        # explicit-disable.
+        shards_config_path = None
     app = create_app(
         repo_url=repo_url,
         master_pubkey=pubkey,
@@ -676,6 +767,7 @@ def main(argv=None) -> None:  # pragma: no cover
         repo_root=args.repo_root,
         progress_dir=args.progress_dir,
         runs_db_path=runs_db_path,
+        shards_config_path=shards_config_path,
     )
     print(
         f"[serve_setup] master={master_tailnet_name} repo={repo_url} "
