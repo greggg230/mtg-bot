@@ -89,3 +89,9 @@ profile_results/
 # MB; the parsed deck JSON is much smaller but still derived data.
 # Regenerable via scripts/fetch_17lands_data.py.
 data/17lands/
+
+# Cargo build artifacts for the rust/ engine crate. Rebuilt by
+# `maturin develop --release -m rust/pyproject.toml`; the resulting
+# .pyd lands in the venv's site-packages, not in the source tree.
+rust/target/
+

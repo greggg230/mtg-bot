@@ -206,6 +206,7 @@ class NNEvalServer:
         address: Any = ("127.0.0.1", 0),
         authkey: Optional[bytes] = None,
         model_factory: Optional[Any] = None,
+        hidden_sizes: Optional[tuple[int, ...]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._device = torch.device(device)
@@ -218,13 +219,20 @@ class NNEvalServer:
 
         # Build the model. ``model_factory`` is an injection point
         # for tests that want a deterministic / instrumented network
-        # without touching the production load path.
+        # without touching the production load path. ``hidden_sizes``
+        # threads through to the underlying MLP — the server must
+        # match the trunk shape the saved weights were trained at,
+        # mirroring the same knob on ``NNEvaluator`` and
+        # ``NNPimcConfig``.
+        mlp_kwargs: dict[str, Any] = {}
+        if hidden_sizes is not None:
+            mlp_kwargs["hidden_sizes"] = tuple(hidden_sizes)
         if model_factory is not None:
             self._model = model_factory()
         elif with_policy:
-            self._model = _ValuePolicyMLP()
+            self._model = _ValuePolicyMLP(**mlp_kwargs)
         else:
-            self._model = _ValueMLP()
+            self._model = _ValueMLP(**mlp_kwargs)
         if weights_path is not None and model_factory is None:
             state_dict = torch.load(
                 weights_path,
@@ -958,6 +966,7 @@ def _server_subprocess_main(
     batch_wait_ms: float,
     address: Any,
     authkey: bytes,
+    hidden_sizes: Optional[tuple[int, ...]],
     ready_event: Any,
     stop_event: Any,
     handle_box: Any,
@@ -976,6 +985,7 @@ def _server_subprocess_main(
         batch_wait_ms=batch_wait_ms,
         address=address,
         authkey=authkey,
+        hidden_sizes=hidden_sizes,
     )
     server.start()
     handle_box["address"] = server.address
@@ -997,6 +1007,7 @@ def launch_server_subprocess(
     batch_wait_ms: float = 5.0,
     address: Any = ("127.0.0.1", 0),
     authkey: Optional[bytes] = None,
+    hidden_sizes: Optional[tuple[int, ...]] = None,
 ) -> "_SubprocessServerProxy":
     """Spawn an :class:`NNEvalServer` in a child process.
 
@@ -1028,6 +1039,7 @@ def launch_server_subprocess(
             batch_wait_ms,
             address,
             authkey,
+            tuple(hidden_sizes) if hidden_sizes is not None else None,
             ready,
             stop,
             handle_box,

@@ -1,7 +1,8 @@
-"""Tests for ``scripts/iterate_alphazero.py`` -> ``train_nn.py``
-flag-passthrough plumbing.
+"""Tests for ``mtg_bot.cli.iterate`` -> ``scripts/train_nn.py`` shim
+flag-passthrough plumbing (the iterate loop is now in
+``mtg_bot.cli.iterate``; the script is a thin shim).
 
-The iterate loop spawns ``train_nn.py`` via ``subprocess.run``;
+The iterate loop spawns ``scripts/train_nn.py`` via ``subprocess.run``;
 the per-iteration train hyperparameters (``--epochs``,
 ``--policy-loss-weight``, ``--one-legal-keep-frac``, ...) need
 to land in the subprocess argv exactly as the operator set them.
@@ -13,7 +14,7 @@ are present.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,19 +23,15 @@ import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPT_PATH = _REPO_ROOT / "scripts" / "iterate_alphazero.py"
 
 
 def _load_module():
     src_dir = _REPO_ROOT / "src"
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
-    spec = importlib.util.spec_from_file_location(
-        "iterate_alphazero", _SCRIPT_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    if "mtg_bot.cli.iterate" in sys.modules:
+        del sys.modules["mtg_bot.cli.iterate"]
+    return importlib.import_module("mtg_bot.cli.iterate")
 
 
 def _captured_subprocess_call(**kwargs):

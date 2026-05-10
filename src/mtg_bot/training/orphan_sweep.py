@@ -249,7 +249,15 @@ def _list_processes_windows() -> list[ProcessInfo]:
     if cp.returncode != 0 or not cp.stdout.strip():
         return []
     try:
-        raw = json.loads(cp.stdout)
+        # ``strict=False`` permits literal control characters (0x00..0x1F)
+        # inside JSON strings, per RFC 8259 leniency. Real-world
+        # ``Get-CimInstance Win32_Process`` output on Win11 has been
+        # observed with at least one process whose ``CommandLine`` field
+        # carries a stray control char (e.g. ``\x01``) — strict-mode
+        # parsing rejects the entire ~160 KB document, which would
+        # otherwise leave us silently returning ``[]`` and skipping the
+        # whole sweep. Best-effort listing → permit the leniency.
+        raw = json.loads(cp.stdout, strict=False)
     except json.JSONDecodeError:
         return []
     # Single result returns a dict, multiple returns a list.

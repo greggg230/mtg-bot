@@ -2,19 +2,16 @@
   "shards": [
     {
       "host": "local",
-      "n_games": 250,
-      "n_workers": 16
+      "n_workers": 8
     },
     {
       "host": "greggs-macbook-pro",
-      "n_games": 150,
       "user": "greggkeithley",
       "repo_path": "/Users/greggkeithley/projects/mtg-bot",
       "venv_python": ".venv-py313/bin/python"
     },
     {
       "host": "desktop-g72aptg",
-      "n_games": 100,
       "user": "gregg",
       "repo_path": "C:\\Users\\Gregg\\Projects\\mtg-bot",
       "venv_python": ".venv-py313\\Scripts\\python.exe",

@@ -40,7 +40,7 @@ to Information-Set MCTS later):
 from __future__ import annotations
 
 import random
-from typing import Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 from mtg_bot.search.determinize import determinize as _default_determinize
 from mtg_bot.search.engine_adapter import MtgGameStateAdapter
@@ -262,6 +262,104 @@ class PIMC(SearchStrategy):
         chosen = max(candidates, key=lambda c: c["visits"])["decision"]
         return (chosen, candidates)
 
+    def choose_with_subtree(
+        self,
+        state: GameState,
+        player_id: PlayerID,
+        tree_depth: int = 1,
+        tree_top_k: Optional[int] = None,
+    ) -> tuple[Optional[Decision], list[dict]]:
+        """PIMC equivalent of ``MCTS.choose_with_subtree``: run K
+        determinized sub-searches and aggregate the per-level
+        candidate stats so the diagnostic replay viewer can drill
+        into the search tree under any root candidate.
+
+        Aggregation rules at every level mirror ``choose_with_full_stats``:
+        visits sum, q/prior/leaf_value are visit-weighted means
+        across the sub-searches that visited the same decision.
+        Sub-trees are merged by recursively aggregating the per-decision
+        children lists, then sorting by visits desc and slicing to
+        ``tree_top_k`` (None = keep all). The root level keeps ALL
+        candidates regardless of ``tree_top_k`` — the data-gen policy
+        encoder needs the full visit distribution. Top-K pruning kicks
+        in at depth ≥ 1.
+
+        ``tree_depth=1`` reproduces ``choose_with_full_stats`` exactly
+        with ``subtree=[]`` on every candidate.
+
+        Forced moves: same single-element shape as
+        ``choose_with_full_stats``, with ``subtree=[]``.
+        """
+        if tree_depth < 1:
+            raise ValueError(
+                f"tree_depth must be >= 1, got {tree_depth!r}"
+            )
+        if not isinstance(state, MtgGameStateAdapter):
+            raise TypeError(
+                "PIMC requires an MtgGameStateAdapter; got "
+                f"{type(state).__name__}."
+            )
+        legal = list(state.legal_decisions())
+        if len(legal) == 1:
+            decision = legal[0]
+            return (
+                decision,
+                [
+                    {
+                        "decision": decision,
+                        "visits": 1,
+                        "q": None,
+                        "prior": None,
+                        "leaf_value": None,
+                        "subtree": [],
+                    }
+                ],
+            )
+
+        per_sub_candidates: list[list[dict]] = []
+        for _ in range(self.samples):
+            sub_seed = self.rng.randrange(1 << 62)
+            adapter = self._build_sub_adapter(state, player_id, sub_seed)
+            inner = self.inner_factory()
+            sub_fn = getattr(inner, "choose_with_subtree", None)
+            if sub_fn is None:
+                # Inner doesn't expose the subtree-aware interface —
+                # fall back to ``choose_with_full_stats`` (or visits)
+                # and synthesize an empty subtree per candidate.
+                full_fn = getattr(inner, "choose_with_full_stats", None)
+                if full_fn is not None:
+                    _, sub_candidates = full_fn(adapter, player_id)
+                else:
+                    visits = inner.choose_with_visits(adapter, player_id)
+                    sub_candidates = [
+                        {
+                            "decision": d, "visits": v, "q": None,
+                            "prior": None, "leaf_value": None,
+                        }
+                        for d, v in visits.items()
+                    ]
+                # Stamp empty subtree so the aggregator's recursion
+                # sees a uniform shape.
+                sub_candidates = [
+                    {**c, "subtree": []} for c in sub_candidates
+                ]
+            else:
+                _, sub_candidates = sub_fn(
+                    adapter, player_id,
+                    tree_depth=tree_depth, tree_top_k=tree_top_k,
+                )
+            per_sub_candidates.append(sub_candidates)
+
+        candidates = _aggregate_subtree_candidates(
+            per_sub_candidates,
+            top_k=tree_top_k,
+            is_root=True,
+        )
+        if not candidates:
+            return (None, [])
+        chosen = max(candidates, key=lambda c: c["visits"])["decision"]
+        return (chosen, candidates)
+
     def _build_sub_adapter(
         self, source: MtgGameStateAdapter, viewer_id: PlayerID, sub_seed: int,
     ) -> MtgGameStateAdapter:
@@ -286,3 +384,87 @@ class PIMC(SearchStrategy):
             in_place=True,
         )
         return sub
+
+
+def _aggregate_subtree_candidates(
+    per_sub_candidates: list[list[dict[str, Any]]],
+    top_k: Optional[int],
+    is_root: bool,
+) -> list[dict[str, Any]]:
+    """Merge K parallel candidate lists (one per PIMC sub-search)
+    into a single per-decision list, recursively aggregating each
+    decision's subtree.
+
+    For every distinct ``decision`` seen across the K input lists,
+    we:
+
+    - Sum visits.
+    - Compute a visit-weighted mean of q / prior / leaf_value over
+      sub-searches that observed the decision (visits > 0 and the
+      field present). None when no sub-search recorded the field.
+    - Recursively aggregate the per-sub-search ``subtree`` lists for
+      that same decision into a single subtree.
+
+    After merging, sort by visits desc. At ``is_root=True`` we keep
+    every decision; at deeper levels we slice to ``top_k`` (None =
+    keep all).
+    """
+    by_decision: dict[Any, dict[str, Any]] = {}
+    sub_lists_by_decision: dict[Any, list[list[dict[str, Any]]]] = {}
+    for sub_candidates in per_sub_candidates:
+        for c in sub_candidates:
+            d = c["decision"]
+            v = int(c["visits"])
+            entry = by_decision.setdefault(
+                d,
+                {
+                    "decision": d,
+                    "visits": 0,
+                    "q_num": 0.0, "q_den": 0,
+                    "prior_num": 0.0, "prior_den": 0,
+                    "leaf_num": 0.0, "leaf_den": 0,
+                },
+            )
+            entry["visits"] += v
+            if c.get("q") is not None and v > 0:
+                entry["q_num"] += float(c["q"]) * v
+                entry["q_den"] += v
+            if c.get("prior") is not None and v > 0:
+                entry["prior_num"] += float(c["prior"]) * v
+                entry["prior_den"] += v
+            if c.get("leaf_value") is not None and v > 0:
+                entry["leaf_num"] += float(c["leaf_value"]) * v
+                entry["leaf_den"] += v
+            sub_lists_by_decision.setdefault(d, []).append(
+                list(c.get("subtree") or []),
+            )
+
+    candidates: list[dict[str, Any]] = []
+    for d, entry in by_decision.items():
+        merged_sub = _aggregate_subtree_candidates(
+            sub_lists_by_decision.get(d, []),
+            top_k=top_k,
+            is_root=False,
+        )
+        candidates.append({
+            "decision": d,
+            "visits": entry["visits"],
+            "q": (
+                entry["q_num"] / entry["q_den"]
+                if entry["q_den"] else None
+            ),
+            "prior": (
+                entry["prior_num"] / entry["prior_den"]
+                if entry["prior_den"] else None
+            ),
+            "leaf_value": (
+                entry["leaf_num"] / entry["leaf_den"]
+                if entry["leaf_den"] else None
+            ),
+            "subtree": merged_sub,
+        })
+
+    candidates.sort(key=lambda c: c["visits"], reverse=True)
+    if not is_root and top_k is not None:
+        candidates = candidates[:top_k]
+    return candidates

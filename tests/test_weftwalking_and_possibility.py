@@ -406,3 +406,59 @@ def test_legal_moves_does_not_offer_free_cast_to_nonactive_player():
     assert not free_casts, (
         "nonactive player should not get free-cast on the active player's turn"
     )
+
+
+def test_legal_actions_does_not_offer_cast_for_free_for_warp_castable_card_in_graveyard():
+    """Regression: legal_actions used to emit ``CastSpell(cast_for_free=True)``
+    for a card in the graveyard with ``warp_castable_from_graveyard``
+    when Weftwalking is on the battlefield, but the apply path's
+    graveyard cast route is gated on ``use_warp=True`` — leaving no
+    cast route for the ``cast_for_free=True`` graveyard variant. The
+    crash surfaced as a 0.03%-rate ValueError in v16-vs-v13 eval
+    (1/3263 games). Per CR 117.9b a single cast can apply only one
+    alternative cost, and the warp-from-graveyard permission already
+    bakes in the warp cost as the alt cost — so a free-cast variant
+    isn't legal in any case.
+    """
+    from mtg_bot.actions import CastSpell, apply_action
+    from mtg_bot.cards import BASIC_LANDS
+    from mtg_bot.legal import legal_actions
+    from tests._rules_helpers import _arena
+
+    culler = _PRINTINGS["Timeline Culler"]
+    state = _arena(
+        p0_battlefield=[
+            _PRINTINGS["Weftwalking"],
+            BASIC_LANDS["Swamp"],
+        ],
+        p0_life=20,
+    )
+    grave_card = state.new_object(culler, owner_id=0, zone=Zone.GRAVEYARD)
+    state.players[0].graveyard.append(grave_card)
+
+    moves = legal_actions(state, 0)
+    free_grave = [
+        m for m in moves
+        if isinstance(m, CastSpell)
+        and m.card_id == grave_card.id
+        and m.cast_for_free
+    ]
+    assert not free_grave, (
+        "cast_for_free=True must not be offered for a card in the "
+        "graveyard — apply path has no route for this combination "
+        "and the warp permission is itself an alt cost (CR 117.9b)"
+    )
+
+    # The warp-from-graveyard variant remains legal and apply must
+    # still accept it.
+    warp_grave = [
+        m for m in moves
+        if isinstance(m, CastSpell)
+        and m.card_id == grave_card.id
+        and m.use_warp
+    ]
+    assert warp_grave, (
+        "warp-from-graveyard must remain a legal move (Timeline Culler)"
+    )
+    apply_action(state, 0, warp_grave[0])
+    assert grave_card not in state.players[0].graveyard

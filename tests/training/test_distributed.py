@@ -38,7 +38,7 @@ def _iso_offset_seconds(seconds: float) -> str:
 
 
 def test_local_shard_minimal_fields_are_enough():
-    shard = ShardConfig(host="local", n_games=100)
+    shard = ShardConfig(host="local")
     assert shard.is_local
     assert shard.display_label == "local"
     assert shard.seed_offset == 0
@@ -49,7 +49,7 @@ def test_label_falls_back_to_host_for_remote():
     ``host="local"`` shards in one config would collide on this —
     that's caught by ShardsConfig dup-label validation, not here."""
     shard = ShardConfig(
-        host="my-mac", n_games=50,
+        host="my-mac",
         user="gregg", repo_path="/r",
         venv_python=".venv/bin/python",
     )
@@ -60,12 +60,12 @@ def test_remote_shard_requires_user_repo_python():
     """Remote shard with missing fields fails at construction time
     (don't wait until self-play has been running for 10 minutes)."""
     with pytest.raises(ValueError, match="missing fields"):
-        ShardConfig(host="remote", n_games=100)
+        ShardConfig(host="remote")
     with pytest.raises(ValueError, match="missing fields"):
-        ShardConfig(host="remote", n_games=100, user="gregg")
+        ShardConfig(host="remote", user="gregg")
     # Complete remote shard — no exception.
     ShardConfig(
-        host="remote", n_games=100,
+        host="remote",
         user="gregg",
         repo_path="/repo",
         venv_python=".venv/bin/python",
@@ -75,38 +75,46 @@ def test_remote_shard_requires_user_repo_python():
 def test_remote_shard_local_fields_are_optional_for_local():
     """Local shards never read user/repo_path/venv_python; missing
     those isn't an error for ``host="local"``."""
-    ShardConfig(host="local", n_games=100)
+    ShardConfig(host="local")
 
 
-def test_n_games_must_be_positive():
-    with pytest.raises(ValueError, match="n_games must be positive"):
-        ShardConfig(host="local", n_games=0)
-    with pytest.raises(ValueError, match="n_games must be positive"):
-        ShardConfig(host="local", n_games=-5)
+def test_legacy_n_games_field_rejected_with_pointer():
+    """Hard removal of the old per-shard ``n_games`` quota: any JSON
+    that still carries it should fail loudly with a pointer at
+    ``--games-per-iteration`` rather than silently swallow the value
+    and mislead the next reader."""
+    with pytest.raises(ValueError, match="n_games"):
+        ShardConfig.from_dict({"host": "local", "n_games": 100})
+    with pytest.raises(ValueError, match="--games-per-iteration"):
+        ShardConfig.from_dict({"host": "local", "n_games": 100})
 
 
 def test_seed_offset_must_be_non_negative():
     with pytest.raises(ValueError, match="seed_offset"):
-        ShardConfig(host="local", n_games=10, seed_offset=-1)
+        ShardConfig(host="local", seed_offset=-1)
 
 
 def test_empty_host_rejected():
     with pytest.raises(ValueError, match="host is required"):
-        ShardConfig(host="", n_games=10)
+        ShardConfig(host="")
 
 
 # ---- ShardsConfig -------------------------------------------------
 
 
-def test_shards_config_total_games_sums():
+def test_shards_config_holds_shard_tuple():
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=200),
+        ShardConfig(host="local"),
         ShardConfig(
-            host="m1", n_games=150, user="u",
+            host="m1", user="u",
             repo_path="/r", venv_python=".venv/bin/python",
         ),
     ))
-    assert cfg.total_games == 350
+    # No more total_games property — total games per iter comes
+    # from iterate_alphazero.py's --games-per-iteration. The shards
+    # config just enumerates the workers.
+    assert len(cfg.shards) == 2
+    assert [s.host for s in cfg.shards] == ["local", "m1"]
 
 
 def test_shards_config_rejects_empty_list():
@@ -119,8 +127,8 @@ def test_shards_config_rejects_duplicate_labels():
     output filenames. Reject up-front."""
     with pytest.raises(ValueError, match="duplicate shard labels"):
         ShardsConfig(shards=(
-            ShardConfig(host="local", n_games=100, label="A"),
-            ShardConfig(host="local", n_games=100, label="A"),
+            ShardConfig(host="local", label="A"),
+            ShardConfig(host="local", label="A"),
         ))
 
 
@@ -129,10 +137,11 @@ def test_shards_config_allows_two_local_with_distinct_labels():
     labels (the user might want to split a single host's load by
     seed range, though that's silly today; future-proofing)."""
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=100, label="L1"),
-        ShardConfig(host="local", n_games=100, label="L2", seed_offset=1_000_000),
+        ShardConfig(host="local", label="L1"),
+        ShardConfig(host="local", label="L2", seed_offset=1_000_000),
     ))
-    assert cfg.total_games == 200
+    assert len(cfg.shards) == 2
+    assert {s.display_label for s in cfg.shards} == {"L1", "L2"}
 
 
 # ---- load_shards_config -------------------------------------------
@@ -144,18 +153,18 @@ def _write(path: Path, data: dict) -> None:
 
 def test_load_assigns_default_seed_offsets_by_position(tmp_path: Path):
     """Idiomatic pattern: seed_offset defaults to position * 1M so
-    shards never collide for any sane n_games. Caller can still
+    shards never collide for any sane game count. Caller can still
     override explicitly."""
     p = tmp_path / "shards.json"
     _write(p, {
         "shards": [
-            {"host": "local", "n_games": 100},
+            {"host": "local"},
             {
-                "host": "m1", "n_games": 100,
+                "host": "m1",
                 "user": "u", "repo_path": "/r",
                 "venv_python": ".venv/bin/python",
             },
-            {"host": "local", "n_games": 100, "label": "L3"},
+            {"host": "local", "label": "L3"},
         ],
     })
     cfg = load_shards_config(p)
@@ -168,29 +177,46 @@ def test_load_explicit_seed_offset_overrides_default(tmp_path: Path):
     p = tmp_path / "shards.json"
     _write(p, {
         "shards": [
-            {"host": "local", "n_games": 100, "seed_offset": 42},
+            {"host": "local", "seed_offset": 42},
         ],
     })
     cfg = load_shards_config(p)
     assert cfg.shards[0].seed_offset == 42
 
 
-def test_load_three_machine_example(tmp_path: Path):
-    """The canonical setup from the design doc: master local + Win
-    1080Ti box + Apple Silicon Mac, sharing a 500-game iter as
-    200/150/150."""
+def test_load_legacy_n_games_field_rejected(tmp_path: Path):
+    """A shards-config JSON predating the cleanup still has
+    ``n_games`` per shard. ``load_shards_config`` must surface a
+    pointer-at-the-replacement error rather than silently ignoring
+    the field — the user's most likely intent in that case is the
+    old "queue size from sum of n_games" behavior, which is now
+    owned by ``--games-per-iteration``."""
     p = tmp_path / "shards.json"
     _write(p, {
         "shards": [
             {"host": "local", "n_games": 200},
+        ],
+    })
+    with pytest.raises(ValueError, match="--games-per-iteration"):
+        load_shards_config(p)
+
+
+def test_load_three_machine_example(tmp_path: Path):
+    """The canonical setup from the design doc: master local + Win
+    1080Ti box + Apple Silicon Mac. Per-shard quotas live in
+    ``--games-per-iteration`` now, not in the JSON."""
+    p = tmp_path / "shards.json"
+    _write(p, {
+        "shards": [
+            {"host": "local"},
             {
-                "host": "win-1080ti", "n_games": 150,
+                "host": "win-1080ti",
                 "user": "gregg",
                 "repo_path": "C:\\Users\\gregg\\Projects\\mtg-bot",
                 "venv_python": ".venv-py313\\Scripts\\python.exe",
             },
             {
-                "host": "macbook", "n_games": 150,
+                "host": "macbook",
                 "user": "gregg",
                 "repo_path": "/Users/gregg/projects/mtg-bot",
                 "venv_python": ".venv-py313/bin/python",
@@ -198,7 +224,6 @@ def test_load_three_machine_example(tmp_path: Path):
         ],
     })
     cfg = load_shards_config(p)
-    assert cfg.total_games == 500
     assert [s.host for s in cfg.shards] == ["local", "win-1080ti", "macbook"]
     assert cfg.shards[0].is_local
     assert not cfg.shards[1].is_local
@@ -272,9 +297,10 @@ def test_run_shard_local_writes_npz_with_per_shard_filename(
         per_game_timeout_sec=None,
         with_policy=True,
     )
-    shard = ShardConfig(host="local", n_games=2, label="L0")
+    shard = ShardConfig(host="local", label="L0")
     npz_path = run_shard_local(
         shard, spec,
+        n_games=2,
         progress_dir=progress_dir,
         output_dir=out_dir,
         run_id_prefix="iter_001_self_play_v1",
@@ -400,8 +426,8 @@ def test_run_distributed_two_local_shards_both_produce_npz(
         with_policy=True,
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1,
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1,
                     seed_offset=1_000_000),
     ))
     queue_url, server = _start_queue_server()
@@ -490,8 +516,8 @@ def test_run_distributed_eval_two_local_shards_aggregate_counts(
         opponent_label="self",
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1),
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1),
     ))
     queue_url, server = _start_queue_server()
     try:
@@ -548,8 +574,8 @@ def test_run_distributed_self_play_with_slack_initializes_overqueue(
         with_policy=True,
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1,
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1,
                     seed_offset=1_000_000),
     ))
     queue_url, server = _start_queue_server()
@@ -596,8 +622,8 @@ def test_run_distributed_eval_with_slack_initializes_overqueue(
         opponent_label="self",
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1),
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1),
     ))
     queue_url, server = _start_queue_server()
     try:
@@ -841,9 +867,84 @@ def test_eval_spec_architecture_round_trips():
     assert rt.policy_hidden_sizes == (48, 24)
 
 
+def test_self_play_spec_action_encoding_version_round_trips():
+    """``action_encoding_version`` round-trips through to_dict /
+    from_dict so remote shards encode policy targets under the same
+    slot-mapping convention the bootstrap weights were trained at.
+    Without this round-trip, the cluster silently mixes v1 remote
+    data with v2 master data on a v17 training run."""
+    from mtg_bot.training.distributed import SelfPlayJobSpec
+
+    original = SelfPlayJobSpec(
+        weights_path="w.pt", samples=4, inner_nodes=200,
+        hidden_sizes=(1024, 1024, 512),
+        base_seed=0, enable_mulligans=False,
+        per_game_timeout_sec=None,
+        action_encoding_version="canonical_v2",
+    )
+    rt = SelfPlayJobSpec.from_dict(original.to_dict())
+    assert rt.action_encoding_version == "canonical_v2"
+
+
+def test_self_play_spec_action_encoding_version_default_is_none():
+    """Older payloads without the field decode cleanly with
+    ``action_encoding_version=None`` so v13/v15/v16-era specs already
+    in flight don't crash. None resolves to NNEvaluator's
+    "positional_v1" downstream — the existing back-compat path."""
+    from mtg_bot.training.distributed import SelfPlayJobSpec
+
+    rebuilt = SelfPlayJobSpec.from_dict({
+        "weights_path": "w.pt",
+        "samples": 1, "inner_nodes": 1,
+        "hidden_sizes": None,
+        "base_seed": 0,
+        "enable_mulligans": False,
+        "per_game_timeout_sec": None,
+    })
+    assert rebuilt.action_encoding_version is None
+
+
+def test_eval_spec_action_encoding_version_round_trips_per_side():
+    """Each side carries its own ``action_encoding_version`` so a
+    cross-version eval (v17[canonical_v2] vs v13[positional_v1]) can
+    encode each NN's PUCT priors against its trained slot mapping.
+    Mixing them up scrambles either side's priors silently."""
+    from mtg_bot.training.distributed import EvalJobSpec
+
+    original = EvalJobSpec(
+        new_weights_path="new.pt", old_weights_path="old.pt",
+        samples=4, inner_nodes=200, hidden_sizes=(64, 64),
+        base_seed=42, enable_mulligans=False,
+        per_game_timeout_sec=300.0,
+        new_action_encoding_version="canonical_v2",
+        old_action_encoding_version="positional_v1",
+    )
+    rt = EvalJobSpec.from_dict(original.to_dict())
+    assert rt.new_action_encoding_version == "canonical_v2"
+    assert rt.old_action_encoding_version == "positional_v1"
+
+
+def test_eval_spec_action_encoding_version_default_is_none():
+    """Older eval payloads without the per-side fields decode with
+    None on both sides — back-compat for v13/v15/v16-era evals."""
+    from mtg_bot.training.distributed import EvalJobSpec
+
+    rebuilt = EvalJobSpec.from_dict({
+        "new_weights_path": "new.pt",
+        "old_weights_path": None,
+        "samples": 1, "inner_nodes": 1,
+        "hidden_sizes": None,
+        "base_seed": 0,
+        "enable_mulligans": False,
+        "per_game_timeout_sec": None,
+    })
+    assert rebuilt.new_action_encoding_version is None
+    assert rebuilt.old_action_encoding_version is None
+
+
 def test_shard_config_round_trips_through_to_dict_from_dict():
     s = ShardConfig(
-        host="win-1080ti", n_games=150, label="win",
+        host="win-1080ti", label="win",
         seed_offset=1_000_000, n_workers=8,
         user="gregg",
         repo_path="C:\\Users\\gregg\\Projects\\mtg-bot",
@@ -873,7 +974,7 @@ def test_remote_pull_command_posix_round_trips_b64_args():
         per_game_timeout_sec=300.0,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -982,7 +1083,7 @@ def test_remote_eval_command_posix_round_trips():
         per_game_timeout_sec=300.0,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -1026,7 +1127,7 @@ def test_remote_eval_command_windows_uses_cmd_syntax():
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="win-box", n_games=10, user="g",
+        host="win-box", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -1052,7 +1153,7 @@ def test_remote_join_windows_normalizes_to_forward_slashes():
     from mtg_bot.training.distributed import _remote_join
 
     shard = ShardConfig(
-        host="winbox", n_games=10, user="g",
+        host="winbox", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -1091,7 +1192,7 @@ def test_remote_join_posix_uses_forward_slashes():
     from mtg_bot.training.distributed import _remote_join
 
     shard = ShardConfig(
-        host="mac", n_games=10, user="g",
+        host="mac", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -1107,7 +1208,7 @@ def test_remote_bundle_sync_command_posix():
         _build_remote_bundle_sync_command,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -1128,7 +1229,7 @@ def test_remote_bundle_sync_command_windows():
         _build_remote_bundle_sync_command,
     )
     shard = ShardConfig(
-        host="winbox", n_games=10, user="g",
+        host="winbox", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -1160,7 +1261,7 @@ def test_remote_pull_command_windows_uses_cmd_syntax():
         per_game_timeout_sec=300.0,
     )
     shard = ShardConfig(
-        host="win-box", n_games=10, user="g",
+        host="win-box", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -1186,7 +1287,7 @@ def test_remote_mkdir_command_posix_quotes_path():
     from mtg_bot.training.distributed import _build_remote_mkdir_command
 
     shard = ShardConfig(
-        host="mac", n_games=10, user="g",
+        host="mac", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -1202,7 +1303,7 @@ def test_remote_mkdir_command_windows_uses_powershell_new_item():
     from mtg_bot.training.distributed import _build_remote_mkdir_command
 
     shard = ShardConfig(
-        host="winbox", n_games=10, user="g",
+        host="winbox", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -1301,7 +1402,7 @@ def test_weight_push_posix_command_shape(monkeypatch, tmp_path):
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -1344,7 +1445,7 @@ def test_weight_push_windows_command_shape(monkeypatch, tmp_path):
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="winbox", n_games=10, user="g",
+        host="winbox", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -1401,7 +1502,7 @@ def test_run_shard_remote_call_sequence(monkeypatch, tmp_path):
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -1512,7 +1613,7 @@ def test_weight_push_failure_returns_failure_report(monkeypatch, tmp_path):
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -2558,7 +2659,7 @@ def test_event_log_writes_one_line_per_record_and_truncates_on_reopen(
         assert "T" in p["ts"]
 
     log2 = EventLog(log_path)
-    log2.record("shard_end", status="completed", n_games=1)
+    log2.record("shard_end", status="completed", n_games_done=1)
     lines2 = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines2) == 1
     parsed2 = json.loads(lines2[0])
@@ -2775,7 +2876,7 @@ def test_replay_collection_posix_command_shape(monkeypatch, tmp_path):
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -2847,7 +2948,7 @@ def test_replay_collection_windows_command_shape(monkeypatch, tmp_path):
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="winbox", n_games=10, user="g",
+        host="winbox", user="g",
         repo_path="C:\\Users\\g\\Projects\\mtg-bot",
         venv_python=".venv-py313\\Scripts\\python.exe",
     )
@@ -2920,7 +3021,7 @@ def test_replay_collection_skipped_when_capture_off(
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -2958,7 +3059,7 @@ def test_replay_collection_skipped_when_replays_root_none(
         replays_root=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -2993,7 +3094,7 @@ def test_replay_collection_eval_path(monkeypatch, tmp_path):
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="macbook", n_games=4, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -3057,7 +3158,7 @@ def test_replay_collection_eval_skipped_when_capture_off(
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="macbook", n_games=4, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -3091,7 +3192,7 @@ def test_replay_collection_handles_empty_listing(monkeypatch, tmp_path):
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -3416,7 +3517,7 @@ def test_ssh_cmd_carries_serveralive_options():
         ShardConfig, _ssh_cmd,
     )
     shard = ShardConfig(
-        host="my-mac", n_games=10, user="g",
+        host="my-mac", user="g",
         repo_path="/r", venv_python=".venv/bin/python",
     )
     cmd = _ssh_cmd(shard, "echo ok")
@@ -3436,7 +3537,7 @@ def test_scp_cmd_carries_serveralive_options_both_directions():
         ShardConfig, _scp_cmd,
     )
     shard = ShardConfig(
-        host="my-mac", n_games=10, user="g",
+        host="my-mac", user="g",
         repo_path="/r", venv_python=".venv/bin/python",
     )
     pull = _scp_cmd(shard, "/remote/x", "local/x", from_remote=True)
@@ -3526,7 +3627,7 @@ def test_run_shard_remote_ssh_run_failure_returns_failure_report(
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -3649,7 +3750,7 @@ def test_run_shard_remote_recovers_npzs_after_ssh_failure(
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=329, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -3729,7 +3830,7 @@ def test_run_shard_eval_remote_ssh_failure_returns_failure_report(
         opponent_label="v6",
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -3778,10 +3879,10 @@ def test_run_distributed_self_play_one_local_shard_fails(
         with_policy=True,
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1,
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1,
                     seed_offset=1_000_000),
-        ShardConfig(host="local", n_games=2, label="BOOM", n_workers=1,
+        ShardConfig(host="local", label="BOOM", n_workers=1,
                     seed_offset=2_000_000),
     ))
 
@@ -3862,8 +3963,8 @@ def test_run_distributed_self_play_all_shards_fail_raises(
         with_policy=True,
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1,
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1,
                     seed_offset=1_000_000),
     ))
 
@@ -3907,8 +4008,8 @@ def test_run_distributed_eval_one_shard_fails_aggregates_rest(
         opponent_label="self",
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="BOOM", n_workers=1),
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="BOOM", n_workers=1),
     ))
 
     real_eval_pull = dist.run_shard_eval_pull
@@ -4050,7 +4151,7 @@ def test_run_shard_remote_bundle_sync_failure_returns_failure_report(
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=10, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4140,7 +4241,7 @@ def test_run_shard_remote_npz_pull_failure_records_partial(
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=2, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4212,7 +4313,7 @@ def test_run_shard_remote_npz_listing_failure_records(
         per_game_timeout_sec=None,
     )
     shard = ShardConfig(
-        host="macbook", n_games=2, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4293,7 +4394,7 @@ def test_run_shard_remote_replay_pull_failure_warned_not_fatal(
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="macbook", n_games=2, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4363,7 +4464,7 @@ def test_run_shard_eval_remote_bundle_sync_failure(monkeypatch, tmp_path):
         opponent_label="rand",
     )
     shard = ShardConfig(
-        host="macbook", n_games=4, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4432,7 +4533,7 @@ def test_run_shard_eval_remote_weight_push_failure(monkeypatch, tmp_path):
         opponent_label="rand",
     )
     shard = ShardConfig(
-        host="macbook", n_games=4, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4490,7 +4591,7 @@ def test_run_shard_eval_remote_corrupt_result_file(monkeypatch, tmp_path):
         opponent_label="rand",
     )
     shard = ShardConfig(
-        host="macbook", n_games=4, user="g",
+        host="macbook", user="g",
         repo_path="/Users/g/repo",
         venv_python=".venv-py313/bin/python",
     )
@@ -4526,8 +4627,8 @@ def test_run_distributed_eval_all_shards_fail_raises(
         opponent_label="self",
     )
     cfg = ShardsConfig(shards=(
-        ShardConfig(host="local", n_games=2, label="A", n_workers=1),
-        ShardConfig(host="local", n_games=2, label="B", n_workers=1),
+        ShardConfig(host="local", label="A", n_workers=1),
+        ShardConfig(host="local", label="B", n_workers=1),
     ))
 
     def _always_boom(*args, **kwargs):
@@ -4659,7 +4760,7 @@ def test_run_shard_remote_uses_supplied_ssh_timeout(monkeypatch, tmp_path):
         replays_root="replays",
     )
     shard = ShardConfig(
-        host="my-mac", n_games=10, user="g",
+        host="my-mac", user="g",
         repo_path="/r", venv_python=".venv-py313/bin/python",
     )
 
@@ -5286,7 +5387,7 @@ def test_run_shard_remote_passes_local_progress_path_to_watchdog(
         per_game_timeout_sec=None,
     )
     shard = _SC(
-        host="my-mac", n_games=10, user="g",
+        host="my-mac", user="g",
         repo_path="/r", venv_python=".venv-py313/bin/python",
     )
     progress_dir = tmp_path / "progress"
@@ -5372,7 +5473,7 @@ def test_run_shard_eval_remote_passes_local_progress_path_to_watchdog(
         opponent_label="rand",
     )
     shard = _SC(
-        host="my-mac", n_games=1, user="g",
+        host="my-mac", user="g",
         repo_path="/r", venv_python=".venv-py313/bin/python",
     )
     dmod.run_shard_eval_remote(

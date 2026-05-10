@@ -43,16 +43,16 @@ def test_resolve_shard_from_config_picks_correct_remote(
     venv_python."""
     push = _load_module()
     p = _write_shards(tmp_path, [
-        {"host": "local", "n_games": 100},
+        {"host": "local"},
         {
-            "host": "win-1080ti", "n_games": 150,
+            "host": "win-1080ti",
             "user": "gregg",
             "repo_path": "C:\\Users\\gregg\\Projects\\mtg-bot",
             "venv_python": ".venv-py313\\Scripts\\python.exe",
             "ssh_port": 2222,
         },
         {
-            "host": "macbook", "n_games": 150,
+            "host": "macbook",
             "user": "gregg",
             "repo_path": "/Users/gregg/projects/mtg-bot",
             "venv_python": ".venv-py313/bin/python",
@@ -83,7 +83,7 @@ def test_resolve_shard_local_rejected(tmp_path: Path):
     on the master. Surface that explicitly."""
     push = _load_module()
     p = _write_shards(tmp_path, [
-        {"host": "local", "n_games": 100},
+        {"host": "local"},
     ])
     with pytest.raises(SystemExit, match="local"):
         push._resolve_shard(
@@ -96,7 +96,7 @@ def test_resolve_shard_unknown_name_rejected(tmp_path: Path):
     push = _load_module()
     p = _write_shards(tmp_path, [
         {
-            "host": "macbook", "n_games": 150,
+            "host": "macbook",
             "user": "u", "repo_path": "/r",
             "venv_python": ".venv/bin/python",
         },

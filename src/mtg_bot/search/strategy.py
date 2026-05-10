@@ -98,6 +98,31 @@ class SearchStrategy(ABC):
         chosen = max(candidates, key=lambda c: c["visits"])["decision"]
         return (chosen, candidates)
 
+    def choose_with_subtree(
+        self,
+        state: GameState,
+        player_id: PlayerID,
+        tree_depth: int = 1,
+        tree_top_k=None,
+    ):
+        """Return ``(chosen, candidates)`` where each candidate has
+        an extra ``"subtree"`` key — a recursive list of grandchild
+        candidates the search would visit, up to ``tree_depth``
+        levels deep. Used by the diagnostic deep-capture path.
+
+        Default implementation reuses ``choose_with_full_stats`` and
+        stamps an empty ``subtree`` on every candidate — strategies
+        that don't expose a real search tree (RandomChoice etc.)
+        get a valid shape with no nested data. ``tree_depth`` /
+        ``tree_top_k`` are accepted but ignored at this fallback.
+        MCTS / PIMC override with a real recursive walk.
+        """
+        chosen, candidates = self.choose_with_full_stats(state, player_id)
+        return (
+            chosen,
+            [{**c, "subtree": []} for c in candidates],
+        )
+
 
 class RandomChoice(SearchStrategy):
     """Pick uniformly among legal decisions. Zero-heuristic baseline.

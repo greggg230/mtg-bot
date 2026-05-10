@@ -141,6 +141,16 @@
   .pairing-status.running { color: #93c5fd; }
   .pairing-status.completed { color: #4ade80; }
   .pairing-status.failed { color: #fca5a5; }
+  /* Wilson 95% CI badge on the eval card. PASS (CI lower bound clears
+     the 0.52 acceptance threshold) renders green like the verdict
+     "stronger" badge; FAIL (CI upper bound below threshold) renders red
+     like "weaker"; UNDECIDED (threshold straddles the CI) renders amber
+     so a glance at the eval card surfaces gate-direction confidence
+     without doing the math by eye. */
+  .stat-value.ci-pass { color: #4ade80; }
+  .stat-value.ci-fail { color: #fca5a5; }
+  .stat-value.ci-undecided { color: #fcd34d; }
+  .stat-value.ci-pending { color: #94a3b8; }
 
   /* Per-machine sub-cards inside aggregated training-progress cards.
      One row per host with five stats: games, secs/game, crashes,
@@ -311,6 +321,57 @@ function statusClass(s) {
   return 'unknown';
 }
 
+// Wilson 95% score interval on the wins_new proportion of decisive
+// games. Mirrors what scripts/eval_early_stop_watcher.py computes
+// server-side, so the UI badge tracks the watcher's PASS / FAIL /
+// undecided decision visually. The 0.52 acceptance threshold is what
+// iterate uses for promote/keep — it's hardcoded here because every
+// active iterate run uses it; if iterate ever emits a per-run
+// threshold, read it from the progress JSON instead.
+const EVAL_GATE_THRESHOLD = 0.52;
+// Minimum decisive games before showing a verdict — below this the
+// CI is too wide to be informative and the watcher wouldn't fire
+// either (see --min-decisive in eval_early_stop_watcher.py). Render
+// "n=X (gathering…)" so the user knows the eval is live.
+const EVAL_CI_MIN_DECISIVE = 30;
+function wilsonInterval(wins, decisive, z) {
+  if (!decisive || decisive <= 0) return null;
+  const p = wins / decisive;
+  const denom = 1 + (z * z) / decisive;
+  const center = (p + (z * z) / (2 * decisive)) / denom;
+  const half = z * Math.sqrt(
+    (p * (1 - p) + (z * z) / (4 * decisive)) / decisive,
+  ) / denom;
+  return {
+    point: p,
+    lo: Math.max(0, center - half),
+    hi: Math.min(1, center + half),
+  };
+}
+function evalConfidenceCell(winsNew, winsOld, threshold) {
+  const decisive = (winsNew || 0) + (winsOld || 0);
+  if (decisive < EVAL_CI_MIN_DECISIVE) {
+    return {
+      text: decisive > 0
+        ? 'n=' + decisive + ' (gathering…)'
+        : '—',
+      cls: 'ci-pending',
+    };
+  }
+  const ci = wilsonInterval(winsNew || 0, decisive, 1.96);
+  if (!ci) return { text: '—', cls: 'ci-pending' };
+  const range =
+    '[' + (ci.lo * 100).toFixed(1) + '%, '
+    + (ci.hi * 100).toFixed(1) + '%]';
+  if (ci.lo > threshold) {
+    return { text: range + ' → PASS', cls: 'ci-pass' };
+  }
+  if (ci.hi < threshold) {
+    return { text: range + ' → FAIL', cls: 'ci-fail' };
+  }
+  return { text: range + ' → undecided', cls: 'ci-undecided' };
+}
+
 // Stop-button + modal wiring. One overlay reused across clicks.
 // `pendingStops` tracks runs whose stop has been ack'd by the
 // backend but whose progress JSON hasn't yet flipped status — the UI
@@ -460,6 +521,7 @@ function ensureCard(run) {
       <div class="stats">
         <div class="stat"><div class="stat-label">Games</div><div class="stat-value" data-field="games">—</div></div>
         <div class="stat"><div class="stat-label">Win rate</div><div class="stat-value" data-field="winrate">—</div></div>
+        <div class="stat"><div class="stat-label">Wilson 95% CI · gate 52%</div><div class="stat-value" data-field="ci">—</div></div>
         <div class="stat"><div class="stat-label">New / opp / draws</div><div class="stat-value" data-field="record">—</div></div>
         <div class="stat"><div class="stat-label">Opponent</div><div class="stat-value" data-field="opp">—</div></div>
         <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" data-field="workers">—</div></div>
@@ -627,6 +689,12 @@ function fillRun(el, run) {
       ? (run.win_rate * 100).toFixed(1) + '%' : '—';
     el.querySelector('[data-field="games"]').textContent = done + ' / ' + total;
     el.querySelector('[data-field="winrate"]').textContent = winRatePct;
+    const ciCell = evalConfidenceCell(
+      run.wins_new, run.wins_old, EVAL_GATE_THRESHOLD,
+    );
+    const ciEl = el.querySelector('[data-field="ci"]');
+    ciEl.textContent = ciCell.text;
+    ciEl.className = 'stat-value ' + ciCell.cls;
     el.querySelector('[data-field="record"]').textContent =
       (run.wins_new || 0) + ' / ' + (run.wins_old || 0) + ' / ' + (run.draws || 0);
     el.querySelector('[data-field="opp"]').textContent =

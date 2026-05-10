@@ -233,6 +233,15 @@ class ISMCTS(SearchStrategy):
         self.batch_size = batch_size
         self.puct = puct
         self.enable_lethal_detect = enable_lethal_detect
+        # Pull the action-encoding version off the evaluator if it
+        # exposes one, else fall back to v1. NN-backed runs (NNEvaluator)
+        # set this to whichever convention the network was trained
+        # against; non-NN evaluators (heuristic, test stubs) have no
+        # opinion and v1 is the safe default — same legality, just the
+        # original positional-by-card.id slot mapping.
+        self._action_encoding_version = getattr(
+            evaluator, "action_encoding_version", "positional_v1",
+        )
         # Counter incremented every time the lethal-detect heuristic
         # short-circuits search. Exposed for benchmark / test
         # introspection. Reset by ``reset_lethal_detect_count``.
@@ -881,7 +890,9 @@ class ISMCTS(SearchStrategy):
         carry the bool array.
         """
         from mtg_bot.training import action_encoding as ae
-        iter_mask = ae.legal_action_mask(sub, viewer)
+        iter_mask = ae.legal_action_mask(
+            sub, viewer, version=self._action_encoding_version,
+        )
         if node._union_mask is None:
             node._union_mask = iter_mask.copy()
         else:
@@ -1112,6 +1123,7 @@ class ISMCTS(SearchStrategy):
         try:
             slot = ae.encode(
                 decision, pre_apply_sub.engine_state, viewer,
+                version=self._action_encoding_version,
             )
         except ae.EncodingOverflowError:
             return

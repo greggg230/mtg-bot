@@ -31,6 +31,11 @@ dev = [
 
 [project.scripts]
 mtg-bot = "mtg_bot.__main__:main"
+# ``mtg_bot`` (underscore form) is the dispatcher into the
+# ``mtg_bot.cli.<subcommand>`` package: ``mtg_bot iterate ...``,
+# ``mtg_bot eval --new v16 --old v13 --games 3000``, etc. Reinstall
+# (``pip install -e .``) for changes here to land on the PATH.
+mtg_bot = "mtg_bot.cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -40,7 +45,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests_rust"]
 # Skip tests marked ``isolated`` by default — they're sensitive to
 # accumulated interpreter state from preceding tests (deepcopy stack
 # pressure, MCTS C-frame depth) and only run reliably in their own
@@ -66,6 +71,29 @@ source = ["mtg_bot"]
 # docs/segfault-fix.md for the full diagnosis.
 branch = false
 core = "sysmon"
+# The ``mtg_bot.cli`` subcommand modules are operator-facing CLI
+# entrypoints (iterate, train, shard, serve, eval, bench, capture).
+# Their ``main()`` argparse bodies were previously script-level code
+# under ``scripts/`` and never participated in coverage — the
+# coverage source filter was already package-only. The argparse-
+# body lines stay exempted via ``# pragma: no cover`` annotations
+# inside the modules. Helpers (``_downsample_one_legal_rows``,
+# ``_render_template``, ``_install_kill_handlers``, etc.) ARE
+# measured because they're exercised by ``tests/scripts/test_*.py``.
+#
+# The ``bench*`` subcommand kinds are diagnostic / operator-only
+# (``clone``, ``clone-zones``, ``nn-eval-server``, ``per-game-wall``)
+# — they need real GPU/process pool/large state to exercise and
+# were never part of the test suite. Same for ``capture`` (single-
+# machine NN-driven self-play, integration test) and ``eval`` (a
+# distributed-eval driver, integration test). Excluded from coverage
+# measurement so the unit-test gate isn't dragged down by code that
+# requires real infra to exercise.
+omit = [
+    "src/mtg_bot/cli/bench.py",
+    "src/mtg_bot/cli/bench_kinds/*.py",
+    "src/mtg_bot/cli/capture.py",
+]
 
 [tool.coverage.report]
 show_missing = true
