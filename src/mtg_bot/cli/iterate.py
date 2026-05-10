@@ -529,6 +529,7 @@ def _self_play_distributed(  # pragma: no cover
     use_belief_weighted: bool = False,
     heuristics: HeuristicsConfig | None = None,
     action_encoding_version: str = "positional_v1",
+    stop_check: "callable | None" = None,
 ) -> tuple[int, int, float]:
     """Distributed self-play: dispatch the iter's games across the
     shards in ``shards_config``, gather all per-shard npzs into the
@@ -573,6 +574,8 @@ def _self_play_distributed(  # pragma: no cover
     extra_kwargs: dict = {}
     if shard_ssh_timeout_s is not None:
         extra_kwargs["shard_ssh_timeout_s"] = shard_ssh_timeout_s
+    if stop_check is not None:
+        extra_kwargs["stop_check"] = stop_check
     npz_paths = run_distributed_self_play(
         shards_config, spec,
         progress_dir=progress_dir,
@@ -634,6 +637,7 @@ def _eval_match_distributed(  # pragma: no cover
     use_belief_weighted: bool = False,
     new_action_encoding_version: str = "positional_v1",
     old_action_encoding_version: str = "positional_v1",
+    stop_check: "callable | None" = None,
 ) -> tuple[int, int, int, float]:
     """Distributed eval-gate match. Mirrors ``_eval_match``'s return
     contract ``(new_wins, old_wins, draws, elapsed_seconds)`` so
@@ -674,6 +678,8 @@ def _eval_match_distributed(  # pragma: no cover
     extra_kwargs: dict = {}
     if shard_ssh_timeout_s is not None:
         extra_kwargs["shard_ssh_timeout_s"] = shard_ssh_timeout_s
+    if stop_check is not None:
+        extra_kwargs["stop_check"] = stop_check
     counts = run_distributed_eval(
         shards_config, spec,
         progress_dir=progress_dir,
@@ -1740,6 +1746,7 @@ def main(argv=None) -> None:  # pragma: no cover
                     phase_prune_enabled=not args.no_phase_priority_prune,
                 ),
                 action_encoding_version=iter_action_encoding_version,
+                stop_check=_cycle_stop_check,
             )
         print(
             f"[iterate]   gen done in {gen_elapsed/60:.1f}m: "
@@ -1931,6 +1938,7 @@ def main(argv=None) -> None:  # pragma: no cover
                         old_action_encoding_version=(
                             best_action_encoding_version
                         ),
+                        stop_check=_cycle_stop_check,
                     )
                 )
             n_decided = wins_new + wins_old
