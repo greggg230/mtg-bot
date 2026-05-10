@@ -48,17 +48,20 @@ import numpy as np
 def _local_worker(args: tuple) -> tuple[float, list[float]]:
     """Worker for ``--mode local``. Loads its own NNEvaluator and
     fires N requests."""
-    weights_path, requests_per, with_policy, seed = args
+    weights_path, requests_per, with_policy, seed, hidden_sizes = args
     import torch
     torch.set_num_threads(1)
     from mtg_bot.features import FEATURE_DIM
     from mtg_bot.search.nn_evaluator import NNEvaluator
     rng = np.random.default_rng(seed)
 
-    ev = NNEvaluator(
-        weights_path=Path(weights_path) if weights_path else None,
-        with_policy=with_policy,
-    )
+    ev_kwargs: dict = {
+        "weights_path": Path(weights_path) if weights_path else None,
+        "with_policy": with_policy,
+    }
+    if hidden_sizes is not None:
+        ev_kwargs["hidden_sizes"] = tuple(hidden_sizes)
+    ev = NNEvaluator(**ev_kwargs)
     latencies: list[float] = []
     started = time.perf_counter()
     feats = rng.standard_normal(
@@ -170,6 +173,14 @@ def main(argv=None) -> None:  # pragma: no cover
         "--out", type=Path, default=None,
         help="If given, append a JSON line summary to this file.",
     )
+    parser.add_argument(
+        "--hidden-sizes", type=int, nargs="+", default=None,
+        help=(
+            "Trunk shape for the MLP. Defaults to NNEvaluator's "
+            "(128, 128, 64). Pass e.g. '1024 1024 512' to bench "
+            "the v13/v15/v16 production trunk."
+        ),
+    )
     args = parser.parse_args(argv)
 
     requests_total = args.workers * args.requests_per
@@ -195,6 +206,10 @@ def main(argv=None) -> None:  # pragma: no cover
             with_policy=args.with_policy,
             batch_size=args.server_batch_size,
             batch_wait_ms=args.server_batch_wait_ms,
+            hidden_sizes=(
+                tuple(args.hidden_sizes)
+                if args.hidden_sizes is not None else None
+            ),
         )
         h = proxy.handle()
         print(
@@ -214,12 +229,17 @@ def main(argv=None) -> None:  # pragma: no cover
         ]
         worker_fn = _server_worker
     else:
+        hidden_sizes_t = (
+            tuple(args.hidden_sizes)
+            if args.hidden_sizes is not None else None
+        )
         per_args = [
             (
                 str(args.weights) if args.weights else None,
                 args.requests_per,
                 args.with_policy,
                 1000 + i,
+                hidden_sizes_t,
             )
             for i in range(args.workers)
         ]
@@ -272,6 +292,10 @@ def main(argv=None) -> None:  # pragma: no cover
             "workers": args.workers,
             "requests_per": args.requests_per,
             "with_policy": args.with_policy,
+            "hidden_sizes": (
+                list(args.hidden_sizes)
+                if args.hidden_sizes is not None else None
+            ),
             "server_batch_size": args.server_batch_size,
             "server_batch_wait_ms": args.server_batch_wait_ms,
             "total_wall_s": wall,

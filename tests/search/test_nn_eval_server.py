@@ -696,6 +696,75 @@ def test_default_address_uses_ephemeral_port(server_factory):
         )
 
 
+# ---------- hidden_sizes plumbing -------------------------------------------
+
+
+def test_server_hidden_sizes_kwarg_changes_trunk_shape(tmp_path: Path):
+    """The ``hidden_sizes`` kwarg must thread through to the underlying
+    ``_ValueMLP`` so the server can host weights trained at the
+    production trunk shape (1024-1024-512). Verify by saving weights
+    from a same-shape reference model and checking the load succeeds
+    (would raise on shape mismatch otherwise) and that an inference
+    matches the reference."""
+    torch.manual_seed(0)
+    custom_sizes = (32, 16)
+    ref = NNEvaluator(hidden_sizes=custom_sizes, with_policy=False)
+    weights = tmp_path / "wide.pt"
+    ref.save(weights)
+
+    server = NNEvalServer(
+        weights_path=weights, device="cpu",
+        with_policy=False, batch_size=1, batch_wait_ms=0.0,
+        hidden_sizes=custom_sizes,
+    )
+    with server:
+        client = NNEvalClient(server.handle())
+        try:
+            feats = np.zeros(FEATURE_DIM, dtype=np.float32)
+            v_server = client._call(MSG_KIND_VALUE, feats)
+            with torch.no_grad():
+                v_ref = ref.model(
+                    torch.from_numpy(feats).unsqueeze(0),
+                ).item()
+            assert v_server == pytest.approx(v_ref, abs=1e-5)
+        finally:
+            client.close()
+
+
+def test_server_hidden_sizes_with_policy_head(tmp_path: Path):
+    """Same as the value-only test but for the dual-head model. Ensures
+    the policy head also picks up the custom trunk shape (otherwise
+    state_dict load would mismatch on the policy_logits.weight key)."""
+    torch.manual_seed(0)
+    custom_sizes = (32, 16)
+    ref = NNEvaluator(hidden_sizes=custom_sizes, with_policy=True)
+    weights = tmp_path / "wide_policy.pt"
+    ref.save(weights)
+
+    server = NNEvalServer(
+        weights_path=weights, device="cpu",
+        with_policy=True, batch_size=1, batch_wait_ms=0.0,
+        hidden_sizes=custom_sizes,
+    )
+    with server:
+        client = NNEvalClient(server.handle())
+        try:
+            feats = np.zeros(FEATURE_DIM, dtype=np.float32)
+            from mtg_bot.training.action_encoding import ACTION_VOCAB_SIZE
+            mask = np.ones(ACTION_VOCAB_SIZE, dtype=bool)
+            from mtg_bot.search.nn_eval_server import (
+                MSG_KIND_VALUE_POLICY,
+            )
+            v, p = client._call(MSG_KIND_VALUE_POLICY, (feats, mask))
+            assert isinstance(v, float)
+            assert p.shape == (ACTION_VOCAB_SIZE,)
+            assert p.dtype == np.float32
+            # Policy is a softmax over masked logits; sums to ~1.
+            assert abs(float(p.sum()) - 1.0) < 1e-5
+        finally:
+            client.close()
+
+
 # ---------- unknown kind error path -----------------------------------------
 
 
