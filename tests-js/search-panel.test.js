@@ -213,6 +213,181 @@ describe('formatAction helper', () => {
     });
     expect(out).toBe('DeclareAttackers(attacker_ids=[3])');
   });
+
+  // ----- name resolution -------------------------------------------------
+
+  it('resolves PlayLand card_id to the card name', () => {
+    const map = new Map([[71, 'Swamp']]);
+    expect(globalThis.formatAction({ kind: 'PlayLand', card_id: 71 }, map))
+      .toBe('PlayLand — Swamp');
+  });
+
+  it('resolves CastSpell card_id to the card name', () => {
+    const map = new Map([[51, 'Hylderblade']]);
+    expect(globalThis.formatAction(
+      { kind: 'CastSpell', card_id: 51, use_warp: false, kicked: false,
+        cast_for_free: false, use_impending: false, cast_room_half: null },
+      map,
+    )).toBe('CastSpell — Hylderblade');
+  });
+
+  it('appends modifier tags for CastSpell when set', () => {
+    const map = new Map([[22, 'Rayblade Trooper']]);
+    expect(globalThis.formatAction(
+      { kind: 'CastSpell', card_id: 22, use_warp: true, kicked: false,
+        cast_for_free: false, use_impending: false, cast_room_half: null },
+      map,
+    )).toBe('CastSpell — Rayblade Trooper (warp)');
+  });
+
+  it('resolves ActivateAbility source_id and keeps the ability index', () => {
+    const map = new Map([[12, 'Sol Ring']]);
+    expect(globalThis.formatAction(
+      { kind: 'ActivateAbility', source_id: 12, ability_index: 0 },
+      map,
+    )).toBe('ActivateAbility — Sol Ring [0]');
+  });
+
+  it('renders AttackerDecision(attack=true) as "Attack — <name>"', () => {
+    const map = new Map([[44, 'Comet Crawler']]);
+    expect(globalThis.formatAction(
+      { kind: 'AttackerDecision', attacker_id: 44, attack: true },
+      map,
+    )).toBe('Attack — Comet Crawler');
+  });
+
+  it('renders AttackerDecision(attack=false) with a "no attack" suffix', () => {
+    const map = new Map([[44, 'Comet Crawler']]);
+    expect(globalThis.formatAction(
+      { kind: 'AttackerDecision', attacker_id: 44, attack: false },
+      map,
+    )).toBe('AttackerDecision — Comet Crawler (no attack)');
+  });
+
+  it('renders BlockerDecision as "Block — <blocker> blocks <attacker>"', () => {
+    const map = new Map([
+      [1, 'Dauntless Scrapbot'],
+      [62, 'Nova Hellkite'],
+    ]);
+    expect(globalThis.formatAction(
+      { kind: 'BlockerDecision', blocker_id: 1, attacker_id: 62 },
+      map,
+    )).toBe('Block — Dauntless Scrapbot blocks Nova Hellkite');
+  });
+
+  it('falls back to legacy form when an id is unresolvable', () => {
+    // Empty map: no name found, legacy id-only string returned.
+    expect(globalThis.formatAction(
+      { kind: 'PlayLand', card_id: 71 }, new Map(),
+    )).toBe('PlayLand(card_id=71)');
+  });
+
+  it('falls back to legacy form when only one of two ids resolves', () => {
+    const map = new Map([[1, 'Dauntless Scrapbot']]);
+    // attacker_id missing → legacy.
+    const out = globalThis.formatAction(
+      { kind: 'BlockerDecision', blocker_id: 1, attacker_id: 62 },
+      map,
+    );
+    expect(out).toBe('BlockerDecision(blocker_id=1, attacker_id=62)');
+  });
+
+  it('treats undefined idToName as an empty map', () => {
+    // No second arg — should not crash and should fall back.
+    expect(globalThis.formatAction({ kind: 'PlayLand', card_id: 71 }))
+      .toBe('PlayLand(card_id=71)');
+  });
+
+  it('leaves unknown kinds in the legacy stringified form', () => {
+    expect(globalThis.formatAction(
+      { kind: 'MysteryNewDecision', some_id: 99, flag: true },
+      new Map([[99, 'Unrelated Card']]),
+    )).toBe('MysteryNewDecision(some_id=99, flag=true)');
+  });
+
+  it('PassPriority is unaffected by an idToName map', () => {
+    expect(globalThis.formatAction({ kind: 'PassPriority' }, new Map([[1, 'X']])))
+      .toBe('PassPriority');
+  });
+});
+
+describe('search panel renders names from snapshot zones', () => {
+  it('uses card names from the current snapshot for candidate labels', () => {
+    // Install a game whose current snapshot has a hand card with id 71.
+    globalThis.game = {
+      gameId: 'g1', currentIdx: 0, snapshotCount: 1,
+      snapCache: new Map(), index: [], fullLog: [],
+      playing: false, playTimer: null,
+    };
+    const snap = _baseSnap();
+    snap.players[1].hand = [
+      { id: 71, name: 'Swamp' },
+      { id: 51, name: 'Hylderblade' },
+    ];
+    snap.search = {
+      chosen: { kind: 'PassPriority' },
+      candidates: [
+        { action: { kind: 'PassPriority' }, visits: 100,
+          q: 0.1, prior: 0.5, leaf_value: 0.0 },
+        { action: { kind: 'PlayLand', card_id: 71 }, visits: 30,
+          q: 0.2, prior: 0.3, leaf_value: 0.0 },
+        { action: { kind: 'CastSpell', card_id: 51, use_warp: false,
+                    kicked: false, cast_for_free: false,
+                    use_impending: false, cast_room_half: null },
+          visits: 10, q: 0.0, prior: 0.2, leaf_value: 0.0 },
+      ],
+      samples: 1, inner_nodes: 100, elapsed_ms: 1,
+    };
+    globalThis.game.snapCache.set(0, snap);
+    globalThis.renderSearchPanel(snap);
+    const rows = Array.from(document.querySelectorAll('#search-rows tr'));
+    const labels = rows.map(r => r.children[0].textContent);
+    expect(labels).toEqual([
+      'PassPriority',
+      'PlayLand — Swamp',
+      'CastSpell — Hylderblade',
+    ]);
+  });
+
+  it('renders the chosen-row header label by name', () => {
+    globalThis.game = {
+      gameId: 'g1', currentIdx: 0, snapshotCount: 1,
+      snapCache: new Map(), index: [], fullLog: [],
+      playing: false, playTimer: null,
+    };
+    const snap = _baseSnap();
+    snap.players[0].battlefield = [{ id: 44, name: 'Comet Crawler' }];
+    snap.search = {
+      chosen: { kind: 'AttackerDecision', attacker_id: 44, attack: true },
+      candidates: [
+        { action: { kind: 'AttackerDecision', attacker_id: 44, attack: true },
+          visits: 5, q: 0, prior: 0.5, leaf_value: 0 },
+      ],
+      samples: 1, inner_nodes: 50, elapsed_ms: 2,
+    };
+    globalThis.game.snapCache.set(0, snap);
+    globalThis.renderSearchPanel(snap);
+    const chosen = document.getElementById('search-chosen').textContent;
+    expect(chosen).toBe('Chose: Attack — Comet Crawler');
+  });
+
+  it('falls back to id-only labels when no game/snapshot is loaded', () => {
+    // No globalThis.game — render the annotation directly. The
+    // formatter should still produce a string (id-only fallback).
+    const snap = _baseSnap();
+    snap.search = {
+      chosen: { kind: 'PlayLand', card_id: 71 },
+      candidates: [
+        { action: { kind: 'PlayLand', card_id: 71 }, visits: 1,
+          q: 0, prior: 0.5, leaf_value: 0 },
+      ],
+      samples: 1, inner_nodes: 1, elapsed_ms: 1,
+    };
+    globalThis.game = null;
+    globalThis.renderSearchPanel(snap);
+    const rows = document.querySelectorAll('#search-rows tr');
+    expect(rows[0].children[0].textContent).toBe('PlayLand(card_id=71)');
+  });
 });
 
 // -------------------------------------------------------------------
@@ -375,6 +550,249 @@ describe('renderSearchPanel recommend fallback', () => {
       .classList.contains('hidden')).toBe(true);
   });
 
+  // -----------------------------------------------------------------
+  // Diagnostic deep-tree capture: candidate rows with non-empty
+  // ``children`` arrays grow a chevron; click toggles inline child
+  // rows below the parent. Recursive expand. Production root-only
+  // captures (``children`` null/undefined/empty) keep today's
+  // rendering exactly — no chevron, no extra rows.
+  // -----------------------------------------------------------------
+});
+
+describe('renderSearchPanel deep-capture expand/collapse', () => {
+  function _deepAnnotated() {
+    const snap = _baseSnap();
+    snap.search = {
+      chosen: { kind: 'PassPriority' },
+      candidates: [
+        {
+          action: { kind: 'PassPriority' }, visits: 50,
+          q: 0.4, prior: 0.6, leaf_value: 0.3,
+          children: [
+            {
+              action: { kind: 'PlayLand', card_id: 5 }, visits: 25,
+              q: 0.2, prior: 0.3, leaf_value: 0.1,
+              children: [
+                {
+                  action: { kind: 'CastSpell', card_id: 9 }, visits: 12,
+                  q: 0.05, prior: 0.2, leaf_value: 0.0,
+                  children: [],
+                },
+                {
+                  action: { kind: 'PassPriority' }, visits: 8,
+                  q: -0.1, prior: 0.4, leaf_value: -0.05,
+                  children: [],
+                },
+              ],
+            },
+            {
+              action: { kind: 'PassPriority' }, visits: 5,
+              q: -0.05, prior: 0.1, leaf_value: 0.0,
+              children: [],
+            },
+          ],
+        },
+        {
+          action: { kind: 'PlayLand', card_id: 7 }, visits: 10,
+          q: -0.1, prior: 0.2, leaf_value: -0.05,
+          children: null,
+        },
+      ],
+      samples: 4, inner_nodes: 200, elapsed_ms: 30,
+    };
+    return snap;
+  }
+
+  it('shows a chevron only on rows whose children list is non-empty', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const rows = document.querySelectorAll('#search-rows tr');
+    expect(rows.length).toBe(2);
+    // First root row (PassPriority, 50 visits): children populated → expandable chevron.
+    const chev0 = rows[0].querySelector('.search-chevron.expandable');
+    expect(chev0).not.toBeNull();
+    expect(chev0.textContent).toBe('▸');
+    // Second row (PlayLand, children=null): chevron span is non-expandable / empty.
+    const chev1 = rows[1].querySelector('.search-chevron.expandable');
+    expect(chev1).toBeNull();
+  });
+
+  it('hides the chevron on rows whose children list is empty (no expand)', () => {
+    const snap = _baseSnap();
+    snap.search = {
+      chosen: { kind: 'PassPriority' },
+      candidates: [
+        {
+          action: { kind: 'PassPriority' }, visits: 5,
+          q: 0.0, prior: 0.5, leaf_value: 0.0,
+          children: [],   // deep-mode capture but no expanded grandchildren.
+        },
+      ],
+      samples: 1, inner_nodes: 10, elapsed_ms: 1,
+    };
+    globalThis.renderSearchPanel(snap);
+    const chev = document.querySelector('#search-rows .search-chevron.expandable');
+    expect(chev).toBeNull();
+  });
+
+  it('rendering a root-only capture (children=null) is identical to today', () => {
+    // Same as the populated-state test, no children field at all.
+    const snap = _baseSnap();
+    snap.search = {
+      chosen: { kind: 'PassPriority' },
+      candidates: [
+        {
+          action: { kind: 'PassPriority' }, visits: 32,
+          q: 0.4, prior: 0.7, leaf_value: 0.3,
+        },
+        {
+          action: { kind: 'PlayLand', card_id: 5 }, visits: 7,
+          q: -0.1, prior: 0.2, leaf_value: -0.05,
+        },
+      ],
+      samples: 1, inner_nodes: 50, elapsed_ms: 5,
+    };
+    globalThis.renderSearchPanel(snap);
+    // No expandable chevrons anywhere.
+    const expandable = document.querySelectorAll(
+      '#search-rows .search-chevron.expandable',
+    );
+    expect(expandable.length).toBe(0);
+    // No child rows (search-row-child class) appended.
+    const children = document.querySelectorAll(
+      '#search-rows .search-row-child',
+    );
+    expect(children.length).toBe(0);
+  });
+
+  it('clicking the chevron expands child rows directly below the parent', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const rows = document.querySelectorAll('#search-rows tr');
+    const chev = rows[0].querySelector('.search-chevron.expandable');
+    expect(chev.textContent).toBe('▸');
+    // Click to expand.
+    chev.click();
+    // After expand: chevron flips, two child rows appear right below.
+    expect(chev.textContent).toBe('▾');
+    const childRows = document.querySelectorAll('#search-rows .search-row-child');
+    expect(childRows.length).toBe(2);
+    // Order is by visits desc — PlayLand(25 visits) first, PassPriority(5) second.
+    expect(childRows[0].children[0].textContent).toContain('PlayLand');
+    expect(childRows[0].children[1].textContent).toBe('25');
+    expect(childRows[1].children[0].textContent).toContain('PassPriority');
+    expect(childRows[1].children[1].textContent).toBe('5');
+    // Child rows' chosen-tint check: deeper rows should NOT carry the
+    // chosen tint even if their action equals the root chosen action.
+    expect(childRows[0].classList.contains('chosen')).toBe(false);
+    expect(childRows[1].classList.contains('chosen')).toBe(false);
+  });
+
+  it('clicking the chevron a second time collapses the child rows', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const chev = document.querySelector(
+      '#search-rows .search-chevron.expandable',
+    );
+    chev.click();  // expand
+    expect(
+      document.querySelectorAll('#search-rows .search-row-child').length,
+    ).toBe(2);
+    chev.click();  // collapse
+    expect(chev.textContent).toBe('▸');
+    expect(
+      document.querySelectorAll('#search-rows .search-row-child').length,
+    ).toBe(0);
+  });
+
+  it('recursively expands depth-2 children when their chevrons are clicked', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    // Expand depth 1 first.
+    const rootChev = document.querySelector(
+      '#search-rows .search-chevron.expandable',
+    );
+    rootChev.click();
+    // Depth-1 row 0 (PlayLand 25) has its own children — expandable.
+    const depth1Rows = document.querySelectorAll('#search-rows .search-row-child');
+    expect(depth1Rows.length).toBe(2);
+    const d1Chev = depth1Rows[0].querySelector('.search-chevron.expandable');
+    expect(d1Chev).not.toBeNull();
+    d1Chev.click();
+    // After depth-2 expand: 4 child rows total (the original 2 + 2 grandchildren).
+    const allChildren = document.querySelectorAll('#search-rows .search-row-child');
+    expect(allChildren.length).toBe(4);
+    // Grandchild rows appear right after their parent (depth-1 row 0).
+    // Order is depth-1[0], grand[0], grand[1], depth-1[1].
+    expect(allChildren[1].children[0].textContent).toContain('CastSpell');
+    expect(allChildren[1].children[1].textContent).toBe('12');
+    expect(allChildren[2].children[0].textContent).toContain('PassPriority');
+    expect(allChildren[2].children[1].textContent).toBe('8');
+  });
+
+  it('collapsing a parent also removes its expanded descendant rows', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const rootChev = document.querySelector(
+      '#search-rows .search-chevron.expandable',
+    );
+    rootChev.click();  // expand depth 1
+    const depth1Rows = document.querySelectorAll('#search-rows .search-row-child');
+    const d1Chev = depth1Rows[0].querySelector('.search-chevron.expandable');
+    d1Chev.click();    // expand depth 2 under first depth-1
+    expect(
+      document.querySelectorAll('#search-rows .search-row-child').length,
+    ).toBe(4);
+    // Now collapse the root — every descendant should be cleared.
+    rootChev.click();
+    expect(
+      document.querySelectorAll('#search-rows .search-row-child').length,
+    ).toBe(0);
+  });
+
+  it('child action labels go through formatAction (same name resolution)', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const chev = document.querySelector(
+      '#search-rows .search-chevron.expandable',
+    );
+    chev.click();
+    const childRows = document.querySelectorAll('#search-rows .search-row-child');
+    // formatAction emits "PlayLand(card_id=5)" for the first child.
+    // textContent of the action cell includes the chevron span text +
+    // the action label; we just assert the action label substring.
+    expect(childRows[0].children[0].textContent).toContain(
+      'PlayLand(card_id=5)',
+    );
+  });
+
+  it('child rows use indented padding scaled by depth', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const rootChev = document.querySelector(
+      '#search-rows .search-chevron.expandable',
+    );
+    rootChev.click();
+    const depth1Row = document.querySelector('#search-rows .search-row-child');
+    const d1Pad = parseInt(depth1Row.children[0].style.paddingLeft, 10);
+    expect(d1Pad).toBeGreaterThan(0);
+    const d1Chev = depth1Row.querySelector('.search-chevron.expandable');
+    d1Chev.click();
+    const depth2Rows = document.querySelectorAll('#search-rows .search-row-child');
+    // Depth-2 row sits right after depth-1[0]; index 1 in the
+    // overall child-row collection.
+    const d2Pad = parseInt(depth2Rows[1].children[0].style.paddingLeft, 10);
+    expect(d2Pad).toBeGreaterThan(d1Pad);
+  });
+
+  it('chosen-row tint stays on root only — no descendant gets tinted', () => {
+    globalThis.renderSearchPanel(_deepAnnotated());
+    const rootChev = document.querySelector(
+      '#search-rows .search-chevron.expandable',
+    );
+    rootChev.click();
+    // Root chosen row is the first row.
+    const rows = document.querySelectorAll('#search-rows tr');
+    const chosenRows = document.querySelectorAll('#search-rows tr.chosen');
+    expect(chosenRows.length).toBe(1);
+    expect(chosenRows[0]).toBe(rows[0]);
+  });
+});
+
+describe('renderSearchPanel stale-fetch path', () => {
   it('discards stale recommend responses when the user scrubs forward', async () => {
     // Two snapshots back-to-back: the first fetch should be ignored
     // because the second renderSearchPanel call bumps the token.

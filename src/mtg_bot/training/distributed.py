@@ -135,21 +135,26 @@ def _urlopen_with_retry(
 class ShardConfig:
     """One shard of a distributed self-play run.
 
-    A shard is a contiguous range of games run on one machine. Each
-    shard gets its own seed-offset so seed collisions across shards
-    are impossible (different shards play DIFFERENT games, not the
-    same games on different hosts).
+    A shard is a worker (local or SSH-reachable) that pulls games
+    from the master's shared queue. The total number of games per
+    iter comes from the iterate driver's ``--games-per-iteration``;
+    this config carries only worker / SSH info, no per-shard quota
+    (a per-shard ``n_games`` field used to live here, but in pull
+    mode it had no effect — slow machines pull fewer games and fast
+    ones pull more, automatically — so it's been removed).
 
-    ``host="local"`` runs in the master process via the existing
-    ``generate_training_data_parallel``. Any other ``host`` value
-    triggers the SSH remote-shard path.
+    Each shard still gets its own seed-offset so seed collisions
+    across shards are impossible (different shards play DIFFERENT
+    games for the same game-index, not the same games).
+
+    ``host="local"`` runs in the master process via the pull-mode
+    runner. Any other ``host`` value triggers the SSH remote-shard
+    path.
     """
 
     # Where the shard runs. ``"local"`` means in-process on the
     # master; anything else is a Tailscale-reachable hostname or IP.
     host: str
-    # How many games this shard plays.
-    n_games: int
     # Free-form short label for naming output artifacts (e.g. the
     # shard's npz file). Defaults to ``host`` when omitted.
     label: str = ""
@@ -187,7 +192,6 @@ class ShardConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "host": self.host,
-            "n_games": self.n_games,
             "label": self.label,
             "seed_offset": self.seed_offset,
             "n_workers": self.n_workers,
@@ -199,9 +203,22 @@ class ShardConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ShardConfig":
+        # Hard removal: ``n_games`` was a per-shard quota in a pre-
+        # pull-queue era. In pull mode it had no effect, so allowing
+        # it to silently linger in shards-config files would mislead
+        # the next reader. Reject up-front with a pointer to the
+        # replacement.
+        if "n_games" in d:
+            raise ValueError(
+                f"shard {d.get('host', '<unknown>')!r}: "
+                "the 'n_games' field has been removed from "
+                "ShardConfig. Total games per iter now comes from "
+                "iterate_alphazero.py's --games-per-iteration "
+                "(every shard pulls from one shared queue). Drop "
+                "the 'n_games' key from your shards-config JSON."
+            )
         return cls(
             host=d["host"],
-            n_games=int(d["n_games"]),
             label=d.get("label", ""),
             seed_offset=int(d.get("seed_offset", 0)),
             n_workers=d.get("n_workers"),
@@ -216,10 +233,6 @@ class ShardConfig:
         # load time than after several minutes of self-play.
         if not self.host:
             raise ValueError("host is required")
-        if self.n_games <= 0:
-            raise ValueError(
-                f"n_games must be positive, got {self.n_games}"
-            )
         if self.seed_offset < 0:
             raise ValueError(
                 f"seed_offset must be non-negative, got {self.seed_offset}"
@@ -243,13 +256,13 @@ class ShardsConfig:
 
     Loaded from JSON. Hand-editing JSON is fine for the 2-3-machine
     setup we have today; if it grows we can migrate to YAML.
+
+    There is no longer a per-config ``total_games`` — the iter total
+    is owned by ``iterate_alphazero.py``'s ``--games-per-iteration``
+    and threaded into the orchestrator at dispatch time.
     """
 
     shards: tuple[ShardConfig, ...]
-
-    @property
-    def total_games(self) -> int:
-        return sum(s.n_games for s in self.shards)
 
     def __post_init__(self) -> None:
         if not self.shards:
@@ -273,17 +286,15 @@ def load_shards_config(path: Path) -> ShardsConfig:
 
         {
           "shards": [
-            {"host": "local", "n_games": 200},
+            {"host": "local"},
             {
               "host": "win-1080ti",
-              "n_games": 150,
               "user": "gregg",
               "repo_path": "C:\\Users\\gregg\\Projects\\mtg-bot",
               "venv_python": ".venv-py313\\Scripts\\python.exe"
             },
             {
               "host": "macbook",
-              "n_games": 150,
               "user": "gregg",
               "repo_path": "/Users/gregg/projects/mtg-bot",
               "venv_python": ".venv-py313/bin/python"
@@ -294,6 +305,11 @@ def load_shards_config(path: Path) -> ShardsConfig:
     seed_offset defaults to position * 1_000_000 (idiomatic pattern,
     no collisions for shards under 1M games each) but can be set
     explicitly per shard.
+
+    The total games per iter is NOT in this config — it comes from
+    iterate_alphazero.py's ``--games-per-iteration``. A legacy
+    ``n_games`` field on any shard entry raises a ``ValueError``
+    pointing at the new contract; see ``ShardConfig.from_dict``.
     """
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -316,7 +332,10 @@ def load_shards_config(path: Path) -> ShardsConfig:
         # shard 1_000_000, etc. Explicit offsets win over the default.
         if "seed_offset" not in item:
             item = {**item, "seed_offset": i * 1_000_000}
-        shards.append(ShardConfig(**item))
+        # ``from_dict`` rejects legacy fields (e.g. ``n_games``) with a
+        # pointer at the new contract; preferred over ``ShardConfig(
+        # **item)`` which would raise a less actionable TypeError.
+        shards.append(ShardConfig.from_dict(item))
     return ShardsConfig(shards=tuple(shards))
 
 
@@ -396,6 +415,16 @@ class SelfPlayJobSpec:
     # right ``_ValuePolicyMLP*`` class.
     architecture: Optional[str] = None
     policy_hidden_sizes: Optional[tuple[int, ...]] = None
+    # Slot-mapping convention the bootstrap weights were trained
+    # against — threaded into the shard's NNPimcConfig so PUCT prior
+    # lookups and policy-target encoding agree on which decision goes
+    # to which slot. ``None`` defaults to NNEvaluator's
+    # ``"positional_v1"`` (v13/v15/v16 metadata predates the field and
+    # back-compat-defaults correctly). v17+ training under
+    # ``canonical_v2`` requires this to round-trip across the SSH
+    # spec boundary or remote shards silently fall back to v1 and
+    # mix v1-encoded data into v2-trained weights.
+    action_encoding_version: Optional[str] = None
     # Bundle of priority short-circuit / filter heuristics applied by
     # ``MtgGameStateAdapter`` during search. Self-play default = every
     # flag ON (see ``HeuristicsConfig`` defaults). Per-heuristic
@@ -446,6 +475,7 @@ class SelfPlayJobSpec:
                 list(self.policy_hidden_sizes)
                 if self.policy_hidden_sizes is not None else None
             ),
+            "action_encoding_version": self.action_encoding_version,
         }
 
     @classmethod
@@ -483,6 +513,7 @@ class SelfPlayJobSpec:
                 tuple(d["policy_hidden_sizes"])
                 if d.get("policy_hidden_sizes") is not None else None
             ),
+            action_encoding_version=d.get("action_encoding_version"),
         )
 
 
@@ -523,6 +554,15 @@ class EvalJobSpec:
     new_architecture: Optional[str] = None
     old_architecture: Optional[str] = None
     policy_hidden_sizes: Optional[tuple[int, ...]] = None
+    # Per-side slot-mapping convention the new / old weights were
+    # trained against. Separate fields because cross-version evals
+    # (e.g. v17[canonical_v2] vs v13[positional_v1]) genuinely need
+    # each side to encode under its own version — using the wrong
+    # version on either side scrambles that side's PUCT priors. ``None``
+    # defaults to NNEvaluator's positional_v1, matching the v13/v15/v16
+    # metadata-missing back-compat path.
+    new_action_encoding_version: Optional[str] = None
+    old_action_encoding_version: Optional[str] = None
     # Bundle of priority short-circuit / filter heuristics. Eval
     # default = every flag OFF (``HeuristicsConfig.disabled()``):
     # match outcomes determine acceptance, so the strength-vs-
@@ -565,6 +605,12 @@ class EvalJobSpec:
                 list(self.policy_hidden_sizes)
                 if self.policy_hidden_sizes is not None else None
             ),
+            "new_action_encoding_version": (
+                self.new_action_encoding_version
+            ),
+            "old_action_encoding_version": (
+                self.old_action_encoding_version
+            ),
         }
 
     @classmethod
@@ -603,6 +649,12 @@ class EvalJobSpec:
                 tuple(d["policy_hidden_sizes"])
                 if d.get("policy_hidden_sizes") is not None else None
             ),
+            new_action_encoding_version=d.get(
+                "new_action_encoding_version"
+            ),
+            old_action_encoding_version=d.get(
+                "old_action_encoding_version"
+            ),
         )
 
 
@@ -610,21 +662,24 @@ def run_shard_local(
     shard: ShardConfig,
     spec: SelfPlayJobSpec,
     *,
+    n_games: int,
     progress_dir: Path,
     output_dir: Path,
     run_id_prefix: str,
     stamp: str,
 ) -> Path:
-    """Run a single shard in-process. Builds the same NNPimcConfig +
-    DataGenProgress + (optional) ReplayCaptureConfig that
-    iterate_alphazero's ``_self_play`` builds, then calls
-    ``generate_training_data_parallel`` for the shard's slice of
-    the workload.
+    """Run a single shard in-process with a fixed pre-allocated game
+    count. Builds the same NNPimcConfig + DataGenProgress + (optional)
+    ReplayCaptureConfig that iterate_alphazero's ``_self_play``
+    builds, then calls ``generate_training_data_parallel`` for the
+    shard's slice of the workload.
+
+    ``n_games`` is the explicit per-shard quota for this push-mode
+    invocation. The pull-mode runner (``run_shard_pull``) is what the
+    orchestrator uses now; this function survives for tests and
+    isolated direct callers that still want push-mode semantics.
 
     Returns the path of the produced ``.npz``.
-
-    Lives in this module (not in a script) so the orchestrator can
-    invoke it from the same process iterate runs in.
     """
     # Imports are local to keep the module's import-cost low for
     # the common "load shards-config to validate" path that doesn't
@@ -637,6 +692,7 @@ def run_shard_local(
         save_dataset,
     )
     from mtg_bot.training.data_gen import ReplayCaptureConfig
+    from mtg_bot.training.trainer import auto_device
 
     cfg = NNPimcConfig(
         weights_path=spec.weights_path,
@@ -648,8 +704,15 @@ def run_shard_local(
         hidden_sizes=spec.hidden_sizes,
         architecture=spec.architecture,
         policy_hidden_sizes=spec.policy_hidden_sizes,
+        action_encoding_version=spec.action_encoding_version,
         use_ismcts=spec.use_ismcts,
         use_belief_weighted=spec.use_belief_weighted,
+        # Resolve locally on this shard's host: master picks "cuda",
+        # Mac picks "mps", Win10 picks "cuda" (or "cpu" if no GPU).
+        # Tests construct NNPimcConfig() directly without ``device=``
+        # and stay on the CPU default — production goes through this
+        # spec-decoding path which always opts in.
+        device=auto_device(),
     )
 
     deck_pool = None
@@ -697,7 +760,7 @@ def run_shard_local(
     progress = DataGenProgress(
         progress_path=progress_path,
         run_id=f"{run_id_prefix}_shard_{shard.display_label}",
-        n_games_total=shard.n_games,
+        n_games_total=n_games,
         n_workers=(
             shard.n_workers if shard.n_workers is not None
             else max(1, 0)  # generate_training_data_parallel will
@@ -706,7 +769,7 @@ def run_shard_local(
         command="distributed_self_play (local shard)",
         notes=(
             f"distributed shard {shard.display_label} "
-            f"({shard.n_games} games)"
+            f"({n_games} games)"
         ),
         replays_dir=replays_subdir,
     )
@@ -716,7 +779,7 @@ def run_shard_local(
             generate_training_data_parallel(
                 p0_factory=cfg.build,
                 p1_factory=cfg.build,
-                n_games=shard.n_games,
+                n_games=n_games,
                 base_seed=spec.base_seed + shard.seed_offset,
                 n_workers=shard.n_workers,
                 with_policy=True,
@@ -729,6 +792,9 @@ def run_shard_local(
                 replay_config=replay_config,
                 hang_dump_dir=hang_dump_dir,
                 heuristics=spec.heuristics,
+                action_encoding_version=(
+                    spec.action_encoding_version or "positional_v1"
+                ),
             )
         )
     except BaseException:
@@ -1116,6 +1182,163 @@ class _EarlyStopPoller:
             )
 
 
+class _StopCheckPoller:
+    """Watches a user-supplied ``stop_check`` predicate and POSTs
+    ``/queue/close/<run_id>`` once it fires. Companion to
+    :class:`_EarlyStopPoller`: the early-stop poller closes the
+    queue when enough successful results are in (statistical /
+    target-met early termination); this poller closes the queue
+    when the operator clicked Stop on the training UI (or any
+    upstream stop sentinel went off, e.g. iterate's cycle-level
+    sentinel propagating through to the in-flight eval).
+    The two are independent — an iter run can have either, both,
+    or neither poller active simultaneously without conflict.
+    Both ultimately make the same fire-and-forget POST to
+    ``/queue/close/<run_id>``; the queue server treats repeated
+    closes as a no-op so two concurrent close POSTs are safe.
+
+    Returns to the orchestrator's ``finally`` cleanup just like
+    ``_EarlyStopPoller`` — the close is fire-and-forget, the
+    poller doesn't need to be drained or joined for correctness
+    (best-effort ``stop()`` just sets the event so the thread
+    exits quickly).
+
+    The default poll interval is short (0.5s) because the
+    user-perceived latency of "I clicked Stop" → "the eval
+    actually stopped dispatching new games" is the metric this
+    poller exists to optimize. The early-stop poller's 3s tick
+    is fine because its threshold is filesystem-derived, but a
+    UI-driven stop should feel immediate.
+
+    ``stop_check`` is called on the poller thread; it must be
+    cheap and thread-safe. The standard
+    ``mtg_bot.training.stop_signal.stop_requested`` predicate is
+    a tiny ``Path.exists()`` probe and satisfies both.
+    """
+
+    def __init__(
+        self,
+        *,
+        stop_check: Callable[[], bool],
+        run_id: str,
+        queue_url: str,
+        interval_s: float = 0.5,
+        urlopen=None,
+    ) -> None:
+        self._stop_check = stop_check
+        self._run_id = run_id
+        self._queue_url = queue_url.rstrip("/")
+        self._interval_s = interval_s
+        self._urlopen = urlopen
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._closed = False
+        self._close_failed = False
+        # Set on first observation that ``stop_check`` returned True;
+        # helps callers / tests assert "the poller saw the stop"
+        # independent of whether the close POST succeeded.
+        self._stop_observed = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"stop-check-{self._run_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the polling thread to exit. Idempotent. Safe to
+        call from the orchestrator's ``finally`` even if
+        :meth:`start` was never called (test paths)."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    @property
+    def closed(self) -> bool:
+        """True once this poller has successfully POSTed
+        ``/queue/close``. Tests inspect this; orchestrator code
+        doesn't need it (the close is fire-and-forget)."""
+        return self._closed
+
+    @property
+    def stop_observed(self) -> bool:
+        """True once ``stop_check()`` returned True at least once.
+        Distinct from :attr:`closed` because the close POST may fail
+        even though the stop was observed; callers can use this to
+        decide whether the run should be reported as ``stopped`` vs
+        ``completed`` independent of whether the queue close
+        succeeded."""
+        return self._stop_observed
+
+    def _loop(self) -> None:
+        # Tick once immediately so a stop sentinel that's already
+        # present at start-up is observed without waiting an interval.
+        first = True
+        while True:
+            if not first and self._stop_event.wait(self._interval_s):
+                return
+            first = False
+            if self._closed:
+                return
+            try:
+                fired = self._stop_check()
+            except Exception as exc:  # noqa: BLE001
+                # A misbehaving stop_check shouldn't kill the
+                # orchestrator. Log once and exit the polling loop;
+                # the run will continue normally.
+                print(
+                    f"[stop-check] {self._run_id}: stop_check raised "
+                    f"{type(exc).__name__}: {exc}; abandoning poll "
+                    f"thread (run will continue without stop-check "
+                    f"propagation).",
+                    file=sys.stderr,
+                )
+                return
+            if not fired:
+                continue
+            self._stop_observed = True
+            self._send_close()
+            return
+
+    def _send_close(self) -> None:
+        """Best-effort POST to ``/queue/close/<run_id>``. On failure
+        we log and give up — the run will drain naturally as the
+        existing queue indices empty (slower than ideal but the user
+        already got a stop sentinel, so the iterate driver will
+        short-circuit at the next stage boundary regardless)."""
+        import urllib.request
+        url = f"{self._queue_url}/queue/close/{self._run_id}"
+        req = urllib.request.Request(
+            url, data=b"", method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            if self._urlopen is not None:
+                resp = self._urlopen(req)
+                status = getattr(resp, "status", 200)
+            else:
+                resp = _urlopen_with_retry(req)
+                status = resp.status
+            if 200 <= status < 300:
+                self._closed = True
+            else:
+                self._close_failed = True
+                print(
+                    f"[stop-check] {url} returned HTTP {status}; "
+                    f"queue will drain naturally.",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._close_failed = True
+            print(
+                f"[stop-check] failed to POST {url}: {exc}; queue "
+                f"will drain naturally.",
+                file=sys.stderr,
+            )
+
+
 @dataclass(frozen=True)
 class ShardSelfPlayReport:
     """Outcome of a single self-play shard from the orchestrator's
@@ -1233,6 +1456,7 @@ def run_distributed_self_play(
     bundle_url: Optional[str] = None,
     slack_extra: int = 0,
     shard_ssh_timeout_s: float = _DEFAULT_SHARD_SSH_TIMEOUT_S,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> list[Path]:
     """Pull-model orchestrator. Initializes a queue of
     ``total_games + slack_extra`` on master, dispatches every shard
@@ -1253,6 +1477,16 @@ def run_distributed_self_play(
     ``total_games`` successful completions are in, abandoning slack.
     Set to 0 (default) to retain the legacy "drain the whole queue"
     behavior.
+
+    ``stop_check``: optional predicate polled by a background thread.
+    On True, the orchestrator POSTs ``/queue/close/<run_id_prefix>``
+    so the queue stops dispatching new games. Shards' workers see
+    an empty queue at the next take, finish their in-flight games,
+    flush their final batches, and shut down; the orchestrator
+    returns whatever npz paths landed before the stop. Mirrors
+    :func:`run_match_parallel`'s ``stop_check`` shape so iterate
+    can pass the same callable through both paths. Defaults to
+    ``None`` (no stop-check), preserving legacy behavior.
     """
     import threading as _threading
     import urllib.request
@@ -1379,21 +1613,46 @@ def run_distributed_self_play(
         )
         early_stop.start()
 
+    # Stop-check propagation: when the operator (or iterate's cycle
+    # sentinel) requests a stop, close the queue server-side so
+    # shards drain at their next take. Independent of early-stop;
+    # both can run concurrently. POSTs the same /queue/close URL —
+    # idempotent on the server side, so a race between the two
+    # closures is harmless.
+    stop_check_poller: Optional[_StopCheckPoller] = None
+    if stop_check is not None:
+        stop_check_poller = _StopCheckPoller(
+            stop_check=stop_check,
+            run_id=run_id_prefix,
+            queue_url=queue_url,
+        )
+        stop_check_poller.start()
+
     # All shards run concurrently — they pull from the same queue,
     # so there's no static partitioning to worry about. Local
     # shards' mp.Pool runs in this process; remote shards block on
     # SSH (lots of idle wall time waiting on the network call to
     # finish before a thread can do useful work, but the master
     # CPU isn't held).
+    # Skip dispatch entirely if stop was already requested before
+    # we got here — the iter's stop sentinel may have landed during
+    # queue init / aggregator startup. Without this guard we'd
+    # spin up workers only to immediately drain them on first take,
+    # which works but wastes ~1-2s of pool spawn cost per shard on
+    # Windows.
     futures: dict[concurrent.futures.Future, ShardConfig] = {}
     n_threads = max(1, len(shards_config.shards))
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=n_threads, thread_name_prefix="dist-self-play",
     )
+    pre_stop = stop_check is not None and stop_check()
     try:
-        for shard in shards_config.shards:
-            runner = _local_runner if shard.is_local else _remote_runner
-            futures[executor.submit(runner, shard)] = shard
+        if not pre_stop:
+            for shard in shards_config.shards:
+                runner = (
+                    _local_runner if shard.is_local else _remote_runner
+                )
+                futures[executor.submit(runner, shard)] = shard
     finally:
         executor.shutdown(wait=False)
 
@@ -1418,6 +1677,8 @@ def run_distributed_self_play(
     finally:
         if early_stop is not None:
             early_stop.stop()
+        if stop_check_poller is not None:
+            stop_check_poller.stop()
         any_failed = any(not r.success for r in reports) or interrupted
         aggregator.stop("failed" if any_failed else "completed")
 
@@ -1473,6 +1734,7 @@ def run_distributed_eval(
     bundle_url: Optional[str] = None,
     slack_extra: int = 0,
     shard_ssh_timeout_s: float = _DEFAULT_SHARD_SSH_TIMEOUT_S,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> dict[str, int]:
     """Eval counterpart to ``run_distributed_self_play``. Initializes
     a queue of ``total_games + slack_extra``, dispatches every shard
@@ -1488,6 +1750,22 @@ def run_distributed_eval(
     ``slack_extra`` enables the same straggler-tolerance early-stop
     used by self-play: queue ``total + slack``, close once ``total``
     successful games are in.
+
+    ``stop_check``: optional predicate polled by a background thread.
+    On True, the orchestrator POSTs ``/queue/close/<run_id_prefix>``
+    so the queue stops dispatching new eval games. Shards drain
+    cleanly: their workers finish in-flight games, write the per-
+    shard result JSON, and exit; the orchestrator returns the
+    accumulated counts (which the eval-gate caller can then judge
+    against its acceptance threshold on partial-but-conclusive
+    data — same shape as :func:`run_match_parallel`'s ``stop_check``
+    semantics). Defaults to ``None`` (no stop-check), preserving
+    legacy behavior.
+
+    The early-stop watcher (``scripts/eval_early_stop_watcher.py``)
+    writes the same ``.STOP_<run_id>`` sentinel iterate's cycle-
+    level stop uses, so the watcher's PASS / FAIL early-stop now
+    propagates end-to-end through the distributed eval path.
     """
     import threading as _threading
     import urllib.request
@@ -1605,15 +1883,33 @@ def run_distributed_eval(
         )
         early_stop.start()
 
+    # Stop-check propagation: same as self-play, but for eval. The
+    # early-stop watcher (eval_early_stop_watcher.py) calls
+    # write_stop on PASS / FAIL, which fires this poller's stop_check
+    # and closes the queue. Mirrors the rationale above; see the
+    # self-play branch for the docstring.
+    stop_check_poller: Optional[_StopCheckPoller] = None
+    if stop_check is not None:
+        stop_check_poller = _StopCheckPoller(
+            stop_check=stop_check,
+            run_id=run_id_prefix,
+            queue_url=queue_url,
+        )
+        stop_check_poller.start()
+
     futures: dict[concurrent.futures.Future, ShardConfig] = {}
     n_threads = max(1, len(shards_config.shards))
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=n_threads, thread_name_prefix="dist-eval",
     )
+    pre_stop = stop_check is not None and stop_check()
     try:
-        for shard in shards_config.shards:
-            runner = _local_runner if shard.is_local else _remote_runner
-            futures[executor.submit(runner, shard)] = shard
+        if not pre_stop:
+            for shard in shards_config.shards:
+                runner = (
+                    _local_runner if shard.is_local else _remote_runner
+                )
+                futures[executor.submit(runner, shard)] = shard
     finally:
         executor.shutdown(wait=False)
 
@@ -1633,6 +1929,8 @@ def run_distributed_eval(
     finally:
         if early_stop is not None:
             early_stop.stop()
+        if stop_check_poller is not None:
+            stop_check_poller.stop()
         any_failed = any(not r.success for r in reports) or interrupted
         aggregator.stop("failed" if any_failed else "completed")
 
@@ -1823,17 +2121,20 @@ def run_shard_pull(
         _winner_to_p0_outcome,
     )
     from mtg_bot.training.progress import DataGenProgress
+    from mtg_bot.training.trainer import auto_device
 
     cfg = NNPimcConfig(
         weights_path=spec.weights_path,
         samples=spec.samples,
         inner_nodes=spec.inner_nodes,
+        device=auto_device(),
         batch_size=32,
         with_policy=spec.with_policy,
         puct=True,
         hidden_sizes=spec.hidden_sizes,
         architecture=spec.architecture,
         policy_hidden_sizes=spec.policy_hidden_sizes,
+        action_encoding_version=spec.action_encoding_version,
         use_ismcts=spec.use_ismcts,
         use_belief_weighted=spec.use_belief_weighted,
     )
@@ -1936,12 +2237,17 @@ def run_shard_pull(
         )
 
     def _build_args(game_idx: int) -> tuple:
+        # 13-element form so the worker's ``_play_one_parallel_game``
+        # picks up the spec's slot-mapping convention rather than
+        # silently defaulting to v1. ``None`` flows through as v1
+        # there too — keeps the existing v13/v15/v16 behavior intact.
         return (
             game_idx, factory, factory, spec.base_seed,
             spec.decision_cap, spec.sample_every,
             replay_config, deck_pool,
             spec.enable_mulligans, spec.per_game_timeout_sec,
             hang_dump_dir, spec.heuristics,
+            spec.action_encoding_version or "positional_v1",
         )
 
     def _flush() -> None:
@@ -2165,7 +2471,9 @@ def run_shard_eval_pull(
     from mtg_bot.training.config import HeuristicConfig, PimcConfig
     from mtg_bot.training.data_gen import ReplayCaptureConfig
     from mtg_bot.training.progress import EvalProgress
+    from mtg_bot.training.trainer import auto_device
 
+    _device = auto_device()
     new_cfg = NNPimcConfig(
         weights_path=spec.new_weights_path,
         samples=spec.samples, inner_nodes=spec.inner_nodes,
@@ -2173,8 +2481,10 @@ def run_shard_eval_pull(
         hidden_sizes=spec.hidden_sizes,
         architecture=spec.new_architecture,
         policy_hidden_sizes=spec.policy_hidden_sizes,
+        action_encoding_version=spec.new_action_encoding_version,
         use_ismcts=spec.use_ismcts,
         use_belief_weighted=spec.use_belief_weighted,
+        device=_device,
     )
     if spec.old_weights_path is not None:
         old_cfg = NNPimcConfig(
@@ -2184,8 +2494,10 @@ def run_shard_eval_pull(
             hidden_sizes=spec.hidden_sizes,
             architecture=spec.old_architecture,
             policy_hidden_sizes=spec.policy_hidden_sizes,
+            action_encoding_version=spec.old_action_encoding_version,
             use_ismcts=spec.use_ismcts,
             use_belief_weighted=spec.use_belief_weighted,
+            device=_device,
         )
         p1_factory = old_cfg.build
     else:

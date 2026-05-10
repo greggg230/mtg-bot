@@ -91,6 +91,41 @@ class ReplayRecorder:
                 snap.update(extra)
         self.snapshots.append(snap)
 
+    def maybe_warn_deep_annotation_size(
+        self, annotation: dict[str, Any], context: str = "",
+    ) -> Optional[int]:
+        """If ``annotation`` carries deep-capture data (any candidate
+        has ``children`` populated as a non-empty list), measure its
+        raw-JSON size and emit a soft warning when it exceeds
+        ``_DEEP_ANNOTATION_SIZE_WARN_BYTES`` (50 KB). Returns the
+        measured raw-byte size when the check ran, None when the
+        annotation isn't deep (so callers can skip logging).
+
+        Soft-only: never aborts the capture, never raises. Diagnostic
+        captures are expected to be larger than production replays;
+        the threshold catches pathological tree-explosion cases (bad
+        top-k clamping, runaway expansion) without blocking the user."""
+        candidates = annotation.get("candidates") or []
+        deep = any(
+            (c.get("children") or [])
+            for c in candidates
+        )
+        if not deep:
+            return None
+        import json as _json
+        raw = len(_json.dumps(annotation).encode("utf-8"))
+        if raw > _DEEP_ANNOTATION_SIZE_WARN_BYTES:
+            import warnings as _warnings
+            _warnings.warn(
+                f"deep search annotation is {raw} bytes "
+                f"(>{_DEEP_ANNOTATION_SIZE_WARN_BYTES} threshold)"
+                + (f" at {context}" if context else "")
+                + " — consider lowering --capture-tree-depth or "
+                "--capture-top-k",
+                stacklevel=3,
+            )
+        return raw
+
     def record_search_annotation(
         self,
         snapshot_index: int,
@@ -135,9 +170,10 @@ def build_search_annotation(
     candidates: list[dict[str, Any]],
     strategy: Any,
     elapsed_ms: Optional[int] = None,
+    deep_capture: bool = False,
 ) -> dict[str, Any]:
     """Build the v3 ``search`` snapshot annotation from a strategy's
-    ``choose_with_full_stats`` output.
+    ``choose_with_full_stats`` (or ``choose_with_subtree``) output.
 
     Encodes ``chosen`` and each candidate's ``decision`` via
     ``decision_to_json`` so the JSON payload is the same shape the
@@ -147,12 +183,26 @@ def build_search_annotation(
     MCTS — best-effort, ``inner_nodes=None`` when the strategy isn't
     a PIMC-of-MCTS). ``elapsed_ms`` is the wallclock for this
     decision's whole search; passed in so callers can time the
-    single ``choose_with_full_stats`` call without round-tripping
-    the strategy.
+    single search call without round-tripping the strategy.
 
     Candidates are returned sorted by visit count descending so the
     viewer can iterate in display order without re-sorting on the
     JS side.
+
+    Schema decision (deep capture, v3 back-compat): each candidate
+    gains an optional ``children: Optional[List[Candidate]]`` field.
+    Production self-play (the default) leaves ``children=None`` on
+    every candidate — readers ignore the field, the on-disk shape is
+    bit-identical to pre-feature replays, and ``format_version``
+    stays at v3. When the diagnostic capture script is invoked with
+    ``--capture-tree-depth N`` (N > 1), the strategy returns
+    candidates with a ``"subtree"`` key whose value is a recursive
+    list of the same shape — we translate that here into the on-disk
+    ``children`` field. ``deep_capture=True`` flips the default for
+    the ``children`` field from None to ``[]`` so even leaf
+    candidates with no expanded children render with a hidden
+    chevron in the viewer (``[]`` is truthy-equivalent to "no
+    children" in the renderer's ``c.children?.length > 0`` check).
     """
     sorted_candidates = sorted(
         candidates, key=lambda c: int(c["visits"]), reverse=True,
@@ -173,6 +223,7 @@ def build_search_annotation(
                 float(c["leaf_value"])
                 if c.get("leaf_value") is not None else None
             ),
+            "children": _encode_children(c, deep_capture=deep_capture),
         })
     samples = getattr(strategy, "samples", 1)
     # PIMC.inner_factory is a zero-arg callable that returns an MCTS-
@@ -212,6 +263,55 @@ def build_search_annotation(
         "inner_nodes": inner_nodes,
         "elapsed_ms": elapsed_ms,
     }
+
+
+# Soft warning threshold for a single deep-mode snapshot's annotation
+# raw-JSON size. The shallow (root-only) annotation budget is ~2 KB raw;
+# deep captures (depth=3 top-k=5) are expected to land in the 10-30 KB
+# range. 50 KB is a sanity ceiling — anything past that suggests the
+# tree exploded (e.g., bad top-k clamping) and the user should re-check
+# their flags rather than ship a multi-GB replay dir. Soft warning, not
+# an abort.
+_DEEP_ANNOTATION_SIZE_WARN_BYTES = 50_000
+
+
+def _encode_children(
+    src_candidate: dict[str, Any], deep_capture: bool,
+) -> Optional[list[dict[str, Any]]]:
+    """Translate the in-memory ``subtree`` key on a candidate into the
+    on-disk ``children`` field. Returns ``None`` (no deep capture)
+    when the candidate has no ``subtree`` *and* deep capture wasn't
+    requested. Returns a recursively-encoded list otherwise.
+
+    The return-None default is what makes deep capture purely additive:
+    pre-feature replays and production captures emit
+    ``children=None`` on every candidate, viewer renders identically
+    to before. The empty-list case (``deep_capture=True`` but the
+    candidate had no expanded grandchildren) is distinct from None
+    and lets the viewer logic stay uniform.
+    """
+    sub = src_candidate.get("subtree")
+    if sub is None:
+        return [] if deep_capture else None
+    return [
+        {
+            "action": decision_to_json(c["decision"]),
+            "visits": int(c["visits"]),
+            "q": (
+                float(c["q"]) if c.get("q") is not None else None
+            ),
+            "prior": (
+                float(c["prior"]) if c.get("prior") is not None
+                else None
+            ),
+            "leaf_value": (
+                float(c["leaf_value"])
+                if c.get("leaf_value") is not None else None
+            ),
+            "children": _encode_children(c, deep_capture=True),
+        }
+        for c in sub
+    ]
 
 
 def _terminal_value(state: EngineGameState, player_id: int) -> float:

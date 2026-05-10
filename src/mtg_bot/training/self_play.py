@@ -542,6 +542,12 @@ def _play_one_match_game(
         # shows "before any actions taken." Mirrors data_gen.
         recorder.record(adapter.engine_state)
 
+    tree_depth = (
+        replay_config.tree_depth if replay_config is not None else 1
+    )
+    tree_top_k = (
+        replay_config.tree_top_k if replay_config is not None else None
+    )
     if per_game_timeout_sec is not None and per_game_timeout_sec > 0:
         from mtg_bot.training._hang_progress import HangProgress
         from mtg_bot.training._timeout import run_with_timeout
@@ -550,7 +556,7 @@ def _play_one_match_game(
             winner, decisions = run_with_timeout(
                 _play_capped_game,
                 (adapter, strategies, rng, decision_cap, recorder,
-                 progress),
+                 progress, tree_depth, tree_top_k),
                 per_game_timeout_sec,
             )
         except TimeoutError as exc:
@@ -581,6 +587,7 @@ def _play_one_match_game(
     else:
         winner, decisions = _play_capped_game(
             adapter, strategies, rng, decision_cap, recorder,
+            tree_depth=tree_depth, tree_top_k=tree_top_k,
         )
 
     if recorder is not None and replay_config is not None:
@@ -667,6 +674,8 @@ def _play_capped_game(
     decision_cap: int,
     replay_recorder: Optional[ReplayRecorder] = None,
     progress: Optional["object"] = None,
+    tree_depth: int = 1,
+    tree_top_k: Optional[int] = None,
 ) -> tuple[PlayerID | None, int]:
     """Play one game with a hard decision cap. Returns
     ``(winner_id_or_None, decisions_made)``. If the cap is hit
@@ -711,8 +720,32 @@ def _play_capped_game(
             # stays None, matching the viewer's hide-when-absent
             # contract.
             strategy = strategies[active]
+            deep_capture = tree_depth > 1
+            subtree_fn = (
+                getattr(strategy, "choose_with_subtree", None)
+                if deep_capture else None
+            )
             full_stats_fn = getattr(strategy, "choose_with_full_stats", None)
-            if callable(full_stats_fn):
+            if callable(subtree_fn):
+                _t0 = time.perf_counter()
+                chosen, candidates = subtree_fn(
+                    adapter, active,
+                    tree_depth=tree_depth, tree_top_k=tree_top_k,
+                )
+                if chosen is not None:
+                    decision = chosen
+                else:
+                    decision = strategy.choose(adapter, active)
+                if candidates:
+                    elapsed_ms = int((time.perf_counter() - _t0) * 1000)
+                    search_annotation = build_search_annotation(
+                        chosen=decision,
+                        candidates=candidates,
+                        strategy=strategy,
+                        elapsed_ms=elapsed_ms,
+                        deep_capture=True,
+                    )
+            elif callable(full_stats_fn):
                 _t0 = time.perf_counter()
                 chosen, candidates = full_stats_fn(adapter, active)
                 if chosen is not None:
@@ -755,6 +788,12 @@ def _play_capped_game(
                 # rationale.
                 replay_recorder.record_search_annotation(
                     len(replay_recorder.snapshots) - 2,
+                    search_annotation,
+                )
+                # Soft size sanity check on deep-capture annotations.
+                # No-op for production root-only captures; only fires
+                # when ``children`` is populated.
+                replay_recorder.maybe_warn_deep_annotation_size(
                     search_annotation,
                 )
         # Update the optional shared progress sentinel — see

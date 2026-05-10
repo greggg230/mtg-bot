@@ -328,6 +328,7 @@ class NNEvaluator(Evaluator):
         hidden_sizes: tuple[int, ...] = HIDDEN_SIZES,
         architecture: str = ARCHITECTURE_SHARED,
         policy_hidden_sizes: Optional[tuple[int, ...]] = None,
+        action_encoding_version: str = "positional_v1",
     ) -> None:
         # ``with_policy=False`` (default) preserves bit-exact backward
         # compat with v1/v2 weights — same _ValueMLP, same forward
@@ -371,9 +372,17 @@ class NNEvaluator(Evaluator):
                 f"architecture must be one of "
                 f"{SUPPORTED_ARCHITECTURES}; got {architecture!r}"
             )
+        # Validate the action-encoding version eagerly so a typo at
+        # NNEvaluator-construction time surfaces with a clear message
+        # rather than silently falling through to v1 behavior at the
+        # first ``legal_action_mask`` call. Validation goes via the
+        # action_encoding module's helper to keep the supported set
+        # definition single-sourced.
+        _action_encoding()._check_version(action_encoding_version)
         self.device = torch.device(device)
         self.with_policy = with_policy
         self.architecture = architecture
+        self.action_encoding_version = action_encoding_version
         if with_policy:
             self.model: nn.Module = _build_dual_head_model(
                 architecture,
@@ -510,7 +519,9 @@ class NNEvaluator(Evaluator):
 
         engine = self._engine_state(state)
         features = extract_features(engine, player_id)
-        mask_np = ae.legal_action_mask(state, player_id)
+        mask_np = ae.legal_action_mask(
+            state, player_id, version=self.action_encoding_version,
+        )
         with torch.no_grad():
             x = torch.from_numpy(features).unsqueeze(0).to(self.device)
             value_t, logits_t = self.model(x)
@@ -590,7 +601,10 @@ class NNEvaluator(Evaluator):
                 extract_features(engine, player_id)
             )
             nonterminal_masks.append(
-                ae.legal_action_mask(s, player_id),
+                ae.legal_action_mask(
+                    s, player_id,
+                    version=self.action_encoding_version,
+                ),
             )
 
         if nonterminal_features:

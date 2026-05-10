@@ -424,6 +424,17 @@ body { display: grid; grid-template-columns: 1fr 460px;
 .search-table td.action { color: var(--ink); }
 .search-row.chosen { background: rgba(255, 200, 90, 0.12); }
 .search-row.chosen td.action { color: var(--accent); font-weight: 700; }
+/* Diagnostic deep-tree capture: child rows reveal nested search-tree
+   under each candidate. They reuse the .search-row column shape and
+   indent via inline style (paddingLeft on .action) so deeper rows
+   visually nest. No chosen-row tint deeper in — there's only one
+   chosen action at the root. */
+.search-row-child td { color: var(--muted); }
+.search-row-child td.action { color: var(--ink); }
+.search-chevron { display: inline-block; min-width: 1em;
+                  color: var(--muted); user-select: none; }
+.search-chevron.expandable { cursor: pointer; color: var(--accent); }
+.search-chevron.expandable:hover { color: var(--ink); }
 
 /* ---- combat arrows ---- */
 

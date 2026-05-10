@@ -1,8 +1,10 @@
-"""Tests for ``scripts/run_self_play_shard.py``.
+"""Tests for ``mtg_bot.cli.shard`` (the runner formerly known as
+``scripts/run_self_play_shard.py``; the script is now a thin shim
+that just calls into this module).
 
 The deeper integration (run a fake shard end-to-end via
 ``run_shard_pull``) is covered by ``tests/training/test_distributed.py``.
-This module exists to pin the script's ``os._exit`` finalizer
+This module exists to pin the runner's ``os._exit`` finalizer
 behavior — the fix for the post-self-play orchestrator hang where
 remote shard Python processes don't exit even after all data is
 flushed and progress JSONs are written. See
@@ -11,7 +13,7 @@ flushed and progress JSONs are written. See
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 from unittest import mock
@@ -20,23 +22,18 @@ import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPT_PATH = _REPO_ROOT / "scripts" / "run_self_play_shard.py"
 
 
 def _load_module():
-    """Import the script as a module without running its ``main()``.
-
-    ``importlib.util`` is the right tool here — the script lives
-    under ``scripts/`` (not on ``sys.path`` as a package), and we
-    want the module object so we can call ``main(argv)`` directly
-    in-process.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "run_self_play_shard", _SCRIPT_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Fresh-import ``mtg_bot.cli.shard`` — the live module the shim
+    routes into. Force-reload so each test gets independent module
+    state (matters when monkeypatching ``_run``, ``os``, etc.)."""
+    src_dir = _REPO_ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    if "mtg_bot.cli.shard" in sys.modules:
+        del sys.modules["mtg_bot.cli.shard"]
+    return importlib.import_module("mtg_bot.cli.shard")
 
 
 def test_main_calls_os_exit_zero_on_help() -> None:
@@ -181,10 +178,10 @@ def test_run_shard_pull_does_not_call_os_exit() -> None:
     # If this assertion ever fires, someone added os._exit to the
     # library — push it to the script wrapper instead.
     assert "os._exit" not in src, (
-        "os._exit should live only in scripts/run_self_play_shard.py's "
-        "main(), not in the library function. Library functions are "
-        "called from in-process unit tests where os._exit would kill "
-        "the test runner."
+        "os._exit should live only in mtg_bot.cli.shard's main(), "
+        "not in the library function. Library functions are called "
+        "from in-process unit tests where os._exit would kill the "
+        "test runner."
     )
 
 

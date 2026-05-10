@@ -1,4 +1,6 @@
-"""Tests for ``scripts/serve_setup_scripts.py``.
+"""Tests for ``mtg_bot.cli.serve`` (the runner formerly known as
+``scripts/serve_setup_scripts.py``; the script is now a thin shim
+that just calls into this module).
 
 Cover the template-substitution + endpoint behavior. The real-
 remote flow (curl from a Mac, iex from a Win box) needs the actual
@@ -7,24 +9,22 @@ machines and is validated manually after both are up.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPT_PATH = _REPO_ROOT / "scripts" / "serve_setup_scripts.py"
 
 
 def _load_module():
-    """Load serve_setup_scripts.py as a module without running its
-    main(). Imports are local so this test file doesn't pollute the
-    module namespace with stray side effects."""
-    spec = importlib.util.spec_from_file_location(
-        "serve_setup_scripts", _SCRIPT_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Fresh-import ``mtg_bot.cli.serve``. Force-reload so each test
+    gets independent module state."""
+    src_dir = _REPO_ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    if "mtg_bot.cli.serve" in sys.modules:
+        del sys.modules["mtg_bot.cli.serve"]
+    return importlib.import_module("mtg_bot.cli.serve")
 
 
 def test_render_template_replaces_all_placeholders(tmp_path: Path):
@@ -233,11 +233,15 @@ def _queue_app():
     return app.test_client()
 
 
-def test_queue_take_returns_410_when_stop_sentinel_present(tmp_path: Path):
+def test_queue_take_returns_drain_when_stop_sentinel_present(tmp_path: Path):
     """Stop-button propagation to remotes: a master-side
-    .STOP_<run_id> sentinel turns subsequent /queue/take into a 410
-    Gone with ``stopped: True``. Remotes treat 410 the same as 404
-    (drain + exit)."""
+    .STOP_<run_id> sentinel turns subsequent /queue/take into a
+    200 OK with ``closed: True, stopped: True, games: []``. Remotes'
+    ``_take_one`` already treats ``closed=True`` as a drain signal
+    (same path as the orchestrator's early-stop ``/queue/close`` POST),
+    so the worker exits cleanly after its current game. We use 200
+    (not 410) because ``urllib.urlopen`` raises ``HTTPError`` on any
+    4xx, which would crash the shard before it could read the body."""
     serve = _load_module()
     app = serve.create_app(
         repo_url="(unused)", master_pubkey="",
@@ -255,10 +259,44 @@ def test_queue_take_returns_410_when_stop_sentinel_present(tmp_path: Path):
     res = c.post("/queue/take", json={
         "run_id": "iter_001", "batch_size": 5,
     })
-    assert res.status_code == 410
+    assert res.status_code == 200
     body = res.get_json()
     assert body["stopped"] is True
+    assert body["closed"] is True
     assert body["games"] == []
+    assert body["remaining"] == 0
+
+
+def test_queue_take_drain_propagates_via_cycle_id_sentinel(tmp_path: Path):
+    """A cycle-level sentinel (e.g. ``.STOP_iter_002_cycle``) does
+    NOT match a child run_id (e.g. ``iter_002_eval_v18_vs_v17``)
+    via the queue server alone — the queue checks the run_id it was
+    given. Per-cycle propagation is the orchestrator's job: it polls
+    its own cycle stop_check and POSTs ``/queue/close/<run_id>``
+    rather than relying on the sentinel filter at the queue level.
+    This test pins the queue's narrow contract: it only fires drain
+    on a sentinel matching its exact run_id."""
+    serve = _load_module()
+    app = serve.create_app(
+        repo_url="(unused)", master_pubkey="",
+        master_tailnet_name="m", port=5099,
+        template_dir=_REPO_ROOT / "scripts",
+        repo_root=None,
+        progress_dir=tmp_path,
+    )
+    c = app.test_client()
+    c.post("/queue/init", json={
+        "run_id": "iter_002_eval_v18_vs_v17", "total_games": 10,
+    })
+    # Cycle-level sentinel only — no match for the eval run_id.
+    (tmp_path / ".STOP_iter_002_cycle").write_text("{}", encoding="utf-8")
+    res = c.post("/queue/take", json={
+        "run_id": "iter_002_eval_v18_vs_v17", "batch_size": 5,
+    })
+    assert res.status_code == 200
+    body = res.get_json()
+    assert "stopped" not in body
+    assert body["games"] == [0, 1, 2, 3, 4]
 
 
 def test_queue_take_no_progress_dir_keeps_legacy_behavior():

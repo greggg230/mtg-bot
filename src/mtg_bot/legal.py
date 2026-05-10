@@ -215,6 +215,34 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
     )
 
     # Instant-speed-castable: instants AND any permanent spell with flash.
+    # Hand-zone PlayLand / CastSpell dedup: two same-printing copies in hand
+    # reach identical end-states modulo card.id (which is a label with no
+    # future bearing on play) — no per-object state on hand-resident
+    # GameObjects diverges between copies; counters / tapped / attached_to /
+    # warped only attach in non-hand zones. Equivalence key is
+    # (printing.name, *modifier_tuple), mirroring the precedent at
+    # _player_capabilities.py:557. MAINTENANCE INVARIANT: if a future
+    # mechanic ever attaches per-object state to hand-resident cards
+    # (counters on cards in hand, "next time you cast THIS card" memory,
+    # etc.), this key MUST absorb that state — otherwise legal actions are
+    # silently dropped. Same comment applies to the PlayLand and sorcery-
+    # speed CastSpell dedup blocks below.
+    seen_instant: set[tuple] = set()
+
+    def _emit_hand_cast(card, **kwargs):
+        key = (
+            card.printing.name,
+            kwargs.get("use_warp", False),
+            kwargs.get("kicked", False),
+            kwargs.get("cast_for_free", False),
+            kwargs.get("use_impending", False),
+            kwargs.get("cast_room_half", None),
+        )
+        if key in seen_instant:
+            return
+        seen_instant.add(key)
+        actions.append(CastSpell(card.id, **kwargs))
+
     for card in p.hand:
         instant_speed = (
             card.printing.is_instant or "flash" in card.printing.keywords
@@ -224,13 +252,13 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
         if _can_cast(
             state, player_id, card, _effective_cost(card, card.printing.mana_cost),
         ) and _targets_are_satisfiable(state, player_id, card) and _additional_costs_payable(state, player_id, card):
-            actions.append(CastSpell(card.id))
+            _emit_hand_cast(card)
             # Kicked variant: can_pay the combined cost.
             if card.printing.kicker_cost is not None and _can_cast(
                 state, player_id, card,
                 _cost_plus_kicker(card, _effective_cost(card, card.printing.mana_cost)),
             ):
-                actions.append(CastSpell(card.id, kicked=True))
+                _emit_hand_cast(card, kicked=True)
         if (
             card.printing.warp_cost is not None
             and _can_cast(
@@ -240,7 +268,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
             and _additional_costs_payable(state, player_id, card)
             and p.life > card.printing.warp_additional_life_cost
         ):
-            actions.append(CastSpell(card.id, use_warp=True))
+            _emit_hand_cast(card, use_warp=True)
         # Battlefield-granted warp: a permanent the controller controls
         # may grant warp to cards in hand matching a filter (Tannuk,
         # Steadfast Second). The grant only applies when the card has
@@ -261,7 +289,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
                 and _targets_are_satisfiable(state, player_id, card)
                 and _additional_costs_payable(state, player_id, card)
             ):
-                actions.append(CastSpell(card.id, use_warp=True))
+                _emit_hand_cast(card, use_warp=True)
         # Weftwalking free-cast variant. Skips the mana-cost payable
         # check (it's free) but still gates on targets / additional
         # non-mana costs.
@@ -270,7 +298,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
             and _targets_are_satisfiable(state, player_id, card)
             and _additional_costs_payable(state, player_id, card)
         ):
-            actions.append(CastSpell(card.id, cast_for_free=True))
+            _emit_hand_cast(card, cast_for_free=True)
 
     if not _is_sorcery_timing(state, player_id):
         return actions
@@ -289,8 +317,15 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
         for o in state.battlefield
     )
     if p.lands_played_this_turn < max_lands:
+        # Hand-zone PlayLand dedup; see rationale + invariant on the
+        # instant-speed dedup block above.
+        seen_playland: set[tuple] = set()
         for card in p.hand:
             if card.printing.is_land:
+                key = (card.printing.name,)
+                if key in seen_playland:
+                    continue
+                seen_playland.add(key)
                 actions.append(PlayLand(card.id))
         if grants_play_from_graveyard:
             for card in p.graveyard:
@@ -309,6 +344,24 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
             or (pr.is_permanent and not pr.is_instant and not pr.is_land)
         )
 
+    # Hand-zone CastSpell dedup, sorcery-speed mirror; see rationale +
+    # invariant on the instant-speed dedup block above.
+    seen_sorcery: set[tuple] = set()
+
+    def _emit_hand_sorcery_cast(card, **kwargs):
+        key = (
+            card.printing.name,
+            kwargs.get("use_warp", False),
+            kwargs.get("kicked", False),
+            kwargs.get("cast_for_free", False),
+            kwargs.get("use_impending", False),
+            kwargs.get("cast_room_half", None),
+        )
+        if key in seen_sorcery:
+            return
+        seen_sorcery.add(key)
+        actions.append(CastSpell(card.id, **kwargs))
+
     for card in p.hand:
         if "flash" in card.printing.keywords:
             continue
@@ -324,20 +377,18 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
                     state, player_id, card,
                     _effective_cost(card, half.mana_cost),
                 ):
-                    actions.append(
-                        CastSpell(card.id, cast_room_half=half.name)
-                    )
+                    _emit_hand_sorcery_cast(card, cast_room_half=half.name)
             continue
         if _is_sorcery_speed_spell(card):
             if _can_cast(
                 state, player_id, card, _effective_cost(card, card.printing.mana_cost),
             ) and _targets_are_satisfiable(state, player_id, card) and _additional_costs_payable(state, player_id, card):
-                actions.append(CastSpell(card.id))
+                _emit_hand_sorcery_cast(card)
                 if card.printing.kicker_cost is not None and _can_cast(
                     state, player_id, card,
                     _cost_plus_kicker(card, _effective_cost(card, card.printing.mana_cost)),
                 ):
-                    actions.append(CastSpell(card.id, kicked=True))
+                    _emit_hand_sorcery_cast(card, kicked=True)
             if (
                 card.printing.warp_cost is not None
                 and _can_cast(
@@ -347,7 +398,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
                 and _additional_costs_payable(state, player_id, card)
                 and p.life > card.printing.warp_additional_life_cost
             ):
-                actions.append(CastSpell(card.id, use_warp=True))
+                _emit_hand_sorcery_cast(card, use_warp=True)
             # Battlefield-granted warp (sorcery-speed mirror of the
             # instant-speed block above). Same priority: grant only
             # applies when no innate warp_cost is present.
@@ -363,7 +414,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
                     and _targets_are_satisfiable(state, player_id, card)
                     and _additional_costs_payable(state, player_id, card)
                 ):
-                    actions.append(CastSpell(card.id, use_warp=True))
+                    _emit_hand_sorcery_cast(card, use_warp=True)
             # Impending alt-cost (Duskmourn Overlord cycle). Sorcery-
             # speed only — mirrors the printed text; offered when
             # the card has an impending cost the caster can pay,
@@ -382,7 +433,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
                 and _targets_are_satisfiable(state, player_id, card)
                 and _additional_costs_payable(state, player_id, card)
             ):
-                actions.append(CastSpell(card.id, use_impending=True))
+                _emit_hand_sorcery_cast(card, use_impending=True)
             # Weftwalking free-cast variant for this sorcery-speed
             # spell. Skips the mana-cost payable check (it's free)
             # but still gates on targets / additional non-mana costs.
@@ -391,7 +442,7 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
                 and _targets_are_satisfiable(state, player_id, card)
                 and _additional_costs_payable(state, player_id, card)
             ):
-                actions.append(CastSpell(card.id, cast_for_free=True))
+                _emit_hand_sorcery_cast(card, cast_for_free=True)
 
     # Warp-cast from graveyard. Timeline Culler grants this; see
     # warp_castable_from_graveyard. Currently only sorcery-speed since
@@ -410,13 +461,19 @@ def legal_actions(state: GameState, player_id: int) -> list[Action]:
             and p.life > card.printing.warp_additional_life_cost
         ):
             actions.append(CastSpell(card.id, use_warp=True))
-        # Weftwalking free-cast variant for sorcery-speed spells.
-        if (
-            free_first_cast_active
-            and _targets_are_satisfiable(state, player_id, card)
-            and _additional_costs_payable(state, player_id, card)
-        ):
-            actions.append(CastSpell(card.id, cast_for_free=True))
+        # NOTE: no Weftwalking free-cast variant from graveyard. The
+        # warp-from-graveyard permission (Timeline Culler) is itself an
+        # alternative cost (the warp cost), and CR 117.9b allows only
+        # one alternative cost per cast. ``_cast_spell``'s graveyard
+        # branch is gated on ``use_warp=True`` for that reason; emitting
+        # a ``cast_for_free=True`` variant here would route through the
+        # apply path's defensive raise (no graveyard route accepts
+        # ``cast_for_free`` without ``use_warp``). Confirmed by a
+        # 0.03%-rate ValueError surfaced in v16-vs-v13 eval (1/3263
+        # games) when Weftwalking was on the battlefield + Timeline
+        # Culler in the graveyard. See test_weftwalking_and_
+        # possibility.py::test_legal_actions_does_not_offer_cast_for_
+        # free_for_warp_castable_card_in_graveyard.
 
     # Warp-exile recasts at sorcery speed (for creatures / sorceries).
     # Instants in warp-exile could be recast at instant speed, but we don't
