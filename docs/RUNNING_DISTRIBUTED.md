@@ -238,10 +238,35 @@ Per-iteration artifacts live in
 
 ## Aborting a run
 
-- **Iteration**: Ctrl-C the master's `iterate_alphazero.py` process.
-  The queue server shuts down gracefully; in-flight remote shards
+- **Iteration (graceful, preferred)**: click "Stop run" in the
+  training UI on the cycle card. This writes a `.STOP_<cycle_id>`
+  sentinel under `training_progress/`. Iterate's cycle loop, the
+  local self-play / eval pools, and the **distributed orchestrator**
+  (`run_distributed_self_play` / `run_distributed_eval`) all poll
+  the sentinel and exit cleanly at the next stage / dispatch
+  boundary. The queue server's `/queue/take` also reads the
+  sentinel and starts returning a drain signal so any in-flight
+  remote shards finish their current game and stop pulling new
+  ones; partial counts (eval) and partial npzs (self-play) are
+  preserved through the orchestrator's return value.
+
+  Stop-check propagation is honored end-to-end as of
+  `feature/distributed-stop-check`. Before that, the distributed
+  orchestrator ignored the sentinel — eval would grind to its
+  full `--eval-games` cap regardless of the watcher's PASS / FAIL
+  decision. Standalone CLI evals (`mtg_bot eval`) still need
+  `Ctrl-C` since they don't have a cycle-level sentinel.
+- **Iteration (force)**: `Ctrl-C` the master's `mtg_bot iterate`
+  process. The queue server shuts down; in-flight remote shards
   finish their current game then exit cleanly. Partial dataset is
   preserved.
+- **Eval early-stop watcher**: run alongside iterate to
+  short-circuit close-call evals once the Wilson 95% CI is
+  conclusive vs the threshold. Writes the same `.STOP_<cycle_id>`
+  sentinel as the UI button, so the same end-to-end propagation
+  applies — distributed evals now actually stop dispatching
+  rather than running to the full cap. See
+  [`scripts/eval_early_stop_watcher.py`](../scripts/eval_early_stop_watcher.py).
 - **Single shard**: SSH to the host and `pkill -f run_self_play_shard`
   (or `Stop-Process` on Windows). Master's queue will re-hand the
   unfinished batches to another worker.

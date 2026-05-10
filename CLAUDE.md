@@ -143,6 +143,20 @@ For one-time per-machine bootstrap (Python, repo clone, SSH keys,
 Tailscale enrollment), see
 [`docs/SETUP_DISTRIBUTED.md`](docs/SETUP_DISTRIBUTED.md).
 
+**Stop-check propagation is honored end-to-end** as of
+`feature/distributed-stop-check`. The training UI's "Stop run"
+button and the eval-early-stop-watcher both write the same
+`.STOP_<cycle_id>` sentinel via `mtg_bot.training.stop_signal`;
+iterate's cycle loop, `run_distributed_self_play`, and
+`run_distributed_eval` all observe it. The orchestrator's
+`_StopCheckPoller` POSTs `/queue/close/<run_id>` on observation,
+the queue server's `/queue/take` also returns a drain marker on
+the sentinel, and remote shards exit cleanly at their next take.
+Partial counts (eval) and partial npzs (self-play) flow back
+through the orchestrator's return value. Before this branch the
+watcher was effectively informational in distributed mode — the
+eval would grind to its full `--eval-games` cap regardless.
+
 ## Run database
 
 Every `mtg_bot` subcommand records its run into a SQLite DB at
