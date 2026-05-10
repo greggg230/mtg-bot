@@ -455,3 +455,259 @@ def test_launch_server_subprocess_smoke(tmp_path):
             client.close()
     finally:
         proxy.stop(timeout=10.0)
+
+
+# ---------- batching correctness: single-worker (no batch) ------------------
+
+
+def test_single_worker_serial_calls_each_dispatch_one(server_factory):
+    """One client firing one request at a time is the worst case for
+    batching — the dispatcher should still serve every request and the
+    answers should still be correct (just at batch=1).
+
+    Verifies: (a) the server doesn't deadlock when there's no
+    second request to coalesce with, (b) the per-call result matches
+    the reference, (c) every dispatched batch has size 1 in this
+    serialized regime.
+    """
+    server, ref, _ = server_factory(batch_size=8, batch_wait_ms=2.0)
+    rng = np.random.default_rng(42)
+    feats_pool = rng.standard_normal(
+        (5, FEATURE_DIM),
+    ).astype(np.float32)
+    with server:
+        client = NNEvalClient(server.handle())
+        try:
+            for i in range(5):
+                v_server = client._call(MSG_KIND_VALUE, feats_pool[i])
+                with torch.no_grad():
+                    v_ref = ref.model(
+                        torch.from_numpy(feats_pool[i]).unsqueeze(0),
+                    ).item()
+                assert v_server == pytest.approx(v_ref, abs=1e-5)
+        finally:
+            client.close()
+        # Single-worker path: every dispatched batch is size 1 (no
+        # peer requests to coalesce with).
+        assert all(s == 1 for s in server.batch_sizes), (
+            f"unexpected coalesced batches in serial regime: "
+            f"{server.batch_sizes}"
+        )
+        assert server.requests_served == 5
+
+
+# ---------- correlation under interleaved sends ----------------------------
+
+
+def test_per_worker_request_correlation_across_a_shared_batch(server_factory):
+    """The dispatcher coalesces requests from multiple workers into one
+    forward pass. Verify that each worker still gets back the value
+    computed for ITS feature vector — no cross-talk where worker A
+    receives worker B's reply.
+
+    We give each worker a worker-specific feature vector
+    (``np.full(FEATURE_DIM, i)``) so the reference forward produces
+    a worker-distinguishable result. Then check that worker i's
+    reply equals the reference forward on input i.
+    """
+    server, ref, _ = server_factory(batch_size=16, batch_wait_ms=20.0)
+    n_workers = 8
+    with server:
+        handle = server.handle()
+        clients = [NNEvalClient(handle) for _ in range(n_workers)]
+        try:
+            results: list[float | None] = [None] * n_workers
+            ready = threading.Barrier(n_workers)
+
+            def _worker(i: int):
+                ready.wait()
+                feats = np.full(FEATURE_DIM, float(i), dtype=np.float32)
+                results[i] = clients[i]._call(MSG_KIND_VALUE, feats)
+
+            threads = [
+                threading.Thread(target=_worker, args=(i,))
+                for i in range(n_workers)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10.0)
+            for i, r in enumerate(results):
+                assert r is not None, f"worker {i} timed out"
+                feats = np.full(FEATURE_DIM, float(i), dtype=np.float32)
+                with torch.no_grad():
+                    v_ref = ref.model(
+                        torch.from_numpy(feats).unsqueeze(0),
+                    ).item()
+                assert r == pytest.approx(v_ref, abs=1e-5), (
+                    f"worker {i} got back the wrong reply: "
+                    f"server={r!r} ref={v_ref!r}"
+                )
+            assert any(s > 1 for s in server.batch_sizes), (
+                f"expected at least one coalesced batch, "
+                f"got sizes={server.batch_sizes}"
+            )
+        finally:
+            for c in clients:
+                c.close()
+
+
+# ---------- 32-worker stampede ---------------------------------------------
+
+
+def test_thirty_two_worker_stampede_serves_all(server_factory):
+    """All 32 workers hit the server at once. Sanity check that the
+    server handles the simultaneous-arrival storm without losing or
+    crossing replies. Each worker gets a worker-specific feature row
+    (np.full(..., i)) so we can verify each reply matches its own
+    input under the reference model."""
+    server, ref, _ = server_factory(batch_size=16, batch_wait_ms=2.0)
+    n_workers = 32
+    with server:
+        handle = server.handle()
+        clients = [NNEvalClient(handle) for _ in range(n_workers)]
+        try:
+            results: list[float | None] = [None] * n_workers
+            errors: list[Exception] = []
+            ready = threading.Barrier(n_workers)
+
+            def _worker(i: int):
+                try:
+                    ready.wait()
+                    feats = np.full(
+                        FEATURE_DIM, float(i), dtype=np.float32,
+                    )
+                    results[i] = clients[i]._call(MSG_KIND_VALUE, feats)
+                except Exception as e:  # pragma: no cover - debug aid
+                    errors.append(e)
+
+            threads = [
+                threading.Thread(target=_worker, args=(i,))
+                for i in range(n_workers)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30.0)
+            assert not errors, f"client errors: {errors!r}"
+            for i, r in enumerate(results):
+                assert r is not None
+                feats = np.full(
+                    FEATURE_DIM, float(i), dtype=np.float32,
+                )
+                with torch.no_grad():
+                    v_ref = ref.model(
+                        torch.from_numpy(feats).unsqueeze(0),
+                    ).item()
+                assert r == pytest.approx(v_ref, abs=1e-5), (
+                    f"stampede crossed replies for worker {i}"
+                )
+            # Sanity: with 32 simultaneous requests and batch_size=16,
+            # at least two batches should have fired.
+            assert len(server.batch_sizes) >= 2
+            assert server.requests_served == n_workers
+        finally:
+            for c in clients:
+                c.close()
+
+
+# ---------- slow forward eventually completes -------------------------------
+
+
+def test_slow_forward_eventually_responds():
+    """A slow model still serves correctly. Simulates the GPU under
+    contention (e.g., cuda kernels piling up) by sleeping inside
+    forward; the dispatcher must not abandon the batch and the client
+    must wait for the reply rather than declaring an error."""
+
+    class SlowModel(torch.nn.Module):
+        def forward(self, x):  # noqa: D401 - test model
+            time.sleep(0.2)
+            n = x.shape[0]
+            return torch.full((n, 1), 0.42, dtype=torch.float32)
+
+    server = NNEvalServer(
+        device="cpu", batch_size=4, batch_wait_ms=1.0,
+        model_factory=SlowModel,
+    )
+    with server:
+        client = NNEvalClient(server.handle())
+        try:
+            feats = np.zeros(FEATURE_DIM, dtype=np.float32)
+            t0 = time.perf_counter()
+            v = client._call(MSG_KIND_VALUE, feats)
+            elapsed = time.perf_counter() - t0
+            assert v == pytest.approx(0.42, abs=1e-6)
+            # Must have taken at least the 0.2s simulated forward time.
+            assert elapsed >= 0.18, (
+                f"call returned faster than the simulated forward: "
+                f"{elapsed:.3f}s"
+            )
+        finally:
+            client.close()
+
+
+# ---------- client reconnect after explicit close ---------------------------
+
+
+def test_client_reconnects_after_explicit_close(server_factory):
+    """``client.close()`` releases the connection but the client must
+    still be usable: the next call lazily reopens. Mirrors the worker
+    lifecycle where a worker may close its connection between phases
+    and reuse the same client object."""
+    server, ref, _ = server_factory(batch_size=1, batch_wait_ms=0.0)
+    with server:
+        client = NNEvalClient(server.handle())
+        feats = np.zeros(FEATURE_DIM, dtype=np.float32)
+        v1 = client._call(MSG_KIND_VALUE, feats)
+        client.close()
+        # Second call should reopen the connection automatically.
+        v2 = client._call(MSG_KIND_VALUE, feats)
+        with torch.no_grad():
+            v_ref = ref.model(
+                torch.from_numpy(feats).unsqueeze(0),
+            ).item()
+        assert v1 == pytest.approx(v_ref, abs=1e-5)
+        assert v2 == pytest.approx(v_ref, abs=1e-5)
+        client.close()
+
+
+# ---------- ephemeral port (no fixed-port collision risk) ------------------
+
+
+def test_default_address_uses_ephemeral_port(server_factory):
+    """The server should bind an OS-assigned ephemeral port by
+    default — never a fixed one. Defends against accidental collisions
+    with the existing ``mtg_bot serve`` infrastructure (port 5099) and
+    other local services."""
+    server, _, _ = server_factory(batch_size=1, batch_wait_ms=0.0)
+    with server:
+        addr = server.address
+        # AF_INET tuple form: ('host', port). Port 0 means "let OS
+        # choose"; the resolved port read off the listener must be
+        # nonzero, must be in the valid TCP range, and must not be
+        # the well-known mtg_bot serve port (5099).
+        assert isinstance(addr, tuple)
+        assert addr[0] == "127.0.0.1"
+        assert 1 <= addr[1] <= 65535
+        assert addr[1] != 5099, (
+            "default address must not collide with the mtg_bot serve "
+            "HTTP server on 5099"
+        )
+
+
+# ---------- unknown kind error path -----------------------------------------
+
+
+def test_unknown_kind_returns_error_to_client(server_factory):
+    """The dispatcher routes by ``kind``; an unknown one must not
+    silently drop the request. The client should receive a clean
+    REPLY_ERROR and raise ``NNEvalServerError`` rather than hang."""
+    server, _, _ = server_factory(batch_size=1, batch_wait_ms=0.0)
+    with server:
+        client = NNEvalClient(server.handle())
+        try:
+            with pytest.raises(NNEvalServerError, match="unknown kind"):
+                client._call("not_a_real_kind", np.zeros(FEATURE_DIM, dtype=np.float32))
+        finally:
+            client.close()
