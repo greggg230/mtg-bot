@@ -71,6 +71,38 @@ the codec is bijective on the legal set. Slot legality (i.e.
 ``legal_action_mask``) is recomputed from scratch every call so it
 always matches the engine's current ``legal_decisions``.
 
+Versioning (canonicality):
+
+The codec carries a ``version`` parameter selecting the slot-mapping
+convention:
+
+- ``"positional_v1"`` (default, back-compat with v13/v15/v16 weights):
+  hand / graveyard / exile positions are taken from the engine's raw
+  zone list. Two states differing only in the ordering of card.ids
+  (canonically equivalent transpositions) produce DIFFERENT slot-to-
+  decision mappings even though their value/policy logits are
+  identical. The MCTS NN-eval cache (``mcts._cache_key``) defends
+  against the resulting drift via a slot_fingerprint extension to its
+  cache key — see commit 2f50fca.
+
+- ``"canonical_v2"``: hand / graveyard / exile positions are taken
+  AFTER sorting each zone by the same forward-relevant tuple
+  ``canonical_state._canonical_zone_card`` uses (printing.name +
+  per-card modifier flags), with raw card.id as the final tiebreaker
+  for determinism within identical canonicalized cards. Two states
+  whose canonical hash collides also carry identical slot-to-decision
+  mappings. v2 makes the slot_fingerprint cache workaround a no-op.
+
+Migration: v13/v15/v16 metadata.json doesn't carry an
+``action_encoding_version`` field, so loaders default it to
+``"positional_v1"`` and behavior is bit-identical to before this
+change. v17+ training runs opt into v2 by passing
+``--action-encoding-version positional_v1|canonical_v2`` to
+``mtg_bot train`` (or by writing the field directly into
+``ModelMetadata.action_encoding_version``); the registry persists the
+choice and ``NNEvaluator`` / ``NNPimcConfig`` thread it through to
+every ``legal_action_mask`` call at inference time.
+
 Stability guarantees:
 
 - ``ACTION_VOCAB_SIZE`` is module-level and immutable. Pinned by a
@@ -224,6 +256,36 @@ ACTION_VOCAB_SIZE: int = SLOT_BLOCKER_END
 
 
 # ---------------------------------------------------------------------
+# Versioning. See module docstring "Versioning (canonicality)" for the
+# semantic difference between v1 and v2.
+# ---------------------------------------------------------------------
+
+ACTION_ENCODING_VERSION_V1 = "positional_v1"
+"""Legacy positional-by-card.id slot mapping. Default; v13/v15/v16
+trained weights memorized this convention."""
+
+ACTION_ENCODING_VERSION_V2 = "canonical_v2"
+"""Canonical sort-by-(printing.name, modifier_tuple, card.id) slot
+mapping. v17+ training runs opt in via metadata."""
+
+SUPPORTED_ACTION_ENCODING_VERSIONS = (
+    ACTION_ENCODING_VERSION_V1,
+    ACTION_ENCODING_VERSION_V2,
+)
+
+
+def _check_version(version: str) -> None:
+    """Validate ``version`` against the supported set. Raises
+    ``ValueError`` early with a helpful message rather than silently
+    treating an unknown string as v1."""
+    if version not in SUPPORTED_ACTION_ENCODING_VERSIONS:
+        raise ValueError(
+            f"action_encoding_version must be one of "
+            f"{SUPPORTED_ACTION_ENCODING_VERSIONS}; got {version!r}"
+        )
+
+
+# ---------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------
 
@@ -282,16 +344,66 @@ def _own_spacecraft(eng: EngineGameState, viewer: PlayerID) -> list:
     ]
 
 
-def _hand(eng: EngineGameState, viewer: PlayerID) -> list:
-    return list(eng.player_by_id(viewer).hand)
+def _canonical_zone_sort_key(card: Any) -> tuple:
+    """Sort key applied to hand / graveyard / exile entries under v2.
+
+    Mirrors the forward-relevant tuple ``canonical_state._canonical_
+    zone_card`` builds (printing.name + per-card modifier flags); the
+    raw ``card.id`` is appended as the final tiebreaker so two
+    canonically-equivalent cards (same printing.name + same modifier
+    tuple) get a deterministic slot ordering. Without the id tiebreak
+    the v2 sort would still be canonical-equivalent (the two slots
+    would be interchangeable from any forward-play perspective), but a
+    deterministic order keeps unit-test asserts simple and matches the
+    tie-breaking convention the engine uses elsewhere
+    (``_attacking_creatures`` sorts by id).
+    """
+    return (
+        card.printing.name,
+        getattr(card, "warped", False),
+        getattr(card, "cast_via_warp", False),
+        getattr(card, "face_down", False),
+        getattr(card, "playable_from_exile_this_turn", False),
+        getattr(card, "play_from_exile_requires_kavu", False),
+        getattr(card, "cast_from_exile_with_lightstall_surcharge", False),
+        card.id,
+    )
 
 
-def _graveyard(eng: EngineGameState, viewer: PlayerID) -> list:
-    return list(eng.player_by_id(viewer).graveyard)
+def _hand(
+    eng: EngineGameState, viewer: PlayerID,
+    version: str = ACTION_ENCODING_VERSION_V1,
+) -> list:
+    """Return the viewer's hand ordered per ``version``.
+
+    v1: raw engine list order (unchanged from pre-canonical days).
+    v2: sorted by ``_canonical_zone_sort_key`` so two states that
+    differ only by card.id permutation produce the same slot mapping.
+    """
+    cards = list(eng.player_by_id(viewer).hand)
+    if version == ACTION_ENCODING_VERSION_V2:
+        return sorted(cards, key=_canonical_zone_sort_key)
+    return cards
 
 
-def _exile(eng: EngineGameState, viewer: PlayerID) -> list:
-    return list(eng.player_by_id(viewer).exile)
+def _graveyard(
+    eng: EngineGameState, viewer: PlayerID,
+    version: str = ACTION_ENCODING_VERSION_V1,
+) -> list:
+    cards = list(eng.player_by_id(viewer).graveyard)
+    if version == ACTION_ENCODING_VERSION_V2:
+        return sorted(cards, key=_canonical_zone_sort_key)
+    return cards
+
+
+def _exile(
+    eng: EngineGameState, viewer: PlayerID,
+    version: str = ACTION_ENCODING_VERSION_V1,
+) -> list:
+    cards = list(eng.player_by_id(viewer).exile)
+    if version == ACTION_ENCODING_VERSION_V2:
+        return sorted(cards, key=_canonical_zone_sort_key)
+    return cards
 
 
 def _library_top(eng: EngineGameState, viewer: PlayerID):
@@ -355,20 +467,26 @@ def _cast_variant_for_gy_or_exile(d: CastSpell) -> int:
 
 def _find_card_zone(
     eng: EngineGameState, viewer: PlayerID, card_id: int,
+    version: str = ACTION_ENCODING_VERSION_V1,
 ) -> tuple[str, int, Any]:
     """Locate ``card_id`` in the viewer's hand / graveyard / exile or
     on top of library. Returns ``(zone_name, position, card)`` or
     raises if not found.
 
+    ``position`` is taken from the version-appropriate zone view: raw
+    engine order under v1, ``_canonical_zone_sort_key``-sorted order
+    under v2. Library top is unaffected (it's slot
+    ``SLOT_CAST_FROM_LIBRARY_TOP``, not a positional family).
+
     Zones searched mirror ``legal.py``'s CastSpell sources."""
     p = eng.player_by_id(viewer)
-    for i, c in enumerate(p.hand):
+    for i, c in enumerate(_hand(eng, viewer, version=version)):
         if c.id == card_id:
             return ("hand", i, c)
-    for i, c in enumerate(p.graveyard):
+    for i, c in enumerate(_graveyard(eng, viewer, version=version)):
         if c.id == card_id:
             return ("graveyard", i, c)
-    for i, c in enumerate(p.exile):
+    for i, c in enumerate(_exile(eng, viewer, version=version)):
         if c.id == card_id:
             return ("exile", i, c)
     if p.library and p.library[0].id == card_id:
@@ -384,7 +502,10 @@ def _find_card_zone(
 # ---------------------------------------------------------------------
 
 
-def encode(decision: Any, state: Any, viewer: PlayerID) -> int:
+def encode(
+    decision: Any, state: Any, viewer: PlayerID,
+    version: str = ACTION_ENCODING_VERSION_V1,
+) -> int:
     """Convert ``decision`` into a slot index in ``[0, ACTION_VOCAB_SIZE)``.
 
     ``state`` may be an engine ``GameState`` or an ``MtgGameStateAdapter``;
@@ -394,15 +515,24 @@ def encode(decision: Any, state: Any, viewer: PlayerID) -> int:
     adapter's pending lists, so prefer the adapter for the legal-mask
     helper.
 
+    ``version`` selects the slot-mapping convention; defaults to
+    ``ACTION_ENCODING_VERSION_V1`` for backward compatibility. See the
+    module docstring "Versioning (canonicality)" for the v1-vs-v2
+    semantic difference. Raises ``ValueError`` for an unknown version
+    string.
+
     Raises ``EncodingOverflowError`` if a referenced position exceeds
     its cap (see module-level cap constants)."""
+    _check_version(version)
     eng = _engine_state(state)
 
     if isinstance(decision, PassPriority):
         return SLOT_PASS
 
     if isinstance(decision, PlayLand):
-        zone, pos, _ = _find_card_zone(eng, viewer, decision.card_id)
+        zone, pos, _ = _find_card_zone(
+            eng, viewer, decision.card_id, version=version,
+        )
         if zone == "hand":
             if pos >= HAND_SIZE_CAP:
                 raise EncodingOverflowError(
@@ -426,7 +556,9 @@ def encode(decision: Any, state: Any, viewer: PlayerID) -> int:
         )
 
     if isinstance(decision, CastSpell):
-        zone, pos, card = _find_card_zone(eng, viewer, decision.card_id)
+        zone, pos, card = _find_card_zone(
+            eng, viewer, decision.card_id, version=version,
+        )
         if zone == "hand":
             if pos >= HAND_SIZE_CAP:
                 raise EncodingOverflowError(
@@ -615,13 +747,24 @@ def _slot_in(slot: int, base: int, end: int) -> bool:
     return base <= slot < end
 
 
-def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
+def decode(
+    slot_idx: int, state: Any, viewer: PlayerID,
+    version: str = ACTION_ENCODING_VERSION_V1,
+) -> Any:
     """Reconstruct the ``Decision`` corresponding to ``slot_idx``.
+
+    ``version`` must match the version used at encode-time. Decoding a
+    slot encoded under v2 with a v1 decoder (or vice versa) is
+    undefined behavior — the decoder will return the wrong card.id at
+    that position. The caller is responsible for threading the version
+    through (``NNEvaluator`` does this for inference; tests pass it
+    explicitly).
 
     Raises ``IllegalSlotError`` when the slot's referenced position
     isn't filled in the current state (e.g., the hand has fewer cards
     than ``hand_pos``). Use ``legal_action_mask`` first if you want to
     avoid this — it's exact."""
+    _check_version(version)
     if slot_idx < 0 or slot_idx >= ACTION_VOCAB_SIZE:
         raise IllegalSlotError(
             f"slot_idx={slot_idx} not in [0, {ACTION_VOCAB_SIZE})"
@@ -633,7 +776,7 @@ def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
 
     if _slot_in(slot_idx, SLOT_LAND_FROM_HAND_BASE, SLOT_LAND_FROM_HAND_END):
         pos = slot_idx - SLOT_LAND_FROM_HAND_BASE
-        hand = _hand(eng, viewer)
+        hand = _hand(eng, viewer, version=version)
         if pos >= len(hand):
             raise IllegalSlotError(
                 f"LAND_FROM_HAND pos={pos} but hand has {len(hand)} cards"
@@ -642,7 +785,7 @@ def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
 
     if _slot_in(slot_idx, SLOT_LAND_FROM_GY_BASE, SLOT_LAND_FROM_GY_END):
         pos = slot_idx - SLOT_LAND_FROM_GY_BASE
-        gy = _graveyard(eng, viewer)
+        gy = _graveyard(eng, viewer, version=version)
         if pos >= len(gy):
             raise IllegalSlotError(
                 f"LAND_FROM_GRAVEYARD pos={pos} but gy has {len(gy)} cards"
@@ -651,7 +794,7 @@ def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
 
     if _slot_in(slot_idx, SLOT_LAND_FROM_EXILE_BASE, SLOT_LAND_FROM_EXILE_END):
         pos = slot_idx - SLOT_LAND_FROM_EXILE_BASE
-        exile = _exile(eng, viewer)
+        exile = _exile(eng, viewer, version=version)
         if pos >= len(exile):
             raise IllegalSlotError(
                 f"LAND_FROM_EXILE pos={pos} but exile has {len(exile)} cards"
@@ -661,7 +804,7 @@ def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
     if _slot_in(slot_idx, SLOT_CAST_FROM_HAND_BASE, SLOT_CAST_FROM_HAND_END):
         offset = slot_idx - SLOT_CAST_FROM_HAND_BASE
         pos, variant = divmod(offset, CAST_VARIANT_HAND_CAP)
-        hand = _hand(eng, viewer)
+        hand = _hand(eng, viewer, version=version)
         if pos >= len(hand):
             raise IllegalSlotError(
                 f"CAST_FROM_HAND pos={pos} but hand has {len(hand)} cards"
@@ -672,7 +815,7 @@ def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
     if _slot_in(slot_idx, SLOT_CAST_FROM_GY_BASE, SLOT_CAST_FROM_GY_END):
         offset = slot_idx - SLOT_CAST_FROM_GY_BASE
         pos, variant = divmod(offset, CAST_VARIANT_GY_EXILE_CAP)
-        gy = _graveyard(eng, viewer)
+        gy = _graveyard(eng, viewer, version=version)
         if pos >= len(gy):
             raise IllegalSlotError(
                 f"CAST_FROM_GRAVEYARD pos={pos} but gy has {len(gy)} cards"
@@ -688,7 +831,7 @@ def decode(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
     if _slot_in(slot_idx, SLOT_CAST_FROM_EXILE_BASE, SLOT_CAST_FROM_EXILE_END):
         offset = slot_idx - SLOT_CAST_FROM_EXILE_BASE
         pos, variant = divmod(offset, CAST_VARIANT_GY_EXILE_CAP)
-        exile = _exile(eng, viewer)
+        exile = _exile(eng, viewer, version=version)
         if pos >= len(exile):
             raise IllegalSlotError(
                 f"CAST_FROM_EXILE pos={pos} but exile has {len(exile)} cards"
@@ -874,9 +1017,20 @@ def _pending_blocker_head(
 # ---------------------------------------------------------------------
 
 
-def legal_action_mask(state: Any, viewer: PlayerID) -> np.ndarray:
+def legal_action_mask(
+    state: Any, viewer: PlayerID,
+    version: str = ACTION_ENCODING_VERSION_V1,
+) -> np.ndarray:
     """Return a bool array of length ``ACTION_VOCAB_SIZE`` where True
     marks slots that decode to a legal decision in the current state.
+
+    ``version`` selects the slot-mapping convention; defaults to
+    ``ACTION_ENCODING_VERSION_V1`` for backward compat. The mask is
+    bit-equivalent under v1 vs v2 only up to a permutation of the
+    positional slot families (hand / graveyard / exile) — the SET of
+    legal slots may differ between versions for the same state, but
+    each version's mask exactly matches that version's
+    ``encode``/``decode`` pair.
 
     Implementation: enumerate the adapter's ``legal_decisions`` (or
     when given an engine state, enumerate ``legal_actions`` directly)
@@ -885,11 +1039,12 @@ def legal_action_mask(state: Any, viewer: PlayerID) -> np.ndarray:
     those decisions are unreachable through the policy head, which is
     the only contract the mask supports.
     """
+    _check_version(version)
     mask = np.zeros(ACTION_VOCAB_SIZE, dtype=bool)
     legals = _enumerate_legal(state, viewer)
     for d in legals:
         try:
-            slot = encode(d, state, viewer)
+            slot = encode(d, state, viewer, version=version)
         except EncodingOverflowError:
             # The position exceeded a cap. Skip — this slot is
             # unreachable by the policy. Increase the cap and rerun

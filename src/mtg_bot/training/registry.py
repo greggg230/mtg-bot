@@ -75,6 +75,26 @@ class ModelMetadata:
     # ``with_policy=False`` (the value-only ``_ValueMLP`` has no
     # architecture choice).
     architecture: str = "shared"
+    # ``action_encoding_version`` carries which slot-mapping convention
+    # the network's policy head was trained against. Two values today:
+    # - ``"positional_v1"`` (default, back-compat with v13/v15/v16):
+    #   hand/graveyard/exile slot positions are taken from the engine's
+    #   raw zone list (positional by ``card.id`` order). Two states
+    #   differing only in card.id permutation produce different slot
+    #   mappings — the MCTS NN-eval cache defends this with a
+    #   slot_fingerprint cache-key extension (commit 2f50fca).
+    # - ``"canonical_v2"``: zones are sorted by
+    #   ``(printing.name, modifier_tuple..., card.id)`` before slot
+    #   assignment, so two canonically-equivalent states share their
+    #   slot mappings. Opt-in for v17+; the slot_fingerprint workaround
+    #   becomes a no-op for v2 weights (positions are already
+    #   canonical).
+    # Default ``"positional_v1"`` so old metadata.json files (no
+    # action_encoding_version key) load with bit-exact pre-canonical
+    # behavior; loaders thread this through to NNEvaluator's
+    # ``legal_action_mask`` calls so v13/v15/v16 keep their trained
+    # slot semantics.
+    action_encoding_version: str = "positional_v1"
     # Training inputs and hyperparameters.
     training: dict[str, Any] = field(default_factory=dict)
     # Per-epoch loss series + summary, from TrainingHistory.
@@ -97,9 +117,9 @@ class ModelMetadata:
     def from_dict(cls, d: dict[str, Any]) -> "ModelMetadata":
         known = {
             "version", "created_at", "feature_dim", "hidden_sizes",
-            "with_policy", "architecture", "training",
-            "training_history", "evaluation", "git_commit", "notes",
-            "extra",
+            "with_policy", "architecture", "action_encoding_version",
+            "training", "training_history", "evaluation", "git_commit",
+            "notes", "extra",
         }
         # Stuff future-written keys we don't recognize into ``extra``.
         extra = dict(d.get("extra", {}))
@@ -118,6 +138,14 @@ class ModelMetadata:
             # loads as the original single-trunk dual-head model — back-
             # compat for v1-v15.
             architecture=str(d.get("architecture", "shared")),
+            # Default "positional_v1" so old metadata.json (no
+            # action_encoding_version key) loads with bit-exact pre-
+            # canonical slot semantics — back-compat for v13/v15/v16
+            # weights that were trained against the positional-by-
+            # card.id mapping.
+            action_encoding_version=str(
+                d.get("action_encoding_version", "positional_v1"),
+            ),
             training=dict(d.get("training", {})),
             training_history=dict(d.get("training_history", {})),
             evaluation=dict(d.get("evaluation", {})),

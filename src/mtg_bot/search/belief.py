@@ -234,6 +234,17 @@ class BeliefWeightedDeterminizer:
                 f"{type(opponent_policy_evaluator).__name__}."
             )
         self.opponent_policy_evaluator = opponent_policy_evaluator
+        # Mirror MCTS / ISMCTS: pull the action-encoding version off the
+        # evaluator if it has one (NNEvaluator does), else default to v1.
+        # Threaded into the ``ae.legal_action_mask`` and ``ae.encode``
+        # calls in ``_score_work_items_batched`` below so opponent-
+        # policy slot lookups use the same convention the network was
+        # trained against.
+        self._action_encoding_version = getattr(
+            opponent_policy_evaluator,
+            "action_encoding_version",
+            "positional_v1",
+        )
         self.played_history: tuple[PriorityMoment, ...] = tuple(
             played_history or (),
         )
@@ -572,7 +583,10 @@ class BeliefWeightedDeterminizer:
                     self.last_evaluator_calls += 1
                     for k, (_, logits) in zip(chunk, results):
                         engine = miss_engine_states[k]
-                        mask = ae.legal_action_mask(engine, opp)
+                        mask = ae.legal_action_mask(
+                            engine, opp,
+                            version=self._action_encoding_version,
+                        )
                         self._cache[miss_keys[k]] = (mask, logits)
                     self._evict_if_oversize()
 
@@ -592,7 +606,10 @@ class BeliefWeightedDeterminizer:
             # LRU bump (cheap).
             self._cache.move_to_end(cache_key)
             try:
-                slot = ae.encode(decision, reconstructed, opponent)
+                slot = ae.encode(
+                    decision, reconstructed, opponent,
+                    version=self._action_encoding_version,
+                )
             except ae.EncodingOverflowError:
                 # Action slot unreachable in this candidate.
                 log_weights[p_idx] += self.log_prob_floor

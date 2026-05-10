@@ -37,9 +37,63 @@ def _synthetic_dataset(n: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
 # ---------- contract checks --------------------------------------------------
 
 
-def test_auto_device_returns_cuda_or_cpu():
+def test_auto_device_returns_cuda_mps_or_cpu():
     d = auto_device()
-    assert d in ("cuda", "cpu")
+    assert d in ("cuda", "mps", "cpu")
+
+
+# ---------- auto_device() preference order (monkeypatched) ------------------
+
+
+def test_auto_device_prefers_cuda_when_available(monkeypatch):
+    """CUDA wins when available, regardless of MPS state."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # Even if MPS also reports available, CUDA takes precedence.
+    if hasattr(torch.backends, "mps"):
+        monkeypatch.setattr(
+            torch.backends.mps, "is_available", lambda: True,
+        )
+    assert auto_device() == "cuda"
+
+
+def test_auto_device_falls_back_to_mps_when_no_cuda(monkeypatch):
+    """No CUDA but MPS available → "mps" (Apple Silicon path)."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # ``torch.backends.mps`` exists on torch 2.x; if the test box's
+    # build is unusually old, skip rather than fake the attribute.
+    if not hasattr(torch.backends, "mps"):
+        pytest.skip("torch.backends.mps not present on this build")
+    monkeypatch.setattr(
+        torch.backends.mps, "is_available", lambda: True,
+    )
+    assert auto_device() == "mps"
+
+
+def test_auto_device_falls_back_to_cpu_when_neither(monkeypatch):
+    """Neither CUDA nor MPS → "cpu" — universal fallback."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    if hasattr(torch.backends, "mps"):
+        monkeypatch.setattr(
+            torch.backends.mps, "is_available", lambda: False,
+        )
+    assert auto_device() == "cpu"
+
+
+def test_auto_device_safe_when_mps_attr_missing(monkeypatch):
+    """``hasattr`` guard means a torch build without
+    ``torch.backends.mps`` (older builds, exotic forks) doesn't
+    AttributeError — it just falls through to CPU."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # Synthesize an MPS-less torch.backends. Use a tiny stand-in so
+    # other attrs on torch.backends (cudnn, etc.) keep working for
+    # any code paths torch itself triggers during the call.
+    class _BackendsNoMps:
+        def __getattr__(self, name):
+            if name == "mps":
+                raise AttributeError(name)
+            return getattr(torch.backends, name)
+    monkeypatch.setattr(torch, "backends", _BackendsNoMps())
+    assert auto_device() == "cpu"
 
 
 def test_returns_training_history_with_per_epoch_losses(tmp_path: Path):

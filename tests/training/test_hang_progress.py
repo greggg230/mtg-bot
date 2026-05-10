@@ -114,13 +114,13 @@ def test_data_gen_timeout_dump_contains_progress(
     from tests._test_decks import simple_test_deck_pool
 
     # ``run_with_timeout(func, args, timeout)`` — drive the progress
-    # sentinel that's been threaded into ``args`` (it's the LAST entry)
-    # for a few iterations, then raise.
+    # sentinel that's been threaded into ``args`` for a few iterations,
+    # then raise. Progress is identified by isinstance check rather
+    # than positional index because the diagnostic-deep-capture feature
+    # added trailing ``tree_depth`` / ``tree_top_k`` ints after the
+    # progress slot — index lookup is brittle to that.
     def fake_run_with_timeout(func, args, timeout_sec):
-        # In data_gen the args tuple is (adapter, strategies, rng,
-        # decision_cap, sample_every, recorder, progress). Progress is
-        # the last item.
-        progress = args[-1]
+        progress = next(a for a in args if isinstance(a, HangProgress))
         _drive_progress(progress, 7)
         raise TimeoutError("simulated hang at decision 7")
 
@@ -160,9 +160,11 @@ def test_self_play_timeout_dump_contains_progress(
     from tests._test_decks import simple_test_deck_pool
 
     def fake_run_with_timeout(func, args, timeout_sec):
-        # In self_play the args tuple is (adapter, strategies, rng,
-        # decision_cap, recorder, progress). Progress is the last item.
-        progress = args[-1]
+        # Locate the progress sentinel by isinstance — the args tuple
+        # gained trailing tree_depth / tree_top_k ints with the
+        # diagnostic-deep-capture feature, so positional indexing is
+        # brittle.
+        progress = next(a for a in args if isinstance(a, HangProgress))
         _drive_progress(progress, 4)
         raise TimeoutError("simulated hang at decision 4")
 

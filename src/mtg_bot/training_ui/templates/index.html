@@ -141,6 +141,16 @@
   .pairing-status.running { color: #93c5fd; }
   .pairing-status.completed { color: #4ade80; }
   .pairing-status.failed { color: #fca5a5; }
+  /* Wilson 95% CI badge on the eval card. PASS (CI lower bound clears
+     the 0.52 acceptance threshold) renders green like the verdict
+     "stronger" badge; FAIL (CI upper bound below threshold) renders red
+     like "weaker"; UNDECIDED (threshold straddles the CI) renders amber
+     so a glance at the eval card surfaces gate-direction confidence
+     without doing the math by eye. */
+  .stat-value.ci-pass { color: #4ade80; }
+  .stat-value.ci-fail { color: #fca5a5; }
+  .stat-value.ci-undecided { color: #fcd34d; }
+  .stat-value.ci-pending { color: #94a3b8; }
 
   /* Per-machine sub-cards inside aggregated training-progress cards.
      One row per host with five stats: games, secs/game, crashes,
@@ -152,7 +162,7 @@
     text-transform: uppercase; letter-spacing: 0.08em;
     margin-bottom: 2px; }
   .machine-row { display: grid;
-    grid-template-columns: 1fr repeat(5, minmax(80px, auto));
+    grid-template-columns: 1fr repeat(5, minmax(80px, auto)) auto;
     align-items: center; gap: 12px;
     padding: 6px 10px; background: var(--bg);
     border: 1px solid var(--border); border-radius: 8px;
@@ -164,6 +174,28 @@
   .machine-stat-label { font-size: 0.6rem; color: var(--muted);
     text-transform: uppercase; letter-spacing: 0.06em; }
   .machine-stat-value { font-family: monospace; font-size: 0.82rem; }
+
+  /* Per-shard "scale workers" control: a small numeric input + Apply
+     button to the right of the per-machine stats. The Apply POSTs to
+     the master's /api/shards/<host>/workers endpoint. Phase 1: takes
+     effect on the NEXT iter; we surface a "pending" hint until the
+     next iter's progress JSON shows the new n_workers value. */
+  .machine-scale { display: flex; align-items: center; gap: 4px;
+    margin-left: 8px; }
+  .machine-scale-input { width: 52px; padding: 2px 4px; font-size: 0.78rem;
+    font-family: monospace; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    text-align: right; }
+  .machine-scale-btn { padding: 2px 8px; font-size: 0.7rem;
+    font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    background: transparent; color: #93c5fd; border: 1px solid #1e3a5f;
+    border-radius: 4px; cursor: pointer; font-family: inherit; }
+  .machine-scale-btn:hover { background: #1e3a5f; color: #bfdbfe; }
+  .machine-scale-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .machine-scale-hint { font-size: 0.68rem; color: var(--muted);
+    font-style: italic; min-width: 12ch; }
+  .machine-scale-hint.pending { color: var(--amber); }
+  .machine-scale-hint.error { color: #fca5a5; }
 
   /* Stop-run button + confirmation modal. The button sits on the
      right side of every running card's header; the modal is a single
@@ -309,6 +341,57 @@ function statusClass(s) {
   if (s === 'running' || s === 'completed' || s === 'failed'
       || s === 'stopped') return s;
   return 'unknown';
+}
+
+// Wilson 95% score interval on the wins_new proportion of decisive
+// games. Mirrors what scripts/eval_early_stop_watcher.py computes
+// server-side, so the UI badge tracks the watcher's PASS / FAIL /
+// undecided decision visually. The 0.52 acceptance threshold is what
+// iterate uses for promote/keep — it's hardcoded here because every
+// active iterate run uses it; if iterate ever emits a per-run
+// threshold, read it from the progress JSON instead.
+const EVAL_GATE_THRESHOLD = 0.52;
+// Minimum decisive games before showing a verdict — below this the
+// CI is too wide to be informative and the watcher wouldn't fire
+// either (see --min-decisive in eval_early_stop_watcher.py). Render
+// "n=X (gathering…)" so the user knows the eval is live.
+const EVAL_CI_MIN_DECISIVE = 30;
+function wilsonInterval(wins, decisive, z) {
+  if (!decisive || decisive <= 0) return null;
+  const p = wins / decisive;
+  const denom = 1 + (z * z) / decisive;
+  const center = (p + (z * z) / (2 * decisive)) / denom;
+  const half = z * Math.sqrt(
+    (p * (1 - p) + (z * z) / (4 * decisive)) / decisive,
+  ) / denom;
+  return {
+    point: p,
+    lo: Math.max(0, center - half),
+    hi: Math.min(1, center + half),
+  };
+}
+function evalConfidenceCell(winsNew, winsOld, threshold) {
+  const decisive = (winsNew || 0) + (winsOld || 0);
+  if (decisive < EVAL_CI_MIN_DECISIVE) {
+    return {
+      text: decisive > 0
+        ? 'n=' + decisive + ' (gathering…)'
+        : '—',
+      cls: 'ci-pending',
+    };
+  }
+  const ci = wilsonInterval(winsNew || 0, decisive, 1.96);
+  if (!ci) return { text: '—', cls: 'ci-pending' };
+  const range =
+    '[' + (ci.lo * 100).toFixed(1) + '%, '
+    + (ci.hi * 100).toFixed(1) + '%]';
+  if (ci.lo > threshold) {
+    return { text: range + ' → PASS', cls: 'ci-pass' };
+  }
+  if (ci.hi < threshold) {
+    return { text: range + ' → FAIL', cls: 'ci-fail' };
+  }
+  return { text: range + ' → undecided', cls: 'ci-undecided' };
 }
 
 // Stop-button + modal wiring. One overlay reused across clicks.
@@ -460,6 +543,7 @@ function ensureCard(run) {
       <div class="stats">
         <div class="stat"><div class="stat-label">Games</div><div class="stat-value" data-field="games">—</div></div>
         <div class="stat"><div class="stat-label">Win rate</div><div class="stat-value" data-field="winrate">—</div></div>
+        <div class="stat"><div class="stat-label">Wilson 95% CI · gate 52%</div><div class="stat-value" data-field="ci">—</div></div>
         <div class="stat"><div class="stat-label">New / opp / draws</div><div class="stat-value" data-field="record">—</div></div>
         <div class="stat"><div class="stat-label">Opponent</div><div class="stat-value" data-field="opp">—</div></div>
         <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" data-field="workers">—</div></div>
@@ -627,6 +711,12 @@ function fillRun(el, run) {
       ? (run.win_rate * 100).toFixed(1) + '%' : '—';
     el.querySelector('[data-field="games"]').textContent = done + ' / ' + total;
     el.querySelector('[data-field="winrate"]').textContent = winRatePct;
+    const ciCell = evalConfidenceCell(
+      run.wins_new, run.wins_old, EVAL_GATE_THRESHOLD,
+    );
+    const ciEl = el.querySelector('[data-field="ci"]');
+    ciEl.textContent = ciCell.text;
+    ciEl.className = 'stat-value ' + ciCell.cls;
     el.querySelector('[data-field="record"]').textContent =
       (run.wins_new || 0) + ' / ' + (run.wins_old || 0) + ' / ' + (run.draws || 0);
     el.querySelector('[data-field="opp"]').textContent =
@@ -722,6 +812,58 @@ function mainUiBase() {
   return window.location.protocol + '//' + window.location.hostname + ':5002';
 }
 
+function serveBase() {
+  // The mtg_bot serve subcommand listens on port 5099 (bundle/queue +
+  // run-DB + dynamic worker scaling endpoints). Reuse this page's
+  // protocol and host so the link works for both localhost AND
+  // tailscale access — same pattern as mainUiBase().
+  return window.location.protocol + '//' + window.location.hostname + ':5099';
+}
+
+// Module-level Map of host -> { value, status: 'pending' | 'error',
+// error?: string }. Populated when the user clicks Apply on a per-
+// machine scale row; cleared once the polled progress JSON shows the
+// new n_workers actually in use (i.e. the next iter has started). The
+// Phase-1 latency between Apply and effect is at least one full
+// iter-cycle (self-play + train + eval), so the pending hint can stay
+// up for a long time — that's intentional and the operator should see
+// it cleared exactly when the next iter's first per-shard JSON
+// reports the new value.
+const pendingScales = new Map();
+// Hosts whose Apply request is in flight RIGHT NOW. Used purely to
+// disable the Apply button so a double-click can't fire two POSTs.
+const inFlightScales = new Set();
+
+async function applyShardScale(host, n) {
+  if (inFlightScales.has(host)) return;
+  inFlightScales.add(host);
+  try {
+    const res = await fetch(
+      serveBase() + '/api/shards/' + encodeURIComponent(host) + '/workers',
+      { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ n_workers: n }) },
+    );
+    if (res.ok) {
+      pendingScales.set(host, { value: n, status: 'pending' });
+    } else {
+      let msg = 'HTTP ' + res.status;
+      try {
+        const body = await res.json();
+        if (body && body.error) msg = body.error;
+      } catch (_) { /* fall through */ }
+      pendingScales.set(host, { value: n, status: 'error', error: msg });
+    }
+  } catch (e) {
+    pendingScales.set(host, {
+      value: n, status: 'error', error: 'network error',
+    });
+  } finally {
+    inFlightScales.delete(host);
+    refresh();
+  }
+}
+
 function renderReplaysFooter(el, run) {
   const footer = el.querySelector('[data-field="replays"]');
   if (!footer) return;
@@ -814,6 +956,12 @@ function renderMachines(el, run) {
   // parent card showing per-host stats: games (n_games_done),
   // secs/game, crashes, timed out, workers. Single-machine runs
   // (no aggregator) won't have this key and the section stays hidden.
+  //
+  // Per-shard "scale workers" control is appended to each row: a
+  // numeric input + Apply button that POSTs to the master's
+  // /api/shards/<host>/workers endpoint. Phase 1 only: the change
+  // takes effect on the NEXT iter; we surface a "pending" hint
+  // until the next iter's progress JSON reports the new n_workers.
   const slot = el.querySelector('[data-field="machines"]');
   if (!slot) return;
   const machines = Array.isArray(run.machines) ? run.machines : [];
@@ -837,8 +985,32 @@ function renderMachines(el, run) {
       : (m.elapsed_seconds && m.n_games_done
         ? m.elapsed_seconds / m.n_games_done
         : null);
+    const host = String(m.label || '');
+    const currentWorkers = Number(m.n_workers || 0);
+    // Resolve any in-flight pending state for this host. If the
+    // pending value matches what's now live, the change has landed
+    // and we can clear the pending entry.
+    let pending = pendingScales.get(host);
+    if (pending && pending.status === 'pending'
+        && pending.value === currentWorkers) {
+      pendingScales.delete(host);
+      pending = null;
+    }
+    let hint = '';
+    if (pending) {
+      const cls = pending.status === 'error'
+        ? 'machine-scale-hint error' : 'machine-scale-hint pending';
+      const text = pending.status === 'error'
+        ? esc(pending.error || 'apply failed')
+        : 'pending → ' + String(pending.value)
+          + ' (next iter)';
+      hint = '<span class="' + cls + '">' + text + '</span>';
+    } else {
+      hint = '<span class="machine-scale-hint"></span>';
+    }
+    const inFlight = inFlightScales.has(host);
     html += '<div class="machine-row">'
-      + '<div class="machine-label">' + esc(m.label || '?') + '</div>'
+      + '<div class="machine-label">' + esc(host || '?') + '</div>'
       + '<div class="machine-stat">'
         + '<div class="machine-stat-label">games</div>'
         + '<div class="machine-stat-value">'
@@ -862,11 +1034,43 @@ function renderMachines(el, run) {
       + '<div class="machine-stat">'
         + '<div class="machine-stat-label">workers</div>'
         + '<div class="machine-stat-value">'
-        + String(m.n_workers || 0) + '</div>'
+        + String(currentWorkers) + '</div>'
+      + '</div>'
+      + '<div class="machine-scale" data-machine-host="' + esc(host) + '">'
+        + '<input type="number" class="machine-scale-input"'
+          + ' min="1" max="64" step="1"'
+          + ' data-field="scale-input" value="'
+          + String(pending ? pending.value : currentWorkers) + '" />'
+        + '<button type="button" class="machine-scale-btn"'
+          + ' data-field="scale-apply"' + (inFlight ? ' disabled' : '')
+          + '>Apply</button>'
+        + hint
       + '</div>'
       + '</div>';
   }
   slot.innerHTML = html;
+  // Wire the Apply buttons. Re-binding on every renderMachines call
+  // is fine — the buttons are freshly created each time.
+  slot.querySelectorAll('[data-field="scale-apply"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const wrap = btn.closest('.machine-scale');
+      if (!wrap) return;
+      const host = wrap.dataset.machineHost || '';
+      const input = wrap.querySelector('[data-field="scale-input"]');
+      if (!input) return;
+      const n = Number(input.value);
+      if (!Number.isInteger(n) || n < 1 || n > 64) {
+        pendingScales.set(host, {
+          value: n, status: 'error',
+          error: 'value must be 1-64',
+        });
+        refresh();
+        return;
+      }
+      btn.disabled = true;
+      applyShardScale(host, n);
+    });
+  });
 }
 
 function fmtPct(v) {

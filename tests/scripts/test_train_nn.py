@@ -1,5 +1,7 @@
-"""Tests for ``scripts/train_nn.py`` — specifically the
-``--one-legal-keep-frac`` flag plumbing and the
+"""Tests for ``mtg_bot.cli.train`` (the runner formerly known as
+``scripts/train_nn.py``; the script is now a thin shim).
+
+Pins the ``--one-legal-keep-frac`` flag plumbing and the
 ``_downsample_one_legal_rows`` helper.
 
 The downsample helper is the policy-head-investigation fix #2:
@@ -10,13 +12,14 @@ rebalances the gradient toward branchy multi-legal rows where
 the MCTS visit-count distribution actually carries signal.
 
 The CLI-level argparse validation is exercised via subprocess
-since ``main()`` does the argparse parsing at the script level.
-The helper is tested directly with synthetic arrays.
+through the legacy shim path (``scripts/train_nn.py``), which
+``iterate_alphazero`` still spawns. The helper is tested directly
+with synthetic arrays via the cli module.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -30,18 +33,14 @@ _SCRIPT_PATH = _REPO_ROOT / "scripts" / "train_nn.py"
 
 
 def _load_train_nn():
-    """Load ``scripts/train_nn.py`` as a module so we can call its
-    helper directly without invoking ``main()``."""
-    # Make sure mtg_bot is importable for train_nn's top-level imports.
+    """Fresh-import ``mtg_bot.cli.train`` — the live module the shim
+    routes into. ``_downsample_one_legal_rows`` and friends live here."""
     src_dir = _REPO_ROOT / "src"
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
-    spec = importlib.util.spec_from_file_location(
-        "train_nn", _SCRIPT_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    if "mtg_bot.cli.train" in sys.modules:
+        del sys.modules["mtg_bot.cli.train"]
+    return importlib.import_module("mtg_bot.cli.train")
 
 
 def _build_synthetic(

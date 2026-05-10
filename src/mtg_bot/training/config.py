@@ -184,6 +184,13 @@ class NNPimcConfig:
     # ``--policy-hidden-sizes``. ``None`` mirrors ``hidden_sizes``,
     # which is what the symmetric default uses.
     policy_hidden_sizes: Optional[tuple[int, ...]] = None
+    # ``action_encoding_version`` carries the slot-mapping convention
+    # the saved weights were trained against. ``None`` mirrors
+    # NNEvaluator's "positional_v1" default — back-compat with v13/v15/
+    # v16 which trained against the positional-by-card.id mapping.
+    # Iterate / evaluate scripts read this from the version's
+    # metadata.json and thread it through.
+    action_encoding_version: Optional[str] = None
     # When True, ``build`` returns ISMCTS instead of PIMC. The class
     # name is historical — kept for serialization compatibility with
     # in-flight specs and saved JSON. Matched-budget conversion:
@@ -243,6 +250,10 @@ class NNPimcConfig:
             eval_kwargs["policy_hidden_sizes"] = self.policy_hidden_sizes
         if self.device is not None:
             eval_kwargs["device"] = self.device
+        if self.action_encoding_version is not None:
+            eval_kwargs["action_encoding_version"] = (
+                self.action_encoding_version
+            )
         evaluator = NNEvaluator(**eval_kwargs)
         if self.use_ismcts:
             total_iters = max(1, self.samples * self.inner_nodes)
@@ -312,6 +323,7 @@ class NNPimcConfig:
                 self.belief_min_opponent_moments
             ),
             "device": self.device,
+            "action_encoding_version": self.action_encoding_version,
         }
 
     @classmethod
@@ -340,6 +352,7 @@ class NNPimcConfig:
                 "belief_min_opponent_moments", 3,
             ),
             device=d.get("device"),
+            action_encoding_version=d.get("action_encoding_version"),
         )
 
 

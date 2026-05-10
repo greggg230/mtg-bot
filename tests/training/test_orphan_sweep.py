@@ -959,6 +959,51 @@ def test_list_processes_windows_returns_empty_on_bad_json(
     assert _os_mod._list_processes_windows() == []
 
 
+def test_list_processes_windows_tolerates_control_chars_in_commandline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: real-world ``Get-CimInstance Win32_Process`` output on
+    Win11 has been observed with a literal control char (e.g. ``\\x01``)
+    embedded in some process's ``CommandLine`` field. Strict-mode
+    ``json.loads`` rejects the whole ~160 KB document at column ~135728
+    with ``Invalid control character at: line 1 column N``, the previous
+    behavior silently swallowed the JSONDecodeError and returned [],
+    masking a working-but-broken process listing on this machine.
+    ``strict=False`` (RFC 8259 leniency) accepts control chars inside
+    strings — listing succeeds, sweep proceeds.
+    """
+    from mtg_bot.training import orphan_sweep as _os_mod
+    # Synthetic JSON: build the array by hand so we can splice a
+    # control char straight into a CommandLine string. ``json.dumps``
+    # would escape it (), defeating the test.
+    raw_json = (
+        '['
+        '{"ProcessId":1234,"ParentProcessId":1,"Name":"python.exe",'
+        '"ExecutablePath":"C:\\\\venv\\\\python.exe",'
+        '"CommandLine":"python.exe --evil-arg=\x01-with-ctrlchar"},'
+        '{"ProcessId":42,"ParentProcessId":1,"Name":"python.exe",'
+        '"ExecutablePath":"","CommandLine":""}'
+        ']'
+    )
+    fake_cp = subprocess.CompletedProcess(
+        args=["powershell"], returncode=0,
+        stdout=raw_json, stderr="",
+    )
+    monkeypatch.setattr(
+        "mtg_bot.training.orphan_sweep.subprocess.run",
+        lambda *a, **k: fake_cp,
+    )
+    out = _os_mod._list_processes_windows()
+    pids = {r.pid for r in out}
+    # Both rows must be parsed — a strict-mode parser would reject the
+    # entire document on the first ``\x01`` and return [].
+    assert pids == {1234, 42}
+    # The control char survives into ``args`` (it's in the source data;
+    # we just don't want it to break parsing).
+    by_pid = {r.pid: r for r in out}
+    assert "\x01" in by_pid[1234].args
+
+
 def test_list_processes_windows_skips_malformed_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

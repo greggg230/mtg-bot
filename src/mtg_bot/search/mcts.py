@@ -31,17 +31,32 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
 import numpy as np
 
 from mtg_bot.search.budget import Budget
+from mtg_bot.search.canonical_state import canonical_state_key
 from mtg_bot.search.evaluator import Evaluator
 from mtg_bot.search.expansion import ExpansionPolicy, FullEnumeration
 from mtg_bot.search.protocol import (
     CHANCE_PLAYER, Decision, GameState, PlayerID,
 )
 from mtg_bot.search.strategy import SearchStrategy
+
+
+@dataclass(slots=True)
+class _CachedEval:
+    """A cached leaf-evaluation result.
+
+    Holds the value (always populated) and the policy logits
+    (populated in PUCT mode; ``None`` under UCB1). Lifetime is one
+    ``choose_with_visits`` call — see ``MCTS._eval_cache``.
+    """
+
+    value: float
+    policy_logits: Optional[np.ndarray] = None
 
 
 class _Node:
@@ -69,7 +84,7 @@ class _Node:
     __slots__ = (
         "state", "parent", "decision", "children",
         "pending_decisions", "visits", "total_value", "virtual_loss",
-        "prior", "_policy_cache", "leaf_nn_value",
+        "prior", "_policy_cache", "leaf_nn_value", "_canonical_key",
     )
 
     def __init__(
@@ -134,6 +149,24 @@ class _Node:
         # only). Either way the per-node "first leaf value" is the
         # same scalar.
         self.leaf_nn_value: Optional[float] = None
+        # Memoized canonical-state-key for the per-search NN-eval
+        # cache. ``None`` until first computed by
+        # ``MCTS._cache_key_for_node`` (or set to a sentinel by paths
+        # that know the state isn't an MTG adapter). The bench's
+        # ``serial`` MCTS path computes the key exactly once per leaf,
+        # so memoizing on the node is mostly a defensive win for the
+        # batched paths in ``_search_batched`` (which used to
+        # recompute the key once for the cache lookup at queueing time
+        # and again at store time after the batched NN call returned)
+        # and for any future code path that re-visits the same node.
+        # Memory cost: one extra slot per node (~8 bytes) holding a
+        # 32-byte digest when populated, dropped with the search tree
+        # at the end of ``choose_with_visits``.
+        # Type is the same as ``MCTS._cache_key``'s return value:
+        # ``Optional[tuple[bytes, tuple]]`` post-drift-fix
+        # (canonical-state hash + viewer slot fingerprint). Was
+        # ``Optional[bytes]`` pre-drift-fix.
+        self._canonical_key: Optional[Any] = None
 
     def is_leaf(self) -> bool:
         return self.state.is_terminal()
@@ -249,6 +282,31 @@ class MCTS(SearchStrategy):
             raise ValueError(
                 f"batch_size must be >= 1, got {batch_size!r}"
             )
+        # Per-search NN-eval cache. Allocated fresh at the top of every
+        # ``choose_with_visits`` / ``choose_with_full_stats`` call,
+        # consulted before each leaf-eval, populated on miss, dropped
+        # at end-of-search. Not shared across searches: this is a
+        # transposition cache *within* one MCTS tree, not DAG-MCTS
+        # (which would also share visit counts). Keys are 32-byte
+        # ``canonical_state_key`` digests; cache is bypassed when the
+        # leaf state isn't an MTG adapter (no ``engine_state`` attr —
+        # toy/test games like tic-tac-toe). See
+        # ``mtg_bot.search.canonical_state`` for the equivalence
+        # rules. Scout-pass measured ~40% transposition hit rate at
+        # PUCT samples=1, inner_nodes=1000 across representative game
+        # states; the cache captures that as a wall-clock speedup
+        # because the NN forward pass dominates leaf-evaluation cost
+        # at PUCT batch_size=1 (the production AlphaZero-training
+        # configuration).
+        self._eval_cache: dict[Any, _CachedEval] = {}
+        # Viewer (root player) for the in-flight search. Set at the
+        # top of ``choose_with_*`` and consumed by ``_cache_key`` to
+        # build the slot-mapping fingerprint that pins the cache to
+        # entries whose action-encoding slots match — see ``_cache_key``
+        # docstring for the rationale. ``None`` outside an active
+        # search call; ``_cache_key`` defensively returns ``None`` in
+        # that case rather than risk a wrong-slot cache hit.
+        self._cache_root_player: Optional[PlayerID] = None
         if puct:
             # Construction-time validation: PUCT needs a policy head.
             # ``NNEvaluator(with_policy=True)`` is the canonical
@@ -288,6 +346,14 @@ class MCTS(SearchStrategy):
         )
         self.batch_size = batch_size
         self.puct = puct
+        # Pull the action-encoding version off the evaluator if it
+        # advertises one (NNEvaluator does), else default to v1.
+        # Threaded into the single ``ae.encode`` call in
+        # ``_stamp_child_prior`` below so PUCT prior lookups use the
+        # same slot mapping the policy head was trained against.
+        self._action_encoding_version = getattr(
+            evaluator, "action_encoding_version", "positional_v1",
+        )
 
     def choose(
         self, state: GameState, player_id: PlayerID
@@ -346,6 +412,108 @@ class MCTS(SearchStrategy):
                 ],
             )
 
+        # Per-search NN-eval cache lifetime: allocated fresh here, dropped
+        # in the ``finally`` clause below. Two consecutive ``choose_with_*``
+        # calls must NOT share cache entries — a fresh tree is built each
+        # call and cross-call sharing would risk stale entries when the
+        # caller mutates ``state`` between calls.
+        self._eval_cache = {}
+        # Pin the viewer for the slot-mapping fingerprint used by
+        # ``_cache_key``. Cleared in the ``finally``.
+        self._cache_root_player = player_id
+        try:
+            root = _Node(
+                state=state.clone(),
+                pending_decisions=self.expansion_policy.make_decision_iterator(
+                    state
+                ),
+            )
+
+            budget = self.budget_factory()
+            budget.start()
+            if self.batch_size == 1:
+                self._search_serial(root, player_id, budget)
+            else:
+                self._search_batched(
+                    root, player_id, budget, self.batch_size,
+                )
+
+            candidates = [
+                {
+                    "decision": child.decision,
+                    "visits": child.visits,
+                    "q": child.mean_value() if child.visits > 0 else None,
+                    "prior": child.prior if self.puct else None,
+                    "leaf_value": child.leaf_nn_value,
+                }
+                for child in root.children
+            ]
+            if not candidates:
+                return (None, [])
+            chosen = max(
+                root.children, key=lambda c: c.visits,
+            ).decision
+            return (chosen, candidates)
+        finally:
+            self._eval_cache = {}
+            self._cache_root_player = None
+
+    def choose_with_subtree(
+        self,
+        state: GameState,
+        player_id: PlayerID,
+        tree_depth: int = 1,
+        tree_top_k: Optional[int] = None,
+    ) -> tuple[Optional[Decision], list[dict[str, Any]]]:
+        """Run a search and return per-root-child stats *plus* the
+        nested top-K sub-tree under each candidate, up to
+        ``tree_depth`` levels deep.
+
+        Returns ``(chosen_decision_or_None, candidates)``. Each
+        candidate dict carries the same fields as
+        ``choose_with_full_stats`` plus an extra ``"subtree"`` key:
+        a list of grandchild dicts (same shape, recursive). The list
+        is empty when ``tree_depth <= 1`` or when the corresponding
+        ``_Node`` has no expanded children. At depth ≥ 1 we sort by
+        visits desc and slice to ``tree_top_k`` (None = keep all).
+        At depth 0 (the root) we keep ALL candidates — that matches
+        today's ``choose_with_full_stats`` shape and the data-gen
+        loop's "encode every visited slot" expectation.
+        ``tree_depth=1`` reproduces ``choose_with_full_stats``
+        exactly with ``subtree=[]`` on every candidate.
+
+        ``"subtree"`` is the in-memory key used by callers walking
+        the search tree directly. ``build_search_annotation``
+        translates this to the on-disk ``children`` field (with
+        ``None`` meaning "no deep capture"). Keeping a different
+        in-memory name avoids accidentally setting ``children=[]``
+        on root-only captures, which would change the on-disk
+        shape and break the v3-back-compat invariant.
+
+        Forced moves: same single-element shape as
+        ``choose_with_full_stats``, with ``subtree=[]``.
+        """
+        if tree_depth < 1:
+            raise ValueError(
+                f"tree_depth must be >= 1, got {tree_depth!r}"
+            )
+        legal = list(state.legal_decisions())
+        if len(legal) == 1:
+            decision = legal[0]
+            return (
+                decision,
+                [
+                    {
+                        "decision": decision,
+                        "visits": 1,
+                        "q": None,
+                        "prior": None,
+                        "leaf_value": None,
+                        "subtree": [],
+                    }
+                ],
+            )
+
         root = _Node(
             state=state.clone(),
             pending_decisions=self.expansion_policy.make_decision_iterator(
@@ -362,22 +530,60 @@ class MCTS(SearchStrategy):
                 root, player_id, budget, self.batch_size,
             )
 
-        candidates = [
-            {
-                "decision": child.decision,
-                "visits": child.visits,
-                "q": child.mean_value() if child.visits > 0 else None,
-                "prior": child.prior if self.puct else None,
-                "leaf_value": child.leaf_nn_value,
-            }
-            for child in root.children
-        ]
+        candidates = self._walk_subtree(
+            root,
+            depth_remaining=tree_depth,
+            top_k=tree_top_k,
+            is_root=True,
+        )
         if not candidates:
             return (None, [])
         chosen = max(
             root.children, key=lambda c: c.visits,
         ).decision
         return (chosen, candidates)
+
+    def _walk_subtree(
+        self,
+        node: "_Node",
+        depth_remaining: int,
+        top_k: Optional[int],
+        is_root: bool,
+    ) -> list[dict[str, Any]]:
+        """Recursively translate a ``_Node``'s expanded children into
+        the candidate-dict shape used by the search-annotation hook.
+
+        ``depth_remaining`` is the number of additional levels to
+        emit beneath ``node``. At ``depth_remaining == 0`` we return
+        an empty list (terminate). At each level we sort children
+        by visits desc; at non-root levels we slice to ``top_k``
+        (keep all when ``top_k is None``). At the root, we keep
+        every child regardless of ``top_k`` so the data-gen policy
+        encoder still sees the full visit distribution.
+        """
+        if depth_remaining <= 0:
+            return []
+        children = list(node.children)
+        children.sort(key=lambda c: c.visits, reverse=True)
+        if not is_root and top_k is not None:
+            children = children[:top_k]
+        out: list[dict[str, Any]] = []
+        for child in children:
+            sub = self._walk_subtree(
+                child,
+                depth_remaining=depth_remaining - 1,
+                top_k=top_k,
+                is_root=False,
+            )
+            out.append({
+                "decision": child.decision,
+                "visits": child.visits,
+                "q": child.mean_value() if child.visits > 0 else None,
+                "prior": child.prior if self.puct else None,
+                "leaf_value": child.leaf_nn_value,
+                "subtree": sub,
+            })
+        return out
 
     def choose_with_visits(
         self, state: GameState, player_id: PlayerID
@@ -405,23 +611,33 @@ class MCTS(SearchStrategy):
         if len(legal) == 1:
             return {legal[0]: 1}
 
-        root = _Node(
-            state=state.clone(),
-            pending_decisions=self.expansion_policy.make_decision_iterator(
-                state
-            ),
-        )
-
-        budget = self.budget_factory()
-        budget.start()
-        if self.batch_size == 1:
-            self._search_serial(root, player_id, budget)
-        else:
-            self._search_batched(
-                root, player_id, budget, self.batch_size,
+        # Per-search NN-eval cache lifetime: allocated fresh here, dropped
+        # in the ``finally`` clause below. See ``__init__`` for design.
+        self._eval_cache = {}
+        # Pin the viewer for the slot-mapping fingerprint used by
+        # ``_cache_key``. Cleared in the ``finally``.
+        self._cache_root_player = player_id
+        try:
+            root = _Node(
+                state=state.clone(),
+                pending_decisions=self.expansion_policy.make_decision_iterator(
+                    state
+                ),
             )
 
-        return {c.decision: c.visits for c in root.children}
+            budget = self.budget_factory()
+            budget.start()
+            if self.batch_size == 1:
+                self._search_serial(root, player_id, budget)
+            else:
+                self._search_batched(
+                    root, player_id, budget, self.batch_size,
+                )
+
+            return {c.decision: c.visits for c in root.children}
+        finally:
+            self._eval_cache = {}
+            self._cache_root_player = None
 
     def _search_serial(
         self, root: _Node, player_id: PlayerID, budget,
@@ -480,10 +696,15 @@ class MCTS(SearchStrategy):
             pending: list[_Node] = []
             pending_set: set[int] = set()
             terminal_results: list[tuple[_Node, float]] = []
+            # Cached leaves collected during this batch — resolved
+            # instantly from ``self._eval_cache`` without the NN call.
+            # Treated like terminals: backpropped before the batch
+            # call, no virtual loss applied.
+            cached_results: list[tuple[_Node, float]] = []
             # Collect a batch worth of leaves. Each non-terminal
-            # leaf gets virtual loss applied so the next selection
-            # in this batch sees a degraded UCB1 score on the path
-            # we're already evaluating.
+            # non-cached leaf gets virtual loss applied so the next
+            # selection in this batch sees a degraded UCB1 score on the
+            # path we're already evaluating.
             for _ in range(batch_size):
                 if budget.exhausted():
                     break
@@ -509,17 +730,50 @@ class MCTS(SearchStrategy):
                     # nothing's pending on this leaf.
                     value = self._evaluate_leaf(leaf, player_id)
                     terminal_results.append((leaf, value))
-                else:
-                    self._apply_virtual_loss(leaf)
-                    pending.append(leaf)
-                    pending_set.add(id(leaf))
+                    continue
+                # Per-search NN-eval cache check. On hit, skip both
+                # the batch and the virtual-loss machinery — the cached
+                # value is the same one a fresh forward pass would
+                # produce, so we can backprop it immediately and free
+                # up the batch slot for a leaf that actually needs the
+                # network. Mirrors the cacheless ``_evaluate_leaf``
+                # bookkeeping (leaf_nn_value, _policy_cache). The
+                # node-memoizing helper saves the (otherwise duplicate)
+                # hash recomputation that would happen at store time
+                # below if this leaf turns out to be a cache miss.
+                cache_key = self._cache_key_for_node(leaf)
+                cached = (
+                    self._eval_cache.get(cache_key)
+                    if cache_key is not None else None
+                )
+                if cached is not None:
+                    if (
+                        self.puct
+                        and leaf._policy_cache is None
+                        and cached.policy_logits is not None
+                    ):
+                        leaf._policy_cache = cached.policy_logits
+                    if leaf.leaf_nn_value is None:
+                        leaf.leaf_nn_value = float(cached.value)
+                    cached_results.append((leaf, cached.value))
+                    continue
+                self._apply_virtual_loss(leaf)
+                pending.append(leaf)
+                pending_set.add(id(leaf))
 
-            # Backprop terminal leaves first — they have real
-            # values immediately. Order doesn't affect correctness.
+            # Backprop terminal + cache-hit leaves first — they have
+            # real values immediately and don't depend on the in-flight
+            # NN batch. Order between the two doesn't affect
+            # correctness.
             for leaf, value in terminal_results:
                 self._backprop(leaf, value, player_id)
+            for leaf, value in cached_results:
+                self._backprop(leaf, value, player_id)
 
-            # Batch-evaluate the non-terminal leaves and backprop.
+            # Batch-evaluate the non-terminal non-cached leaves and
+            # backprop. Cache-misses go into the network call;
+            # results get stored before backprop so subsequent leaves
+            # at the same canonical state in later batches will hit.
             if pending:
                 states = [leaf.state for leaf in pending]
                 if self.puct:
@@ -537,6 +791,17 @@ class MCTS(SearchStrategy):
                             leaf._policy_cache = policy
                         if leaf.leaf_nn_value is None:
                             leaf.leaf_nn_value = float(value)
+                        # Store in the per-search cache so a later
+                        # transposition through the same canonical
+                        # state can short-circuit. The hash was
+                        # already computed at the cache-lookup site
+                        # above and memoized on the node, so this
+                        # call hits the slot instead of re-hashing.
+                        cache_key = self._cache_key_for_node(leaf)
+                        if cache_key is not None:
+                            self._eval_cache[cache_key] = _CachedEval(
+                                value=float(value), policy_logits=policy,
+                            )
                         self._revert_virtual_loss(leaf)
                         self._backprop(leaf, value, player_id)
                 else:
@@ -546,6 +811,11 @@ class MCTS(SearchStrategy):
                     for leaf, value in zip(pending, values):
                         if leaf.leaf_nn_value is None:
                             leaf.leaf_nn_value = float(value)
+                        cache_key = self._cache_key_for_node(leaf)
+                        if cache_key is not None:
+                            self._eval_cache[cache_key] = _CachedEval(
+                                value=float(value), policy_logits=None,
+                            )
                         self._revert_virtual_loss(leaf)
                         self._backprop(leaf, value, player_id)
 
@@ -695,20 +965,43 @@ class MCTS(SearchStrategy):
         """Set ``child.prior`` from ``parent._policy_cache[encode(d)]``,
         populating the cache on first call.
 
+        Per-search NN-eval cache integration: before triggering a
+        synchronous single-state forward pass to populate
+        ``parent._policy_cache``, we check ``self._eval_cache`` keyed
+        on the parent state's canonical key. On cache hit we reuse
+        the stored policy without a network call. On miss we run the
+        forward pass and store the result so subsequent leaves at
+        the same canonical state share it.
+
         Lazy-imported codec because ``mtg_bot.training`` pulls in
         ``mtg_bot.search`` at package init — importing at module load
         would create a cycle. By the time any search runs the cycle
         has resolved.
         """
         if parent._policy_cache is None:
-            _, policy = self.evaluator.evaluate_with_policy(
-                parent.state, root_player,
+            cache_key = self._cache_key_for_node(parent)
+            cached = (
+                self._eval_cache.get(cache_key)
+                if cache_key is not None else None
             )
-            parent._policy_cache = policy
+            if cached is not None and cached.policy_logits is not None:
+                parent._policy_cache = cached.policy_logits
+            else:
+                value, policy = self.evaluator.evaluate_with_policy(
+                    parent.state, root_player,
+                )
+                parent._policy_cache = policy
+                if cache_key is not None:
+                    self._eval_cache[cache_key] = _CachedEval(
+                        value=float(value), policy_logits=policy,
+                    )
         from mtg_bot.training import action_encoding as ae
         eng = getattr(parent.state, "engine_state", parent.state)
         try:
-            slot = ae.encode(decision, eng, root_player)
+            slot = ae.encode(
+                decision, eng, root_player,
+                version=self._action_encoding_version,
+            )
         except ae.EncodingOverflowError:
             # Decision didn't fit in the fixed vocab. Leave prior 0;
             # PUCT will explore by visit-count alone for this child.
@@ -734,6 +1027,104 @@ class MCTS(SearchStrategy):
         # they're sampled by weight.
         return self._make_child(node, decision, root_player)
 
+    def _cache_key(self, state: GameState) -> Optional[Any]:
+        """Return a content-addressed hash of ``state`` suitable for
+        the per-search NN-eval cache, or ``None`` when the state isn't
+        an MTG adapter (toy/test games).
+
+        Detection: an MTG adapter exposes ``engine_state``; toys
+        don't. The latter fall through to the cacheless fast path —
+        their evaluators (rollout, heuristic) are cheap enough that
+        caching is pointless and the canonical-state hash is
+        MTG-specific anyway.
+
+        The key combines two pieces:
+
+        1. ``canonical_state_key(state)`` — the forward-play-equivalent
+           hash that drops raw ``GameObject.id`` ordering inside the
+           hand / graveyard / exile so two states with permuted card
+           ids hash identically.
+        2. A **slot-mapping fingerprint** of the viewer's hand /
+           graveyard / exile / library-top raw ``card.id`` ordering.
+
+        Why both: the cached ``policy_logits`` from
+        ``evaluate_with_policy`` are positional — slot
+        ``LAND_FROM_HAND_BASE + i`` is the prior for "play the card
+        at hand position ``i``". Two canonically-equivalent states
+        with permuted card.ids in hand have IDENTICAL value AND
+        IDENTICAL post-softmax-by-canonical-position policy, but
+        different ``card.id`` -> position -> slot mappings. Reusing
+        the cached logits at slot indices computed from the new
+        state's positional encoding reads the WRONG prior for each
+        decision (smoking-gun observed 2026-05-06: cache-on flipped
+        the chosen action at T3-main when hand had two Mountains).
+
+        Including the slot fingerprint scopes hits to states where
+        the slot mapping is identical — same value AND same policy
+        slots, so the cached pair is safe to reuse byte-for-byte.
+        Slot-mismatched transpositions miss the cache and recompute
+        (preserving correctness; the perf cost is the lost transposition
+        hits when card.ids permute, but those hits would have been
+        wrong-slot reads anyway).
+
+        ``self._cache_root_player`` is the viewer (set at the top of
+        ``choose_with_visits`` / ``choose_with_full_stats``) — slot
+        encoding is positional in the viewer's zones, and the viewer
+        is fixed for the entire search.
+
+        Note: most internal call sites prefer
+        :meth:`_cache_key_for_node`, which memoizes the
+        ``canonical_state_key`` portion of the digest on the
+        :class:`_Node` so repeated calls during the same search (e.g.
+        ``_search_batched``'s cache-lookup-then-store pattern) only
+        pay the hash cost once per node. This raw method stays as
+        the public hook for tests that monkey-patch it (e.g. the
+        bench script's ``cache_disabled=True`` mode) and for the
+        rare paths that hash a state without a node attached.
+        """
+        if not hasattr(state, "engine_state"):
+            return None
+        eng = state.engine_state
+        viewer = self._cache_root_player
+        # Defensive: if the cache is consulted before
+        # ``choose_with_*`` set the viewer (shouldn't happen via the
+        # production paths), bypass the cache rather than risk a
+        # wrong-slot hit.
+        if viewer is None:
+            return None
+        p = eng.player_by_id(viewer)
+        slot_fp = (
+            tuple(c.id for c in p.hand),
+            tuple(c.id for c in p.graveyard),
+            tuple(c.id for c in p.exile),
+            p.library[0].id if p.library else -1,
+        )
+        return (canonical_state_key(state), slot_fp)
+
+    def _cache_key_for_node(self, node: _Node) -> Optional[bytes]:
+        """Like :meth:`_cache_key` but memoized on ``node``.
+
+        Computes ``canonical_state_key(node.state)`` on first call and
+        stashes the result in ``_Node._canonical_key`` so subsequent
+        calls return in O(1). For non-MTG states (toys) the slot stays
+        ``None`` and every call falls through to a cheap ``hasattr``
+        check; cycling through the slow path on toys isn't worth a
+        second sentinel because the cache is a no-op for them anyway.
+        """
+        cached = node._canonical_key
+        if cached is not None:
+            return cached
+        # Honor monkey-patched ``_cache_key`` (e.g. the bench's
+        # cache-disabled mode swaps in a ``lambda state: None``).
+        # Tests that override ``_cache_key`` to return ``None``
+        # expect every call to be cacheless; respect that by going
+        # through the override rather than the canonical-state hash
+        # directly.
+        key = self._cache_key(node.state)
+        if key is not None:
+            node._canonical_key = key
+        return key
+
     def _evaluate_leaf(
         self, leaf: _Node, root_player: PlayerID
     ) -> float:
@@ -750,8 +1141,47 @@ class MCTS(SearchStrategy):
         there (no legal action; ``evaluate_with_policy`` returns the
         all-zeros vector for terminals, which we don't bother
         caching — a terminal never gets expanded).
+
+        Per-search NN-eval cache (``self._eval_cache``): on MTG
+        adapter states we hash the state via ``canonical_state_key``
+        before calling the evaluator. Cache hit returns the stored
+        ``(value, policy)`` pair without touching the network; cache
+        miss runs the evaluator and stores the result before
+        returning. Terminal leaves bypass the cache: their evaluator
+        path short-circuits to ±1/0 with no NN call, so caching them
+        wouldn't save anything (and the canonical hash is correct
+        but pointless). Toy/test states (no ``engine_state`` attr)
+        also bypass the cache transparently — the framework
+        operates as before for non-MTG inputs.
         """
-        if self.puct and not leaf.is_leaf():
+        # Terminal leaves: always go through the value-only path; no
+        # cache lookup (no NN call to skip).
+        if leaf.is_leaf():
+            value = self.evaluator.evaluate(leaf.state, root_player)
+            if leaf.leaf_nn_value is None:
+                leaf.leaf_nn_value = float(value)
+            return value
+
+        cache_key = self._cache_key_for_node(leaf)
+        if cache_key is not None:
+            cached = self._eval_cache.get(cache_key)
+            if cached is not None:
+                # Cache HIT — skip the NN. Mirror the bookkeeping the
+                # cacheless paths do: stash the policy on the leaf
+                # for future child-expansions, set ``leaf_nn_value``
+                # for the annotation hook.
+                if (
+                    self.puct
+                    and leaf._policy_cache is None
+                    and cached.policy_logits is not None
+                ):
+                    leaf._policy_cache = cached.policy_logits
+                if leaf.leaf_nn_value is None:
+                    leaf.leaf_nn_value = float(cached.value)
+                return cached.value
+
+        # Cache MISS — run the evaluator and store.
+        if self.puct:
             value, policy = self.evaluator.evaluate_with_policy(
                 leaf.state, root_player,
             )
@@ -759,10 +1189,18 @@ class MCTS(SearchStrategy):
                 leaf._policy_cache = policy
             if leaf.leaf_nn_value is None:
                 leaf.leaf_nn_value = float(value)
+            if cache_key is not None:
+                self._eval_cache[cache_key] = _CachedEval(
+                    value=float(value), policy_logits=policy,
+                )
             return value
         value = self.evaluator.evaluate(leaf.state, root_player)
         if leaf.leaf_nn_value is None:
             leaf.leaf_nn_value = float(value)
+        if cache_key is not None:
+            self._eval_cache[cache_key] = _CachedEval(
+                value=float(value), policy_logits=None,
+            )
         return value
 
     def _backprop(

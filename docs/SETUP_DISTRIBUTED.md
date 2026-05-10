@@ -22,11 +22,12 @@ manual scp / env vars / pubkey paste.
 **On the master**, once:
 
 ```bash
-PYTHONPATH=src .venv-py313/Scripts/python.exe scripts/serve_setup_scripts.py
+PYTHONPATH=src .venv-py313/Scripts/python.exe -m mtg_bot.cli serve
 ```
 
 (Default port 5099. Auto-detects the master's tailnet name, the
-repo's git remote, and the user's `~/.ssh/id_ed25519.pub`.)
+repo's git remote, and the user's `~/.ssh/id_ed25519.pub`.
+``scripts/serve_setup_scripts.py`` still works as a legacy shim.)
 
 **On each remote** (one-time):
 
@@ -239,19 +240,16 @@ Drop a file like `shards_config.json` in the master's repo root
 {
   "shards": [
     {
-      "host": "local",
-      "n_games": 200
+      "host": "local"
     },
     {
       "host": "win-1080ti",
-      "n_games": 150,
       "user": "<you>",
       "repo_path": "C:\\Users\\<you>\\Projects\\mtg-bot",
       "venv_python": ".venv-py313\\Scripts\\python.exe"
     },
     {
       "host": "macbook",
-      "n_games": 150,
       "user": "<you>",
       "repo_path": "/Users/<you>/projects/mtg-bot",
       "venv_python": ".venv-py313/bin/python"
@@ -263,8 +261,10 @@ Drop a file like `shards_config.json` in the master's repo root
 Notes:
 - **`host`** is the SSH target — Tailscale magic-DNS hostname,
   bare IP, or `local` for the master. All three are fine.
-- **`n_games`** sums across shards become the iter's total games
-  per iter. With the example above each iter plays 500 games.
+- **Total games per iter** comes from `iterate_alphazero.py`'s
+  `--games-per-iteration` (every shard pulls from one shared
+  queue; slow machines pull fewer, fast ones pull more — there
+  is no per-shard quota in this file).
 - **`repo_path`** is the absolute path to the remote's repo
   working tree. The orchestrator does `cd` into this before
   running anything.
@@ -277,6 +277,9 @@ Notes:
   when omitted. Override if you want explicit per-shard seeds.
 - **`ssh_port`** defaults to 22 — set if your remote runs sshd on
   a non-standard port.
+- A legacy **`n_games`** field on any shard entry is rejected with
+  a clear error pointing at `--games-per-iteration` — drop it from
+  any older config files.
 
 ---
 
@@ -284,12 +287,12 @@ Notes:
 
 ### Lightweight: 6 games × 3 shards (~5 min)
 
-Edit a temporary shards config that uses small `n_games` values
-(e.g. 2 / 2 / 2), then:
+Pass a small `--games-per-iteration` (e.g. 6) and let the three
+shards drain it from the shared queue:
 
 ```bash
 PYTHONPATH=src .venv-py313/Scripts/python.exe \
-  scripts/iterate_alphazero.py \
+  -m mtg_bot.cli iterate \
   --bootstrap-version v6 --n-iterations 1 \
   --games-per-iteration 6 \
   --epochs 5 --batch-size 256 --learning-rate 1e-3 \
@@ -315,8 +318,9 @@ Once the smoke is clean, kick off the real iteration:
 
 ```bash
 PYTHONPATH=src .venv-py313/Scripts/python.exe \
-  scripts/iterate_alphazero.py \
+  -m mtg_bot.cli iterate \
   --bootstrap-version v6 --n-iterations 5 \
+  --games-per-iteration 500 \
   --epochs 100 --batch-size 256 --learning-rate 1e-3 \
   --acceptance-threshold 0.55 --eval-games 200 \
   --enable-mulligans --per-game-timeout-sec 450 \
@@ -326,8 +330,9 @@ PYTHONPATH=src .venv-py313/Scripts/python.exe \
   --shards-config shards_config.json
 ```
 
-Note `--games-per-iteration` is omitted — when `--shards-config`
-is set, the per-iter total comes from the sum of shard `n_games`.
+`--games-per-iteration` is the single source of truth for the
+iter's total game count: every shard (local + remote) pulls from
+the master's shared queue until it drains.
 
 ---
 

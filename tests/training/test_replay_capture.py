@@ -713,6 +713,663 @@ def test_end_to_end_replay_capture_writes_v3_with_search_field(
     assert all(s["search"] is None for s in replay.snapshots)
 
 
+# ---------- Diagnostic deep-tree capture (children field) -------------------
+
+
+def test_build_search_annotation_root_only_emits_children_none():
+    """Back-compat invariant: when ``deep_capture=False`` (the
+    default) and candidates have no ``subtree`` key, every emitted
+    candidate carries ``children=None`` — readers ignoring the field
+    see exactly the pre-feature shape."""
+    import random
+    from mtg_bot.actions import PassPriority, PlayLand
+    from mtg_bot.search import (
+        Budget, MCTS, RandomRolloutEvaluator,
+    )
+    from mtg_bot.training import build_search_annotation
+
+    mcts = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=8),
+        rng=random.Random(0),
+    )
+    candidates = [
+        {"decision": PassPriority(), "visits": 7,
+         "q": 0.1, "prior": None, "leaf_value": None},
+        {"decision": PlayLand(card_id=2), "visits": 3,
+         "q": 0.0, "prior": None, "leaf_value": None},
+    ]
+    annotation = build_search_annotation(
+        chosen=PassPriority(), candidates=candidates,
+        strategy=mcts, elapsed_ms=5,
+    )
+    for c in annotation["candidates"]:
+        assert c["children"] is None
+
+
+def test_build_search_annotation_deep_capture_translates_subtree():
+    """When candidates carry an in-memory ``subtree`` key, encode it
+    recursively as the on-disk ``children`` field. Empty subtrees
+    become ``[]`` (not None) so the chevron-hidden contract is
+    honored (``length === 0`` reads the same as ``no children``)."""
+    import random
+    from mtg_bot.actions import PassPriority, PlayLand
+    from mtg_bot.search import (
+        Budget, MCTS, RandomRolloutEvaluator,
+    )
+    from mtg_bot.training import build_search_annotation
+
+    mcts = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=8),
+        rng=random.Random(0),
+    )
+    candidates = [
+        {
+            "decision": PassPriority(), "visits": 10, "q": 0.1,
+            "prior": None, "leaf_value": None,
+            "subtree": [
+                {
+                    "decision": PlayLand(card_id=4), "visits": 5,
+                    "q": -0.05, "prior": None, "leaf_value": 0.1,
+                    "subtree": [],
+                },
+            ],
+        },
+        {
+            "decision": PlayLand(card_id=2), "visits": 3, "q": 0.0,
+            "prior": None, "leaf_value": None, "subtree": [],
+        },
+    ]
+    annotation = build_search_annotation(
+        chosen=PassPriority(), candidates=candidates,
+        strategy=mcts, elapsed_ms=5, deep_capture=True,
+    )
+    # First candidate (most-visited) has 1 child; child is a
+    # serialized PlayLand with the right stats.
+    first = annotation["candidates"][0]
+    assert isinstance(first["children"], list)
+    assert len(first["children"]) == 1
+    grand = first["children"][0]
+    assert grand["action"] == {"kind": "PlayLand", "card_id": 4}
+    assert grand["visits"] == 5
+    assert grand["q"] == -0.05
+    assert grand["leaf_value"] == 0.1
+    # Grandchild had subtree=[] → on-disk children=[] (sentinel for
+    # "deep-capture, no further children" rather than None).
+    assert grand["children"] == []
+    # Second candidate had subtree=[] (no expanded grandchildren) but
+    # deep_capture=True still emits []  — the viewer's chevron logic
+    # treats len==0 the same as None (hide), so this stays UI-equivalent.
+    assert annotation["candidates"][1]["children"] == []
+
+
+def test_build_search_annotation_subtree_round_trips_through_gzip(
+    tmp_path: Path,
+):
+    """A deep-captured search annotation embedded in a Replay must
+    survive gzip-JSON serialization unchanged: the recursive
+    ``children`` lists, the action shapes, and every numeric field."""
+    import gzip
+    import json as _json
+    from mtg_bot.actions import CastSpell, PassPriority, PlayLand
+    from mtg_bot.replay import REPLAY_FORMAT_VERSION, Replay, save_replay
+    from mtg_bot.training.replay_capture import _encode_children
+
+    # Hand-craft the on-disk shape directly (no MCTS involved — pure
+    # serialization round-trip test).
+    candidates_in_memory = [
+        {
+            "decision": PassPriority(), "visits": 12, "q": 0.2,
+            "prior": 0.5, "leaf_value": 0.1,
+            "subtree": [
+                {
+                    "decision": PlayLand(card_id=4), "visits": 6,
+                    "q": -0.05, "prior": 0.2, "leaf_value": -0.02,
+                    "subtree": [
+                        {
+                            "decision": CastSpell(card_id=9), "visits": 2,
+                            "q": 0.3, "prior": 0.1, "leaf_value": 0.4,
+                            "subtree": [],
+                        },
+                    ],
+                },
+                {
+                    "decision": PassPriority(), "visits": 3,
+                    "q": 0.0, "prior": 0.1, "leaf_value": None,
+                    "subtree": [],
+                },
+            ],
+        },
+    ]
+    encoded_root_children = _encode_children(
+        {"subtree": candidates_in_memory}, deep_capture=True,
+    )
+    snap = {
+        "turn_number": 1, "step": "precombat_main", "decision": None,
+        "search": {
+            "chosen": {"kind": "PassPriority"},
+            "candidates": encoded_root_children,
+            "samples": 1, "inner_nodes": 200, "elapsed_ms": 7,
+        },
+    }
+    replay = Replay(
+        format_version=REPLAY_FORMAT_VERSION,
+        metadata={"game_idx": 0},
+        snapshots=[snap],
+    )
+    path = tmp_path / "deep.json.gz"
+    save_replay(replay, path)
+    # Inspect the on-disk gzip: load + json-parse and check the
+    # nested shape survives byte-identical.
+    with gzip.open(path, "rt") as f:
+        loaded = _json.load(f)
+    out_root = loaded["snapshots"][0]["search"]["candidates"][0]
+    assert out_root["action"] == {"kind": "PassPriority"}
+    assert out_root["visits"] == 12
+    # Two depth-1 children.
+    assert len(out_root["children"]) == 2
+    # First depth-1 child is PlayLand(4) with one depth-2 child.
+    d1 = out_root["children"][0]
+    assert d1["action"] == {"kind": "PlayLand", "card_id": 4}
+    assert d1["visits"] == 6
+    assert len(d1["children"]) == 1
+    d2 = d1["children"][0]
+    assert d2["action"]["kind"] == "CastSpell"
+    assert d2["action"]["card_id"] == 9
+    assert d2["visits"] == 2
+    # Depth-2 child had no further children.
+    assert d2["children"] == []
+    # Second depth-1 sibling.
+    sib = out_root["children"][1]
+    assert sib["action"] == {"kind": "PassPriority"}
+    assert sib["children"] == []
+    # Schema-version unchanged — deep capture is purely additive.
+    assert loaded["format_version"] == REPLAY_FORMAT_VERSION
+    assert REPLAY_FORMAT_VERSION == 3
+
+
+def test_build_search_annotation_deep_capture_size_bounded():
+    """A realistic deep-mode annotation (depth=3, top-K=5, 5 root
+    candidates) lands well under the 50 KB soft warning threshold —
+    confirming that diagnostic captures are bounded and won't blow
+    out the disk on a typical game (~270 priority moments)."""
+    import random
+    from mtg_bot.actions import (
+        ActivateAbility, CastSpell, PassPriority, PlayLand,
+    )
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.training import build_search_annotation
+
+    mcts = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=200),
+        rng=random.Random(0),
+    )
+
+    def _leaf(d, v):
+        return {
+            "decision": d, "visits": v, "q": 0.05, "prior": 0.2,
+            "leaf_value": 0.0, "subtree": [],
+        }
+
+    def _branch(d, v, children):
+        return {
+            "decision": d, "visits": v, "q": 0.1, "prior": 0.3,
+            "leaf_value": 0.05, "subtree": children,
+        }
+
+    # 5 root candidates, each with 5 depth-1 children, each with 5
+    # depth-2 leaves. Matches what a real `--capture-tree-depth 3
+    # --capture-top-k 5` run would produce on a node-rich snapshot.
+    decs_l2 = [PassPriority(), PlayLand(card_id=1), CastSpell(card_id=2),
+               ActivateAbility(source_id=3, ability_index=0),
+               CastSpell(card_id=4)]
+    decs_l1 = [PlayLand(card_id=10), CastSpell(card_id=11),
+               PassPriority(), CastSpell(card_id=12),
+               ActivateAbility(source_id=13, ability_index=0)]
+    decs_l0 = [PassPriority(), PlayLand(card_id=20),
+               CastSpell(card_id=21), CastSpell(card_id=22),
+               ActivateAbility(source_id=23, ability_index=0)]
+    candidates = [
+        _branch(d0, 50 - 7 * i, [
+            _branch(d1, 10 - j, [
+                _leaf(d2, 3 - k) for k, d2 in enumerate(decs_l2)
+            ])
+            for j, d1 in enumerate(decs_l1)
+        ])
+        for i, d0 in enumerate(decs_l0)
+    ]
+    annotation = build_search_annotation(
+        chosen=PassPriority(), candidates=candidates,
+        strategy=mcts, elapsed_ms=42, deep_capture=True,
+    )
+    import json as _json
+    raw = len(_json.dumps(annotation).encode("utf-8"))
+    # Sanity: deep mode SHOULD be much bigger than shallow's 2 KB
+    # cap, but well under the 50 KB soft-warning threshold so a
+    # full game's worth of ~270 snapshots stays single-digit MB.
+    assert raw > 2048, f"deep annotation suspiciously small: {raw} B"
+    assert raw < 50_000, (
+        f"deep annotation exceeded 50 KB threshold: {raw} B"
+    )
+
+
+def test_build_search_annotation_depth_one_matches_choose_with_full_stats():
+    """``deep_capture=False`` + plain candidates (no subtree key)
+    must produce a per-snapshot annotation that's structurally
+    identical to today's ``build_search_annotation`` output, modulo
+    the new ``children=None`` field on each candidate. The on-disk
+    shape stays back-compat with v3 readers because they ignore
+    unknown fields."""
+    import random
+    from mtg_bot.actions import PassPriority, PlayLand
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.training import build_search_annotation
+
+    mcts = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=8),
+        rng=random.Random(0),
+    )
+    candidates = [
+        {"decision": PassPriority(), "visits": 7, "q": 0.1,
+         "prior": None, "leaf_value": None},
+        {"decision": PlayLand(card_id=2), "visits": 3, "q": 0.0,
+         "prior": None, "leaf_value": None},
+    ]
+    annotation = build_search_annotation(
+        chosen=PassPriority(), candidates=candidates,
+        strategy=mcts, elapsed_ms=5,
+    )
+    # Same five core fields, plus children=None.
+    expected_core_keys = {
+        "action", "visits", "q", "prior", "leaf_value", "children",
+    }
+    for c in annotation["candidates"]:
+        assert set(c.keys()) == expected_core_keys
+        assert c["children"] is None
+
+
+def test_mcts_choose_with_subtree_walks_tree():
+    """MCTS.choose_with_subtree must surface real tree structure
+    under each root candidate (depth=2 walks one level past root)."""
+    import random
+    from mtg_bot.actions import PassPriority
+    from mtg_bot.agents import RandomAgent
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.search.engine_adapter import MtgGameStateAdapter
+    from mtg_bot.simulate import setup_game
+
+    state = setup_game(
+        agents=[RandomAgent(), RandomAgent()],
+        decks=simple_test_decklists(), seed=0,
+    )
+    adapter = MtgGameStateAdapter(state)
+    mcts = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=80),
+        rng=random.Random(0),
+    )
+    chosen, candidates = mcts.choose_with_subtree(
+        adapter, 0, tree_depth=2, tree_top_k=3,
+    )
+    assert chosen is not None or candidates  # forced moves still ok
+    # Every root candidate has the subtree key (real list, possibly empty
+    # — depends on whether the budget reached that branch).
+    for c in candidates:
+        assert "subtree" in c
+        assert isinstance(c["subtree"], list)
+    # Children should be ≤ top_k=3 at depth 1.
+    for c in candidates:
+        assert len(c["subtree"]) <= 3
+
+
+def test_mcts_choose_with_subtree_depth_one_matches_full_stats():
+    """At ``tree_depth=1`` the new method's candidate stats match
+    ``choose_with_full_stats`` exactly (modulo the new empty
+    ``subtree`` key). Pins the back-compat invariant."""
+    import random
+    from mtg_bot.agents import RandomAgent
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.search.engine_adapter import MtgGameStateAdapter
+    from mtg_bot.simulate import setup_game
+
+    state = setup_game(
+        agents=[RandomAgent(), RandomAgent()],
+        decks=simple_test_decklists(), seed=0,
+    )
+    # Two independent MCTS instances with identical RNG seeding +
+    # the same root state — the searches are deterministic, so the
+    # per-root-child stats must match across the two methods.
+    a = MtgGameStateAdapter(state)
+    b = MtgGameStateAdapter(state)
+    mcts_a = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=64),
+        rng=random.Random(0),
+    )
+    mcts_b = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=64),
+        rng=random.Random(0),
+    )
+    chosen_a, cands_a = mcts_a.choose_with_full_stats(a, 0)
+    chosen_b, cands_b = mcts_b.choose_with_subtree(
+        b, 0, tree_depth=1, tree_top_k=None,
+    )
+    assert chosen_a == chosen_b
+    assert len(cands_a) == len(cands_b)
+    # Strip subtree from b for shape-equivalence check.
+    cands_b_stripped = [
+        {k: v for k, v in c.items() if k != "subtree"}
+        for c in cands_b
+    ]
+    # Order doesn't matter at the root in choose_with_full_stats
+    # (no sort), but choose_with_subtree sorts root by visits desc.
+    # Compare as sets of frozensets-of-items.
+    def _key(c):
+        return (c["decision"], c["visits"])
+    assert sorted(cands_a, key=_key) == sorted(cands_b_stripped, key=_key)
+    # subtree on every root cand at depth=1 is empty list.
+    for c in cands_b:
+        assert c["subtree"] == []
+
+
+def test_mcts_choose_with_subtree_invalid_depth_raises():
+    """tree_depth < 1 is a programmer error; raise rather than
+    silently returning empty results."""
+    import random
+    from mtg_bot.agents import RandomAgent
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.search.engine_adapter import MtgGameStateAdapter
+    from mtg_bot.simulate import setup_game
+
+    state = setup_game(
+        agents=[RandomAgent(), RandomAgent()],
+        decks=simple_test_decklists(), seed=0,
+    )
+    adapter = MtgGameStateAdapter(state)
+    mcts = MCTS(
+        evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+        budget_factory=lambda: Budget(max_nodes=4),
+        rng=random.Random(0),
+    )
+    with pytest.raises(ValueError):
+        mcts.choose_with_subtree(adapter, 0, tree_depth=0)
+
+
+def test_pimc_choose_with_subtree_aggregates_across_subsearches():
+    """PIMC.choose_with_subtree returns the same root-level shape as
+    choose_with_full_stats (visits summed across K worlds, q/prior/
+    leaf_value visit-weighted means) PLUS recursive ``subtree`` lists
+    aggregated the same way at each level."""
+    import random
+    from mtg_bot.agents import RandomAgent
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.search.engine_adapter import MtgGameStateAdapter
+    from mtg_bot.search.pimc import PIMC
+    from mtg_bot.simulate import setup_game
+
+    state = setup_game(
+        agents=[RandomAgent(), RandomAgent()],
+        decks=simple_test_decklists(), seed=0,
+    )
+    adapter = MtgGameStateAdapter(state)
+    pimc = PIMC(
+        inner_factory=lambda: MCTS(
+            evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+            budget_factory=lambda: Budget(max_nodes=40),
+            rng=random.Random(0),
+        ),
+        samples=2,
+        rng=random.Random(0),
+    )
+    chosen, candidates = pimc.choose_with_subtree(
+        adapter, 0, tree_depth=2, tree_top_k=2,
+    )
+    # Root keeps all candidates regardless of top_k.
+    assert chosen is not None or candidates
+    for c in candidates:
+        assert "subtree" in c
+        # Depth-1 (children of root candidates) capped at top_k=2.
+        assert len(c["subtree"]) <= 2
+        # Every grandchild also has a subtree key (empty since
+        # depth=2 stops there).
+        for grand in c["subtree"]:
+            assert grand["subtree"] == []
+
+
+def test_pimc_choose_with_subtree_depth_one_back_compat():
+    """At depth=1, PIMC.choose_with_subtree returns root candidates
+    matching choose_with_full_stats, with empty subtree on each."""
+    import random
+    from mtg_bot.agents import RandomAgent
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.search.engine_adapter import MtgGameStateAdapter
+    from mtg_bot.search.pimc import PIMC
+    from mtg_bot.simulate import setup_game
+
+    state = setup_game(
+        agents=[RandomAgent(), RandomAgent()],
+        decks=simple_test_decklists(), seed=0,
+    )
+    adapter = MtgGameStateAdapter(state)
+    pimc = PIMC(
+        inner_factory=lambda: MCTS(
+            evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+            budget_factory=lambda: Budget(max_nodes=32),
+            rng=random.Random(0),
+        ),
+        samples=2,
+        rng=random.Random(0),
+    )
+    _, candidates = pimc.choose_with_subtree(
+        adapter, 0, tree_depth=1, tree_top_k=None,
+    )
+    for c in candidates:
+        assert c["subtree"] == []
+
+
+def test_pimc_choose_with_subtree_invalid_depth_raises():
+    import random
+    from mtg_bot.agents import RandomAgent
+    from mtg_bot.search import Budget, MCTS, RandomRolloutEvaluator
+    from mtg_bot.search.engine_adapter import MtgGameStateAdapter
+    from mtg_bot.search.pimc import PIMC
+    from mtg_bot.simulate import setup_game
+
+    state = setup_game(
+        agents=[RandomAgent(), RandomAgent()],
+        decks=simple_test_decklists(), seed=0,
+    )
+    adapter = MtgGameStateAdapter(state)
+    pimc = PIMC(
+        inner_factory=lambda: MCTS(
+            evaluator=RandomRolloutEvaluator(rng=random.Random(0)),
+            budget_factory=lambda: Budget(max_nodes=4),
+            rng=random.Random(0),
+        ),
+        samples=2,
+    )
+    with pytest.raises(ValueError):
+        pimc.choose_with_subtree(adapter, 0, tree_depth=0)
+
+
+def test_replay_capture_config_has_tree_capture_fields():
+    """ReplayCaptureConfig exposes tree_depth and tree_top_k with
+    production-safe defaults (1, None)."""
+    cfg = ReplayCaptureConfig(save_dir="x")
+    assert cfg.tree_depth == 1
+    assert cfg.tree_top_k is None
+    cfg2 = ReplayCaptureConfig(
+        save_dir="x", tree_depth=3, tree_top_k=5,
+    )
+    assert cfg2.tree_depth == 3
+    assert cfg2.tree_top_k == 5
+
+
+def test_end_to_end_data_gen_deep_capture_writes_children(tmp_path: Path):
+    """Run a sequential data_gen with PIMC + deep capture (depth=2,
+    top_k=2). Resulting replay has at least one snapshot whose
+    search.candidates carry populated ``children`` lists; non-deep
+    captures (default) still emit ``children=None`` exclusively."""
+    from mtg_bot.training import PimcConfig
+    config = PimcConfig(samples=1, inner_nodes=8)
+    factory = lambda seed, _c=config: _c.build(seed)
+
+    save_dir = tmp_path / "deep_replays"
+    cfg = ReplayCaptureConfig(
+        save_dir=str(save_dir), capture_every=1,
+        tree_depth=2, tree_top_k=2,
+    )
+    generate_training_data(
+        p0_factory=factory, p1_factory=factory,
+        n_games=1, base_seed=0, replay_config=cfg,
+        deck_pool=simple_test_deck_pool(),
+    )
+    files = sorted(save_dir.glob("*.json.gz"))
+    assert len(files) == 1
+    replay = load_replay(files[0])
+    assert replay.format_version == 3  # NOT bumped to 4
+    annotated = [
+        s for s in replay.snapshots if s.get("search") is not None
+    ]
+    assert annotated
+    saw_populated = False
+    for s in annotated:
+        for c in s["search"]["candidates"]:
+            assert "children" in c
+            # children is either None (forced moves with no real
+            # search), [] (no expanded grandchildren), or a real list.
+            if c["children"]:
+                saw_populated = True
+                assert len(c["children"]) <= 2  # top_k=2
+                # Recursive shape check on first depth-1 child.
+                for grand in c["children"]:
+                    assert "action" in grand
+                    assert isinstance(grand["visits"], int)
+                    # children at depth=2 boundary is [] (terminate)
+                    # because tree_depth=2 means root + 1 deeper.
+                    assert grand["children"] == []
+    assert saw_populated, (
+        "no candidate with populated children — deep capture "
+        "should produce at least one"
+    )
+
+
+def test_end_to_end_data_gen_default_depth_emits_no_children(
+    tmp_path: Path,
+):
+    """Production default (tree_depth=1, tree_top_k=None): every
+    annotated candidate has children=None. No size regression vs
+    pre-feature replays."""
+    from mtg_bot.training import PimcConfig
+    config = PimcConfig(samples=1, inner_nodes=4)
+    factory = lambda seed, _c=config: _c.build(seed)
+
+    save_dir = tmp_path / "shallow"
+    cfg = ReplayCaptureConfig(save_dir=str(save_dir), capture_every=1)
+    generate_training_data(
+        p0_factory=factory, p1_factory=factory,
+        n_games=1, base_seed=0, replay_config=cfg,
+        deck_pool=simple_test_deck_pool(),
+    )
+    files = sorted(save_dir.glob("*.json.gz"))
+    replay = load_replay(files[0])
+    annotated = [
+        s for s in replay.snapshots if s.get("search") is not None
+    ]
+    assert annotated
+    for s in annotated:
+        for c in s["search"]["candidates"]:
+            # Default path: children=None on every candidate.
+            assert c["children"] is None
+
+
+def test_recorder_warns_on_oversized_deep_annotation():
+    """The soft size sanity check fires a warning when a deep
+    annotation exceeds the 50 KB threshold but does NOT raise."""
+    import warnings as _warnings
+    from mtg_bot.training.replay_capture import (
+        _DEEP_ANNOTATION_SIZE_WARN_BYTES,
+    )
+
+    rec = ReplayRecorder()
+    # Build an artificial annotation just over the threshold by
+    # padding chosen action with a long string. (children=[long str]
+    # makes it deep.)
+    big_payload = "x" * (_DEEP_ANNOTATION_SIZE_WARN_BYTES + 100)
+    annotation = {
+        "chosen": {"kind": "Filler", "pad": big_payload},
+        "candidates": [{
+            "action": {"kind": "PassPriority"}, "visits": 1,
+            "q": None, "prior": None, "leaf_value": None,
+            "children": [
+                {
+                    "action": {"kind": "X", "pad": big_payload},
+                    "visits": 1, "q": None, "prior": None,
+                    "leaf_value": None, "children": [],
+                },
+            ],
+        }],
+    }
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        size = rec.maybe_warn_deep_annotation_size(annotation)
+    assert size is not None
+    assert size > _DEEP_ANNOTATION_SIZE_WARN_BYTES
+    assert len(caught) == 1
+    assert "deep search annotation" in str(caught[0].message)
+
+
+def test_recorder_no_warning_on_shallow_annotation():
+    """Production root-only annotations (children=None on every
+    candidate) skip the size check entirely — no overhead, no
+    spurious warnings."""
+    import warnings as _warnings
+
+    rec = ReplayRecorder()
+    annotation = {
+        "chosen": {"kind": "PassPriority"},
+        "candidates": [
+            {"action": {"kind": "PassPriority"}, "visits": 5,
+             "q": 0.1, "prior": None, "leaf_value": None,
+             "children": None},
+        ],
+        "samples": 1, "inner_nodes": 50, "elapsed_ms": 5,
+    }
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        size = rec.maybe_warn_deep_annotation_size(annotation)
+    assert size is None
+    assert len(caught) == 0
+
+
+def test_recorder_no_warning_on_small_deep_annotation():
+    """Deep annotation under threshold: size measured but no warning."""
+    import warnings as _warnings
+
+    rec = ReplayRecorder()
+    annotation = {
+        "chosen": {"kind": "PassPriority"},
+        "candidates": [{
+            "action": {"kind": "PassPriority"}, "visits": 1,
+            "q": None, "prior": None, "leaf_value": None,
+            "children": [
+                {"action": {"kind": "PassPriority"}, "visits": 1,
+                 "q": None, "prior": None, "leaf_value": None,
+                 "children": []},
+            ],
+        }],
+    }
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        size = rec.maybe_warn_deep_annotation_size(annotation)
+    assert size is not None
+    assert len(caught) == 0
+
+
 def test_end_to_end_replay_capture_records_decisions(tmp_path: Path):
     """Run two games with replay capture enabled. Every snapshot
     after the first carries a non-None decision that round-trips

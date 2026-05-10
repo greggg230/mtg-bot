@@ -83,9 +83,25 @@ class TrainingHistory:
 
 
 def auto_device() -> str:
-    """Return ``"cuda"`` when a CUDA device is available, else
-    ``"cpu"``. Convenience for callers that don't care which."""
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    """Return the best available torch device string for this host.
+
+    Order of preference: ``"cuda"`` > ``"mps"`` > ``"cpu"``. CUDA wins
+    on machines with NVIDIA GPUs (master / Win10 remote); MPS picks
+    up Apple Silicon (Mac remote); CPU is the universal fallback.
+
+    The ``hasattr`` check on ``torch.backends.mps`` keeps this safe
+    on older torch builds where the submodule isn't present (current
+    torch 2.x always exposes it, but the check costs nothing and
+    documents the precondition).
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        return "mps"
+    return "cpu"
 
 
 def train_value_network(

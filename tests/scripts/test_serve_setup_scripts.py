@@ -1,4 +1,6 @@
-"""Tests for ``scripts/serve_setup_scripts.py``.
+"""Tests for ``mtg_bot.cli.serve`` (the runner formerly known as
+``scripts/serve_setup_scripts.py``; the script is now a thin shim
+that just calls into this module).
 
 Cover the template-substitution + endpoint behavior. The real-
 remote flow (curl from a Mac, iex from a Win box) needs the actual
@@ -7,24 +9,22 @@ machines and is validated manually after both are up.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPT_PATH = _REPO_ROOT / "scripts" / "serve_setup_scripts.py"
 
 
 def _load_module():
-    """Load serve_setup_scripts.py as a module without running its
-    main(). Imports are local so this test file doesn't pollute the
-    module namespace with stray side effects."""
-    spec = importlib.util.spec_from_file_location(
-        "serve_setup_scripts", _SCRIPT_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Fresh-import ``mtg_bot.cli.serve``. Force-reload so each test
+    gets independent module state."""
+    src_dir = _REPO_ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    if "mtg_bot.cli.serve" in sys.modules:
+        del sys.modules["mtg_bot.cli.serve"]
+    return importlib.import_module("mtg_bot.cli.serve")
 
 
 def test_render_template_replaces_all_placeholders(tmp_path: Path):

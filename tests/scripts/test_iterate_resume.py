@@ -1,4 +1,6 @@
-"""Tests for the partial-iter recovery path in ``scripts/iterate_alphazero.py``.
+"""Tests for the partial-iter recovery path in ``mtg_bot.cli.iterate``
+(formerly ``scripts/iterate_alphazero.py``; the script is a thin
+shim now).
 
 Covers ``_reconcile_iterate_state`` against the three on-disk shapes
 the iterate loop can leave behind when a process is killed mid-cycle:
@@ -16,24 +18,24 @@ never landed): refuse rather than silently guess.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPT_PATH = _REPO_ROOT / "scripts" / "iterate_alphazero.py"
 
 
 def _load_module():
-    spec = importlib.util.spec_from_file_location(
-        "iterate_alphazero", _SCRIPT_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    src_dir = _REPO_ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    if "mtg_bot.cli.iterate" in sys.modules:
+        del sys.modules["mtg_bot.cli.iterate"]
+    return importlib.import_module("mtg_bot.cli.iterate")
 
 
 def _make_version_dir(
