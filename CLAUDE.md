@@ -143,6 +143,43 @@ For one-time per-machine bootstrap (Python, repo clone, SSH keys,
 Tailscale enrollment), see
 [`docs/SETUP_DISTRIBUTED.md`](docs/SETUP_DISTRIBUTED.md).
 
+### Dynamic worker scaling (Phase 1, between-iter only)
+
+The training UI's per-machine sub-cards (data_gen / eval cards
+from a distributed iter) include a small numeric input + Apply
+button per shard. Clicking Apply POSTs to the master's
+`mtg_bot serve` endpoint:
+
+- `GET /api/shards` — current `shards_config.json` contents.
+- `POST /api/shards/<host>/workers` with body `{"n_workers": N}`,
+  N in `[1, 64]`. Returns 400 on invalid value, 404 on unknown
+  host. Mutates `shards_config.json` write-through via tempfile +
+  `os.replace`; persists across `mtg_bot serve` and
+  `mtg_bot iterate` restarts. Concurrent edits serialize through
+  a module-level lock in
+  `src/mtg_bot/training/shards_config_edit.py`.
+
+`mtg_bot iterate` re-reads `shards_config.json` from disk at the
+top of every iter cycle (in
+`mtg_bot.training._iterate_helpers.refresh_shards_config_for_iter`)
+so the change applied via the UI takes effect on the NEXT iter's
+pool init. Each iter logs a one-line summary so the operator can
+grep the iter log to confirm:
+
+    [iterate] shards_config refreshed for iter_007: local=8,
+    macbook=null (auto), win10=4
+
+**Phase 1 explicitly excludes mid-iter scaling.** The
+currently-running iter's `multiprocessing.Pool` keeps its current
+worker count; the new value lands at the next iter boundary.
+Mid-iter rescale is Phase 2 — it requires switching the local
+self-play pool from `multiprocessing.Pool` to a queue +
+spawn/kill worker pattern. Deferred until the between-iter
+control proves insufficient in practice.
+
+Pass `--shards-config ''` to `mtg_bot serve` to disable the
+endpoints entirely (default: `shards_config.json` in the cwd).
+
 ## Run database
 
 Every `mtg_bot` subcommand records its run into a SQLite DB at
