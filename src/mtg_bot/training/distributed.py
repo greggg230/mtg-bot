@@ -1182,6 +1182,163 @@ class _EarlyStopPoller:
             )
 
 
+class _StopCheckPoller:
+    """Watches a user-supplied ``stop_check`` predicate and POSTs
+    ``/queue/close/<run_id>`` once it fires. Companion to
+    :class:`_EarlyStopPoller`: the early-stop poller closes the
+    queue when enough successful results are in (statistical /
+    target-met early termination); this poller closes the queue
+    when the operator clicked Stop on the training UI (or any
+    upstream stop sentinel went off, e.g. iterate's cycle-level
+    sentinel propagating through to the in-flight eval).
+    The two are independent — an iter run can have either, both,
+    or neither poller active simultaneously without conflict.
+    Both ultimately make the same fire-and-forget POST to
+    ``/queue/close/<run_id>``; the queue server treats repeated
+    closes as a no-op so two concurrent close POSTs are safe.
+
+    Returns to the orchestrator's ``finally`` cleanup just like
+    ``_EarlyStopPoller`` — the close is fire-and-forget, the
+    poller doesn't need to be drained or joined for correctness
+    (best-effort ``stop()`` just sets the event so the thread
+    exits quickly).
+
+    The default poll interval is short (0.5s) because the
+    user-perceived latency of "I clicked Stop" → "the eval
+    actually stopped dispatching new games" is the metric this
+    poller exists to optimize. The early-stop poller's 3s tick
+    is fine because its threshold is filesystem-derived, but a
+    UI-driven stop should feel immediate.
+
+    ``stop_check`` is called on the poller thread; it must be
+    cheap and thread-safe. The standard
+    ``mtg_bot.training.stop_signal.stop_requested`` predicate is
+    a tiny ``Path.exists()`` probe and satisfies both.
+    """
+
+    def __init__(
+        self,
+        *,
+        stop_check: Callable[[], bool],
+        run_id: str,
+        queue_url: str,
+        interval_s: float = 0.5,
+        urlopen=None,
+    ) -> None:
+        self._stop_check = stop_check
+        self._run_id = run_id
+        self._queue_url = queue_url.rstrip("/")
+        self._interval_s = interval_s
+        self._urlopen = urlopen
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._closed = False
+        self._close_failed = False
+        # Set on first observation that ``stop_check`` returned True;
+        # helps callers / tests assert "the poller saw the stop"
+        # independent of whether the close POST succeeded.
+        self._stop_observed = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"stop-check-{self._run_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the polling thread to exit. Idempotent. Safe to
+        call from the orchestrator's ``finally`` even if
+        :meth:`start` was never called (test paths)."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    @property
+    def closed(self) -> bool:
+        """True once this poller has successfully POSTed
+        ``/queue/close``. Tests inspect this; orchestrator code
+        doesn't need it (the close is fire-and-forget)."""
+        return self._closed
+
+    @property
+    def stop_observed(self) -> bool:
+        """True once ``stop_check()`` returned True at least once.
+        Distinct from :attr:`closed` because the close POST may fail
+        even though the stop was observed; callers can use this to
+        decide whether the run should be reported as ``stopped`` vs
+        ``completed`` independent of whether the queue close
+        succeeded."""
+        return self._stop_observed
+
+    def _loop(self) -> None:
+        # Tick once immediately so a stop sentinel that's already
+        # present at start-up is observed without waiting an interval.
+        first = True
+        while True:
+            if not first and self._stop_event.wait(self._interval_s):
+                return
+            first = False
+            if self._closed:
+                return
+            try:
+                fired = self._stop_check()
+            except Exception as exc:  # noqa: BLE001
+                # A misbehaving stop_check shouldn't kill the
+                # orchestrator. Log once and exit the polling loop;
+                # the run will continue normally.
+                print(
+                    f"[stop-check] {self._run_id}: stop_check raised "
+                    f"{type(exc).__name__}: {exc}; abandoning poll "
+                    f"thread (run will continue without stop-check "
+                    f"propagation).",
+                    file=sys.stderr,
+                )
+                return
+            if not fired:
+                continue
+            self._stop_observed = True
+            self._send_close()
+            return
+
+    def _send_close(self) -> None:
+        """Best-effort POST to ``/queue/close/<run_id>``. On failure
+        we log and give up — the run will drain naturally as the
+        existing queue indices empty (slower than ideal but the user
+        already got a stop sentinel, so the iterate driver will
+        short-circuit at the next stage boundary regardless)."""
+        import urllib.request
+        url = f"{self._queue_url}/queue/close/{self._run_id}"
+        req = urllib.request.Request(
+            url, data=b"", method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            if self._urlopen is not None:
+                resp = self._urlopen(req)
+                status = getattr(resp, "status", 200)
+            else:
+                resp = _urlopen_with_retry(req)
+                status = resp.status
+            if 200 <= status < 300:
+                self._closed = True
+            else:
+                self._close_failed = True
+                print(
+                    f"[stop-check] {url} returned HTTP {status}; "
+                    f"queue will drain naturally.",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._close_failed = True
+            print(
+                f"[stop-check] failed to POST {url}: {exc}; queue "
+                f"will drain naturally.",
+                file=sys.stderr,
+            )
+
+
 @dataclass(frozen=True)
 class ShardSelfPlayReport:
     """Outcome of a single self-play shard from the orchestrator's
@@ -1299,6 +1456,7 @@ def run_distributed_self_play(
     bundle_url: Optional[str] = None,
     slack_extra: int = 0,
     shard_ssh_timeout_s: float = _DEFAULT_SHARD_SSH_TIMEOUT_S,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> list[Path]:
     """Pull-model orchestrator. Initializes a queue of
     ``total_games + slack_extra`` on master, dispatches every shard
@@ -1319,6 +1477,16 @@ def run_distributed_self_play(
     ``total_games`` successful completions are in, abandoning slack.
     Set to 0 (default) to retain the legacy "drain the whole queue"
     behavior.
+
+    ``stop_check``: optional predicate polled by a background thread.
+    On True, the orchestrator POSTs ``/queue/close/<run_id_prefix>``
+    so the queue stops dispatching new games. Shards' workers see
+    an empty queue at the next take, finish their in-flight games,
+    flush their final batches, and shut down; the orchestrator
+    returns whatever npz paths landed before the stop. Mirrors
+    :func:`run_match_parallel`'s ``stop_check`` shape so iterate
+    can pass the same callable through both paths. Defaults to
+    ``None`` (no stop-check), preserving legacy behavior.
     """
     import threading as _threading
     import urllib.request
@@ -1445,21 +1613,46 @@ def run_distributed_self_play(
         )
         early_stop.start()
 
+    # Stop-check propagation: when the operator (or iterate's cycle
+    # sentinel) requests a stop, close the queue server-side so
+    # shards drain at their next take. Independent of early-stop;
+    # both can run concurrently. POSTs the same /queue/close URL —
+    # idempotent on the server side, so a race between the two
+    # closures is harmless.
+    stop_check_poller: Optional[_StopCheckPoller] = None
+    if stop_check is not None:
+        stop_check_poller = _StopCheckPoller(
+            stop_check=stop_check,
+            run_id=run_id_prefix,
+            queue_url=queue_url,
+        )
+        stop_check_poller.start()
+
     # All shards run concurrently — they pull from the same queue,
     # so there's no static partitioning to worry about. Local
     # shards' mp.Pool runs in this process; remote shards block on
     # SSH (lots of idle wall time waiting on the network call to
     # finish before a thread can do useful work, but the master
     # CPU isn't held).
+    # Skip dispatch entirely if stop was already requested before
+    # we got here — the iter's stop sentinel may have landed during
+    # queue init / aggregator startup. Without this guard we'd
+    # spin up workers only to immediately drain them on first take,
+    # which works but wastes ~1-2s of pool spawn cost per shard on
+    # Windows.
     futures: dict[concurrent.futures.Future, ShardConfig] = {}
     n_threads = max(1, len(shards_config.shards))
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=n_threads, thread_name_prefix="dist-self-play",
     )
+    pre_stop = stop_check is not None and stop_check()
     try:
-        for shard in shards_config.shards:
-            runner = _local_runner if shard.is_local else _remote_runner
-            futures[executor.submit(runner, shard)] = shard
+        if not pre_stop:
+            for shard in shards_config.shards:
+                runner = (
+                    _local_runner if shard.is_local else _remote_runner
+                )
+                futures[executor.submit(runner, shard)] = shard
     finally:
         executor.shutdown(wait=False)
 
@@ -1484,6 +1677,8 @@ def run_distributed_self_play(
     finally:
         if early_stop is not None:
             early_stop.stop()
+        if stop_check_poller is not None:
+            stop_check_poller.stop()
         any_failed = any(not r.success for r in reports) or interrupted
         aggregator.stop("failed" if any_failed else "completed")
 
@@ -1539,6 +1734,7 @@ def run_distributed_eval(
     bundle_url: Optional[str] = None,
     slack_extra: int = 0,
     shard_ssh_timeout_s: float = _DEFAULT_SHARD_SSH_TIMEOUT_S,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> dict[str, int]:
     """Eval counterpart to ``run_distributed_self_play``. Initializes
     a queue of ``total_games + slack_extra``, dispatches every shard
@@ -1554,6 +1750,22 @@ def run_distributed_eval(
     ``slack_extra`` enables the same straggler-tolerance early-stop
     used by self-play: queue ``total + slack``, close once ``total``
     successful games are in.
+
+    ``stop_check``: optional predicate polled by a background thread.
+    On True, the orchestrator POSTs ``/queue/close/<run_id_prefix>``
+    so the queue stops dispatching new eval games. Shards drain
+    cleanly: their workers finish in-flight games, write the per-
+    shard result JSON, and exit; the orchestrator returns the
+    accumulated counts (which the eval-gate caller can then judge
+    against its acceptance threshold on partial-but-conclusive
+    data — same shape as :func:`run_match_parallel`'s ``stop_check``
+    semantics). Defaults to ``None`` (no stop-check), preserving
+    legacy behavior.
+
+    The early-stop watcher (``scripts/eval_early_stop_watcher.py``)
+    writes the same ``.STOP_<run_id>`` sentinel iterate's cycle-
+    level stop uses, so the watcher's PASS / FAIL early-stop now
+    propagates end-to-end through the distributed eval path.
     """
     import threading as _threading
     import urllib.request
@@ -1671,15 +1883,33 @@ def run_distributed_eval(
         )
         early_stop.start()
 
+    # Stop-check propagation: same as self-play, but for eval. The
+    # early-stop watcher (eval_early_stop_watcher.py) calls
+    # write_stop on PASS / FAIL, which fires this poller's stop_check
+    # and closes the queue. Mirrors the rationale above; see the
+    # self-play branch for the docstring.
+    stop_check_poller: Optional[_StopCheckPoller] = None
+    if stop_check is not None:
+        stop_check_poller = _StopCheckPoller(
+            stop_check=stop_check,
+            run_id=run_id_prefix,
+            queue_url=queue_url,
+        )
+        stop_check_poller.start()
+
     futures: dict[concurrent.futures.Future, ShardConfig] = {}
     n_threads = max(1, len(shards_config.shards))
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=n_threads, thread_name_prefix="dist-eval",
     )
+    pre_stop = stop_check is not None and stop_check()
     try:
-        for shard in shards_config.shards:
-            runner = _local_runner if shard.is_local else _remote_runner
-            futures[executor.submit(runner, shard)] = shard
+        if not pre_stop:
+            for shard in shards_config.shards:
+                runner = (
+                    _local_runner if shard.is_local else _remote_runner
+                )
+                futures[executor.submit(runner, shard)] = shard
     finally:
         executor.shutdown(wait=False)
 
@@ -1699,6 +1929,8 @@ def run_distributed_eval(
     finally:
         if early_stop is not None:
             early_stop.stop()
+        if stop_check_poller is not None:
+            stop_check_poller.stop()
         any_failed = any(not r.success for r in reports) or interrupted
         aggregator.stop("failed" if any_failed else "completed")
 

@@ -2631,6 +2631,577 @@ def test_early_stop_poller_stale_skip_log_fires_once_per_run(
     assert err.count("ignoring") == 1
 
 
+# ---- _StopCheckPoller -------------------------------------------
+
+
+def test_stop_check_poller_closes_queue_when_stop_check_returns_true(
+    tmp_path: Path,
+):
+    """Happy path: stop_check fires True on the first tick → exactly
+    one POST to /queue/close/<run_id>. Single-shot per the docstring;
+    the closed flag flips and the polling thread exits."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    posted: list[str] = []
+
+    class FakeResp:
+        status = 200
+
+    def fake_urlopen(req):
+        posted.append(req.full_url)
+        return FakeResp()
+
+    poller = _StopCheckPoller(
+        stop_check=lambda: True,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.02,
+        urlopen=fake_urlopen,
+    )
+    poller.start()
+    time.sleep(0.15)
+    poller.stop()
+    assert posted == ["http://master:5099/queue/close/r"]
+    assert poller.closed is True
+    assert poller.stop_observed is True
+
+
+def test_stop_check_poller_does_not_close_when_stop_check_stays_false(
+    tmp_path: Path,
+):
+    """Negative path: stop_check stays False over many ticks → no
+    POSTs, closed stays False. The orchestrator finishes naturally."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    posted: list[str] = []
+    poller = _StopCheckPoller(
+        stop_check=lambda: False,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.02,
+        urlopen=lambda req: posted.append(req.full_url),
+    )
+    poller.start()
+    time.sleep(0.15)
+    poller.stop()
+    assert posted == []
+    assert poller.closed is False
+    assert poller.stop_observed is False
+
+
+def test_stop_check_poller_observes_stop_then_close_post_fails(
+    tmp_path: Path, capsys,
+):
+    """If the close POST raises, log + give up — but stop_observed
+    still reflects that the stop_check fired. The queue will drain
+    naturally as its existing indices empty (slower path); the user
+    already got a stop sentinel out the door, so the iterate driver
+    will short-circuit at the next stage boundary regardless."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    def boom(req):
+        raise ConnectionError("master unreachable")
+
+    poller = _StopCheckPoller(
+        stop_check=lambda: True,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.02,
+        urlopen=boom,
+    )
+    poller.start()
+    time.sleep(0.15)
+    poller.stop()
+    assert poller.closed is False
+    assert poller.stop_observed is True
+    err = capsys.readouterr().err
+    assert "stop-check" in err
+
+
+def test_stop_check_poller_close_non_2xx_logs_and_gives_up(
+    tmp_path: Path, capsys,
+):
+    """A 4xx/5xx response from /queue/close is treated the same as a
+    network failure: logged + abandoned. We don't spin retrying a
+    server that's actively rejecting our close POST."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    class FakeResp:
+        status = 500
+
+    poller = _StopCheckPoller(
+        stop_check=lambda: True,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.02,
+        urlopen=lambda req: FakeResp(),
+    )
+    poller.start()
+    time.sleep(0.15)
+    poller.stop()
+    assert poller.closed is False
+    assert poller.stop_observed is True
+    err = capsys.readouterr().err
+    assert "stop-check" in err and "HTTP 500" in err
+
+
+def test_stop_check_poller_recovers_when_stop_check_raises(
+    tmp_path: Path, capsys,
+):
+    """A misbehaving stop_check (raises) shouldn't kill the
+    orchestrator — log once and exit the polling loop. Run continues
+    naturally; user just doesn't get stop-check propagation for this
+    invocation."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    posted: list[str] = []
+
+    def angry():
+        raise RuntimeError("disk gone")
+
+    poller = _StopCheckPoller(
+        stop_check=angry,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.02,
+        urlopen=lambda req: posted.append(req.full_url),
+    )
+    poller.start()
+    time.sleep(0.15)
+    poller.stop()
+    assert posted == []
+    assert poller.closed is False
+    err = capsys.readouterr().err
+    assert "stop-check" in err and "RuntimeError" in err
+
+
+def test_stop_check_poller_stops_polling_after_close(
+    tmp_path: Path,
+):
+    """After a successful close POST, the loop exits — no further
+    ticks, even if stop_check would still return True. Idempotency
+    on the orchestrator side: only one /queue/close per stop event."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    posted: list[str] = []
+
+    class FakeResp:
+        status = 200
+
+    poller = _StopCheckPoller(
+        stop_check=lambda: True,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.01,
+        urlopen=lambda req: (posted.append(req.full_url), FakeResp())[1],
+    )
+    poller.start()
+    time.sleep(0.2)  # many ticks would fire if loop didn't exit
+    poller.stop()
+    assert len(posted) == 1
+
+
+def test_stop_check_poller_double_stop_is_safe(tmp_path: Path):
+    """Calling .stop() twice (e.g. orchestrator's finally + an
+    explicit cleanup helper) doesn't deadlock or raise. .stop() is
+    idempotent and tolerates being called before .start() (no thread
+    yet → no-op)."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    poller = _StopCheckPoller(
+        stop_check=lambda: False,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=0.02,
+        urlopen=lambda req: None,
+    )
+    # Stop before start: no-op.
+    poller.stop()
+    poller.start()
+    poller.stop()
+    poller.stop()
+    assert poller.closed is False
+
+
+def test_stop_check_poller_immediate_first_tick_no_wait(tmp_path: Path):
+    """The first tick fires immediately (no initial interval wait)
+    so a stop sentinel that's already present at start-up is observed
+    fast — the user clicked Stop before the orchestrator started its
+    polling and shouldn't have to wait an interval for confirmation."""
+    from mtg_bot.training.distributed import _StopCheckPoller
+
+    posted: list[str] = []
+
+    class FakeResp:
+        status = 200
+
+    poller = _StopCheckPoller(
+        stop_check=lambda: True,
+        run_id="r",
+        queue_url="http://master:5099",
+        interval_s=10.0,  # would be too long to wait for, but won't
+        urlopen=lambda req: (posted.append(req.full_url), FakeResp())[1],
+    )
+    poller.start()
+    # First tick fires synchronously inside the thread on start-up.
+    time.sleep(0.1)
+    poller.stop()
+    assert len(posted) == 1
+
+
+# ---- run_distributed_* + stop_check end-to-end ------------------
+
+
+def _start_queue_server_with_stop(progress_dir: Path) -> tuple[str, "object"]:
+    """In-process queue server that mirrors mtg_bot.cli.serve's
+    /queue/take stop-sentinel behavior: when a ``.STOP_<run_id>``
+    file exists in ``progress_dir``, /queue/take returns 200 with
+    ``{games: [], remaining: 0, closed: True, stopped: True}``.
+
+    Used by tests that drive run_distributed_eval / run_distributed_
+    self_play through the real stop-sentinel pathway end-to-end."""
+    import http.server
+    import json as _json
+    import socket
+    import threading as _threading
+
+    state: dict = {"queues": {}, "lock": _threading.Lock()}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args, **kwargs):
+            pass
+
+        def _reply(self, status, body_obj):
+            payload = _json.dumps(body_obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8")
+            data = _json.loads(raw) if raw else {}
+            if self.path == "/queue/init":
+                run_id = data["run_id"]
+                total = int(data["total_games"])
+                with state["lock"]:
+                    state["queues"][run_id] = {
+                        "next": 0, "total": total, "closed": False,
+                    }
+                self._reply(200, {"ok": True})
+            elif self.path == "/queue/take":
+                run_id = data["run_id"]
+                bs = int(data.get("batch_size", 25))
+                # Sentinel-based stop check, just like mtg_bot.cli.serve.
+                sentinel = progress_dir / f".STOP_{run_id}"
+                if sentinel.exists():
+                    self._reply(200, {
+                        "games": [], "remaining": 0,
+                        "closed": True, "stopped": True,
+                    })
+                    return
+                with state["lock"]:
+                    q = state["queues"].get(run_id)
+                    if q is None:
+                        self._reply(404, {"error": "unknown run_id"})
+                        return
+                    if q.get("closed"):
+                        self._reply(200, {
+                            "games": [], "remaining": 0, "closed": True,
+                        })
+                        return
+                    start = q["next"]
+                    end = min(start + bs, q["total"])
+                    q["next"] = end
+                    remaining = q["total"] - end
+                self._reply(200, {
+                    "games": list(range(start, end)),
+                    "remaining": remaining,
+                })
+            elif self.path.startswith("/queue/close/"):
+                run_id = self.path[len("/queue/close/"):]
+                with state["lock"]:
+                    q = state["queues"].get(run_id)
+                    if q is None:
+                        self._reply(404, {"error": "unknown run_id"})
+                        return
+                    q["closed"] = True
+                self._reply(200, {"ok": True, "closed": True})
+            else:
+                self._reply(404, {"error": "not found"})
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", port), Handler,
+    )
+    thread = _threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return f"http://127.0.0.1:{port}", server
+
+
+def test_run_distributed_eval_stop_check_skips_dispatch_if_pre_stopped(
+    tmp_path: Path,
+):
+    """Pre-stop optimization: if stop_check returns True before the
+    orchestrator submits any shards (sentinel was already on disk
+    when iterate called in), skip the executor.submit loop entirely.
+    No shards run → no per-shard JSONs → returns zero counts. The
+    eval-gate caller then judges 0/0 and either keeps current best
+    or short-circuits via its own cycle stop_check."""
+    from mtg_bot.training.distributed import (
+        EvalJobSpec, run_distributed_eval,
+    )
+
+    weights_path, hidden_sizes = _tiny_dual_head_weights(tmp_path)
+    progress_dir = tmp_path / "training_progress"
+    progress_dir.mkdir()
+    spec = EvalJobSpec(
+        new_weights_path=str(weights_path),
+        old_weights_path=str(weights_path),
+        samples=1, inner_nodes=10,
+        hidden_sizes=hidden_sizes,
+        base_seed=0, enable_mulligans=False,
+        per_game_timeout_sec=None,
+        opponent_label="self",
+    )
+    cfg = ShardsConfig(shards=(
+        ShardConfig(host="local", label="A", n_workers=1),
+    ))
+    queue_url, server = _start_queue_server_with_stop(progress_dir)
+    try:
+        counts = run_distributed_eval(
+            cfg, spec,
+            progress_dir=progress_dir,
+            run_id_prefix="iter_pre_stop_eval",
+            total_games=4,
+            queue_url=queue_url,
+            stop_check=lambda: True,  # already stopped at entry
+        )
+    finally:
+        server.shutdown()
+    # No shards ran → all zeros. No "all shards failed" raise either
+    # because the pre-stop short-circuit produces an empty reports
+    # list, distinct from the all-failed case.
+    assert counts == {
+        "n_games": 0, "wins_new": 0, "wins_old": 0,
+        "draws": 0, "crashed": 0,
+    }
+
+
+def test_run_distributed_self_play_stop_check_skips_dispatch_if_pre_stopped(
+    tmp_path: Path,
+):
+    """Self-play counterpart: pre-stop returns an empty npz list
+    rather than raising. iterate's caller then short-circuits at
+    its next stage boundary (which it already does today via the
+    cycle_stop_check between stages)."""
+    from mtg_bot.training.distributed import (
+        SelfPlayJobSpec, run_distributed_self_play,
+    )
+
+    weights_path, hidden_sizes = _tiny_dual_head_weights(tmp_path)
+    out_dir = tmp_path / "iterate_data"
+    progress_dir = tmp_path / "training_progress"
+    progress_dir.mkdir()
+    spec = SelfPlayJobSpec(
+        weights_path=str(weights_path),
+        samples=1, inner_nodes=10,
+        hidden_sizes=hidden_sizes,
+        base_seed=0, enable_mulligans=False,
+        per_game_timeout_sec=None,
+        with_policy=True,
+    )
+    cfg = ShardsConfig(shards=(
+        ShardConfig(host="local", label="A", n_workers=1),
+    ))
+    queue_url, server = _start_queue_server_with_stop(progress_dir)
+    try:
+        paths = run_distributed_self_play(
+            cfg, spec,
+            progress_dir=progress_dir,
+            output_dir=out_dir,
+            run_id_prefix="iter_pre_stop_sp",
+            total_games=4,
+            queue_url=queue_url,
+            stop_check=lambda: True,
+        )
+    finally:
+        server.shutdown()
+    assert paths == []
+
+
+def test_run_distributed_eval_stop_check_fires_mid_run_drains_partial(
+    tmp_path: Path,
+):
+    """Mid-run stop: orchestrator dispatches shards; after the first
+    couple of games the operator drops the sentinel; the queue server
+    starts returning ``closed=True`` on subsequent /queue/take calls;
+    shards drain at their next take and exit. Returned counts reflect
+    what completed before the stop — strictly less than total_games."""
+    from mtg_bot.training.distributed import (
+        EvalJobSpec, run_distributed_eval,
+    )
+    from mtg_bot.training.stop_signal import write_stop
+
+    weights_path, hidden_sizes = _tiny_dual_head_weights(tmp_path)
+    progress_dir = tmp_path / "training_progress"
+    progress_dir.mkdir()
+    spec = EvalJobSpec(
+        new_weights_path=str(weights_path),
+        old_weights_path=str(weights_path),
+        samples=1, inner_nodes=10,
+        hidden_sizes=hidden_sizes,
+        base_seed=0, enable_mulligans=False,
+        per_game_timeout_sec=None,
+        opponent_label="self",
+    )
+    cfg = ShardsConfig(shards=(
+        ShardConfig(host="local", label="A", n_workers=1),
+    ))
+    queue_url, server = _start_queue_server_with_stop(progress_dir)
+    run_id = "iter_mid_stop_eval"
+
+    # Stop_check goes True after ~50ms — just enough for the shard
+    # to start, take its first game(s), and then see the drain on
+    # subsequent /queue/take calls.
+    stop_at = time.monotonic() + 0.2
+
+    def stop_check():
+        if time.monotonic() >= stop_at:
+            # Drop the actual sentinel so the queue server's
+            # /queue/take starts returning closed=True. The
+            # _StopCheckPoller will also POST /queue/close/<id> on
+            # its next tick — both paths converge on the same drain.
+            write_stop(progress_dir, run_id)
+            return True
+        return False
+
+    try:
+        counts = run_distributed_eval(
+            cfg, spec,
+            progress_dir=progress_dir,
+            run_id_prefix=run_id,
+            total_games=20,  # large enough that mid-run stop matters
+            queue_url=queue_url,
+            stop_check=stop_check,
+        )
+    finally:
+        server.shutdown()
+
+    # Count contract: aggregator returns whatever completed.
+    # Strictly less than total because the stop fires mid-flight;
+    # at least 0 because the shard might have stopped before
+    # finishing its first game.
+    total = (
+        counts["wins_new"] + counts["wins_old"]
+        + counts["draws"] + counts["crashed"]
+    )
+    assert total == counts["n_games"]
+    assert 0 <= counts["n_games"] < 20
+    # The orchestrator did NOT raise — stop_check is a clean
+    # exit, not a failure.
+
+
+def test_run_distributed_self_play_stop_check_fires_mid_run_returns_partial(
+    tmp_path: Path,
+):
+    """Self-play mid-run stop: orchestrator returns whatever npzs
+    landed before the drain. iterate's training step then trains on
+    that partial mix (which is fine — it would have done the same on
+    a watcher-driven natural stop)."""
+    from mtg_bot.training.distributed import (
+        SelfPlayJobSpec, run_distributed_self_play,
+    )
+    from mtg_bot.training.stop_signal import write_stop
+
+    weights_path, hidden_sizes = _tiny_dual_head_weights(tmp_path)
+    out_dir = tmp_path / "iterate_data"
+    progress_dir = tmp_path / "training_progress"
+    progress_dir.mkdir()
+    spec = SelfPlayJobSpec(
+        weights_path=str(weights_path),
+        samples=1, inner_nodes=10,
+        hidden_sizes=hidden_sizes,
+        base_seed=0, enable_mulligans=False,
+        per_game_timeout_sec=None,
+        with_policy=True,
+    )
+    cfg = ShardsConfig(shards=(
+        ShardConfig(host="local", label="A", n_workers=1),
+    ))
+    queue_url, server = _start_queue_server_with_stop(progress_dir)
+    run_id = "iter_mid_stop_sp"
+    stop_at = time.monotonic() + 0.2
+
+    def stop_check():
+        if time.monotonic() >= stop_at:
+            write_stop(progress_dir, run_id)
+            return True
+        return False
+
+    try:
+        paths = run_distributed_self_play(
+            cfg, spec,
+            progress_dir=progress_dir,
+            output_dir=out_dir,
+            run_id_prefix=run_id,
+            total_games=20,
+            queue_url=queue_url,
+            stop_check=stop_check,
+        )
+    finally:
+        server.shutdown()
+
+    # Strictly fewer npzs than total, but no crash.
+    assert 0 <= len(paths) < 20
+    for p in paths:
+        assert p.is_file()
+
+
+def test_run_distributed_eval_stop_check_none_preserves_legacy_behavior(
+    tmp_path: Path,
+):
+    """Without a stop_check, run_distributed_eval behaves exactly
+    as before — no poller spun up, runs to natural completion."""
+    from mtg_bot.training.distributed import (
+        EvalJobSpec, run_distributed_eval,
+    )
+
+    weights_path, hidden_sizes = _tiny_dual_head_weights(tmp_path)
+    progress_dir = tmp_path / "training_progress"
+    progress_dir.mkdir()
+    spec = EvalJobSpec(
+        new_weights_path=str(weights_path),
+        old_weights_path=str(weights_path),
+        samples=1, inner_nodes=10,
+        hidden_sizes=hidden_sizes,
+        base_seed=0, enable_mulligans=False,
+        per_game_timeout_sec=None,
+        opponent_label="self",
+    )
+    cfg = ShardsConfig(shards=(
+        ShardConfig(host="local", label="A", n_workers=1),
+    ))
+    queue_url, server = _start_queue_server_with_stop(progress_dir)
+    try:
+        counts = run_distributed_eval(
+            cfg, spec,
+            progress_dir=progress_dir,
+            run_id_prefix="iter_no_stop_eval",
+            total_games=4,
+            queue_url=queue_url,
+            # No stop_check — legacy default.
+        )
+    finally:
+        server.shutdown()
+    assert counts["n_games"] == 4
+
+
 # ---- EventLog + helpers ----------------------------------------
 
 
