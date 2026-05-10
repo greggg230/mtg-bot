@@ -85,6 +85,7 @@ from mtg_bot.training import (
 )
 from mtg_bot.training._iterate_helpers import (
     find_foreign_npzs,
+    refresh_shards_config_for_iter,
 )
 from mtg_bot.training.data_gen import ReplayCaptureConfig
 from mtg_bot.training.distributed import (
@@ -1578,6 +1579,20 @@ def main(argv=None) -> None:  # pragma: no cover
         if user_stopped:
             break
         n_done = state["iterations_completed"]
+        # Phase 1 dynamic worker scaling: re-read shards_config.json
+        # from disk at the top of each iter cycle so changes made via
+        # the training UI's POST /api/shards/<host>/workers between
+        # iters take effect on the upcoming pool init. The CURRENTLY
+        # RUNNING iter's pool is not resized — that's Phase 2 and
+        # requires switching from multiprocessing.Pool to a
+        # queue + spawn/kill worker pattern. The refresh helper logs
+        # a one-line summary so the operator can confirm in the iter
+        # log whether their UI bump took effect at this boundary.
+        shards_cfg = refresh_shards_config_for_iter(
+            config_path=args.shards_config,
+            previous=shards_cfg,
+            iter_label=f"iter_{n_done + 1:03d}",
+        )
         cycle_seed = args.seed + 1_000_000 * (n_done + 1)
         best_version = state["current_best"]
         best_weights = registry.weights_path(best_version)
