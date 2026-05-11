@@ -303,5 +303,6 @@ pub fn make_state(
         attackers: Vec::new(),
         blockers: Vec::new(),
         stack: Vec::new(),
+        consecutive_passes: 0,
     })
 }

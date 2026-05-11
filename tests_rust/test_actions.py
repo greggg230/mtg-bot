@@ -32,20 +32,41 @@ import pytest
 def test_apply_action_pass_priority_toggles_priority(synthetic_state):
     """``apply_action({"kind": "pass_priority"})`` routes to the
     existing ``pass_priority()`` primitive — priority flips from
-    active player (0) to the other player (1)."""
+    active player (0) to the other player (1). A SINGLE pass does NOT
+    fire the CR 117.4 step-advance (closes G3 at the action layer;
+    see pass-priority-step-advance slice): the consecutive-passes
+    counter is 1 after one pass, and step-advance fires only when
+    both players have passed in succession with an empty stack."""
     assert synthetic_state.get_priority_player() == 0
+    starting_phase = synthetic_state.current_phase()
     synthetic_state.apply_action({"kind": "pass_priority"})
     assert synthetic_state.get_priority_player() == 1
+    # Single pass: counter == 1, no step advance.
+    assert synthetic_state.current_phase() == starting_phase
 
 
-def test_apply_action_pass_priority_twice_returns_to_original(synthetic_state):
-    """The pass-priority dispatch is involutive — two applies return
-    to the starting priority player. Locks in that the dispatch
-    routes to the toggle primitive (not the give-priority-to
-    primitive with a fixed argument)."""
+def test_apply_action_pass_priority_twice_advances_step(synthetic_state):
+    """G3 close-out (pass-priority-step-advance slice): two
+    apply_action pass_priority calls with an empty stack fire CR
+    117.4 — the current step ends and the engine advances to the
+    next step via ``advance_phase()``. Priority returns to player 0
+    after the toggle (1→0); the new phase is UPKEEP (UNTAP→UPKEEP).
+    Replaces the pre-slice "two applies return to the starting
+    priority player" pin, which described the pure-toggle behavior
+    that blocked the parity_smoke harness from ever reaching MAIN1.
+
+    (The bare ``state.pass_priority()`` primitive in
+    ``state_ops_priority.rs`` is unchanged — it remains a pure
+    toggle that doesn't consult the stack or the phase. The CR 117.4
+    composition is wired in apply_action; ``test_priority.py``'s
+    primitive-shape pins still pass against the bare method.)"""
+    starting_phase = synthetic_state.current_phase()
     synthetic_state.apply_action({"kind": "pass_priority"})
     synthetic_state.apply_action({"kind": "pass_priority"})
+    # Priority is back to active player after the second toggle.
     assert synthetic_state.get_priority_player() == 0
+    # Step advanced one tick.
+    assert synthetic_state.current_phase() == starting_phase + 1
 
 
 def test_apply_action_returns_none(synthetic_state):
@@ -97,6 +118,117 @@ def test_apply_action_on_clone_does_not_affect_original(synthetic_state):
     cloned.apply_action({"kind": "pass_priority"})
     assert cloned.get_priority_player() == 1
     assert synthetic_state.get_priority_player() == 0
+
+
+# --- G3: CR 117.4 step-advance composition on PassPriority ----------
+#
+# pass-priority-step-advance slice. Closes RUST_PARITY_GAPS.md G3 at
+# the apply_action layer: the bare ``pass_priority()`` primitive is
+# still a pure toggle (test_priority.py pins that), but
+# ``apply_action({"kind": "pass_priority"})`` now wraps the toggle
+# with the CR 117.4 step-advance composition — when both players
+# pass priority in succession with an empty stack, the engine
+# advances to the next step. Implementation lives in
+# ``state_ops_actions.rs`` and uses a ``consecutive_passes`` counter
+# on ``GameState``.
+
+
+def test_apply_action_pass_priority_with_nonempty_stack_does_not_advance(
+    synthetic_state,
+):
+    """G3 close-out, stack-aware leg: when the stack is non-empty
+    (e.g. a spell or ability is waiting to resolve), two consecutive
+    passes do NOT fire ``advance_phase``. This slice scopes the
+    composition to the empty-stack/step-advance branch of CR 117.4;
+    the stack-resolution branch is still reached via the explicit
+    ``complete_priority_round()`` primitive. Pins that the dispatcher
+    consults ``state.stack`` before firing the step-advance — a
+    regression that ignored the stack would silently lose the in-
+    flight stack item by advancing past it."""
+    synthetic_state.push_to_stack(42, 0)
+    assert synthetic_state.stack_size() == 1
+    starting_phase = synthetic_state.current_phase()
+    synthetic_state.apply_action({"kind": "pass_priority"})
+    synthetic_state.apply_action({"kind": "pass_priority"})
+    # No step advance with a non-empty stack.
+    assert synthetic_state.current_phase() == starting_phase
+    # Stack item still pending — neither pass resolved it.
+    assert synthetic_state.stack_size() == 1
+    # Priority sequence is the pure-toggle 0→1→0.
+    assert synthetic_state.get_priority_player() == 0
+
+
+def test_apply_action_pass_priority_then_play_land_then_pass_does_not_advance(
+    synthetic_state,
+):
+    """G3 close-out, "intervening action resets the chain" leg: a
+    non-pass action between two passes breaks the consecutive-pass
+    chain. Pin: pass → play_land → pass leaves the phase unchanged
+    (only one pass counts toward the round-completion counter after
+    the play_land reset). A future slice may extend the
+    ``legal_decisions`` enumerator to model this same chain-break;
+    the dispatcher's behavior matters first.
+
+    This pins that ``consecutive_passes`` is RESET (not just
+    "incremented elsewhere") when a non-pass arm fires — a regression
+    that only incremented on pass arms would still allow a
+    "pass, play_land, pass" sequence to advance the step on the
+    second pass."""
+    forest_id = _move_forest_into_hand(synthetic_state, 0)
+    starting_phase = synthetic_state.current_phase()
+    synthetic_state.apply_action({"kind": "pass_priority"})
+    # play_land also flips priority (no — play_land doesn't touch
+    # priority; G4 still open). But it MUST reset consecutive_passes.
+    synthetic_state.apply_action({"kind": "play_land", "card_id": forest_id})
+    # One pass after the reset — counter == 1, no advance.
+    synthetic_state.apply_action({"kind": "pass_priority"})
+    assert synthetic_state.current_phase() == starting_phase
+
+
+def test_apply_action_pass_priority_four_passes_advance_two_steps(synthetic_state):
+    """G3 close-out, multi-step ladder: four consecutive passes walk
+    the phase ladder by two ticks (UNTAP → UPKEEP after passes 1-2,
+    UPKEEP → DRAW after passes 3-4). Locks in that the counter resets
+    to 0 after each step-advance, so the next pair fires the next
+    advance. Mirrors the production parity-smoke trajectory: the
+    harness emits long pass-priority runs to walk past the pre-main
+    steps and reach MAIN1 where actual decisions exist."""
+    starting_phase = synthetic_state.current_phase()
+    for _ in range(4):
+        synthetic_state.apply_action({"kind": "pass_priority"})
+    assert synthetic_state.current_phase() == starting_phase + 2
+    # Priority is back to active player after each pair of toggles.
+    assert synthetic_state.get_priority_player() == 0
+
+
+def test_apply_action_pass_priority_round_trip_through_untap_fires_untap_sweep(
+    synthetic_state,
+):
+    """G3 close-out, untap-sweep canary: walking via apply_action
+    pass-priority pairs all the way around the phase ladder lands
+    back on UNTAP for the OTHER player — and the cross-slice
+    composition with ``state_ops_steps.rs`` fires the untap sweep on
+    the new active player's permanents. Pins that the action-layer
+    step-advance reaches the same downstream effects as a direct
+    ``advance_phase()`` call (i.e. apply_action is a SUPER-set, not a
+    SUB-set, of the bare primitive's effects).
+
+    The synthetic seed seeds P1's battlefield with untapped
+    permanents (Forest + Grizzly Bears at ids 67..71 / 72..76); tap
+    one before the wrap to make the sweep observable. 12 phases × 2
+    passes per phase = 24 passes to lap once and land on the next
+    turn's UNTAP."""
+    # Tap a P1 permanent so the untap sweep has something to flip.
+    p1_forest_id = 67  # base 67 is the first P1 forest
+    synthetic_state.tap_object(p1_forest_id)
+    assert synthetic_state.is_tapped(p1_forest_id) is True
+    # 24 passes = 12 step advances = full lap to next turn's UNTAP.
+    for _ in range(24):
+        synthetic_state.apply_action({"kind": "pass_priority"})
+    # Back on UNTAP, active player flipped to 1, untap sweep fired.
+    assert synthetic_state.current_phase() == 0
+    assert synthetic_state.active_player == 1
+    assert synthetic_state.is_tapped(p1_forest_id) is False
 
 
 # --- PlayLand --------------------------------------------------------

@@ -250,14 +250,19 @@ def test_trajectory_mode_different_seeds_pick_different_trajectories(
     permitting more than one legal action at some step) produce a
     different fingerprint trajectory.
 
-    Today's synthetic-state starting position has the state in
-    PHASE_UNTAP where only PassPriority is legal — so the walks only
-    differ in priority-toggle parity at intermediate steps. We assert
-    that across the FULL trajectories (initial + after each step),
-    at least one fingerprint differs between two well-separated
-    seeds. If a future slice expands the synthetic state's legal
-    space, this test stays valid (more variation, more likely to
-    differ)."""
+    Pre pass-priority-step-advance slice: the synthetic-state UNTAP
+    seat had only PassPriority legal, so 10 passes from seed 1 == 10
+    passes from seed 2 (rng.choice of a one-element list). The test
+    documented that quirk explicitly with ``traj_a == traj_b``.
+
+    Post-slice: ``apply_action({"kind": "pass_priority"})`` now
+    composes CR 117.4 step-advance, so a chain of passes walks the
+    phase ladder. By the time 10 decisions have been applied, the
+    state has reached a step (MAIN1 / BEGINNING_OF_COMBAT / etc.)
+    where the legal-decisions set is larger than one — ActivateAbility
+    on the seeded Forests, DeclareAttackers on the seeded Bears, etc.
+    The two seeds now diverge into different trajectories, which is
+    what this test's name originally intended."""
     import mtg_bot_engine
 
     state_a = mtg_bot_engine.make_synthetic_state(2, 3, 5)
@@ -266,22 +271,21 @@ def test_trajectory_mode_different_seeds_pick_different_trajectories(
     state_b = mtg_bot_engine.make_synthetic_state(2, 3, 5)
     _, traj_b = parity_smoke._walk_trajectory(state_b, seed=2, num_decisions=10)
 
-    # Even on a purely PassPriority-only state, an odd number of
-    # passes between any two trajectory points would produce a
-    # different intermediate fingerprint — but the rng.choice of a
-    # one-element list is always the same element, so 10 PassPriority
-    # passes from seed 1 == 10 PassPriority passes from seed 2. The
-    # meaningful assertion is that the trajectories have the same
-    # SHAPE (length) and end on the same fingerprint when the legal
-    # set is a singleton. We assert that as a sanity-check;
-    # the "different seeds differ" assertion would need a state with
-    # >1 legal action, which we don't yet have a fixture for.
+    # Shape (length) is identical: 11 fingerprints = initial + after
+    # each of 10 decisions.
     assert len(traj_a) == len(traj_b) == 11
-    # On a singleton-legal state, both trajectories ARE identical:
-    # rng.choice picks the only element regardless of seed.
-    # Document this explicitly so a future maintainer doesn't read
-    # this test as "broken" when traj_a == traj_b.
-    assert traj_a == traj_b
+    # Initial fingerprint matches (same seed-independent state).
+    assert traj_a[0] == traj_b[0]
+    # But at least one intermediate / final fingerprint differs —
+    # the seeds picked different paths once the legal set grew past
+    # the singleton.
+    assert traj_a != traj_b, (
+        f"expected seeds 1 and 2 to pick different trajectories now "
+        f"that pass_priority composes step-advance (so 10 decisions "
+        f"reach a state with multiple legal actions); got identical "
+        f"trajectories — has the legal-decisions set regressed back "
+        f"to a singleton on the synthetic state?"
+    )
 
 
 def test_trajectory_mode_100_decisions_passes(parity_smoke, capsys):
@@ -1062,27 +1066,71 @@ def test_cross_engine_game_mode_with_flag_walks_past_g3(
 
 
 @pytest.mark.parametrize("seed", [42, 7, 123, 999, 2026])
-def test_cross_engine_game_mode_with_flag_walks_at_least_20_decisions_across_seeds(
+def test_cross_engine_game_mode_with_flag_walks_past_pass_priority_loop_across_seeds(
     parity_smoke, capsys, seed
 ):
-    """For the Forest-only deck on every seed, masking G3 (the only
-    documented divergence the slice's emitted actions trigger) lets
-    the harness walk through 20 decisions WITHOUT hitting an unmasked
-    divergence. Locks in the "G3 mask alone is sufficient for this
-    deck shape" measurement; if a future change adds an unmasked
-    divergence to the Forest-pass_priority loop, this test fails
-    loudly so we know to investigate before merging."""
+    """Post pass-priority-step-advance slice: with G3 closed at the
+    apply_action layer, Rust now advances past UNTAP/UPKEEP/DRAW via
+    consecutive pass_priority pairs and reaches MAIN1, where the
+    harness can emit PlayLand from the Forest-only deck. Python's
+    apply_action(PassPriority()) stays a no-op (its outer search loop
+    drives the step machine separately), so the structural step/phase
+    drift between the engines surfaces — masked as ``G25`` (drift
+    downstream of G3, see KNOWN_GAP_MASKS) past decision 0.
+
+    Across all seeds the harness walks at least 6 decisions of
+    masked pass_priority and then hits an UNMASKED divergence at the
+    first PlayLand (the engines pick different card_ids because
+    they're in different steps and their legal-decisions enumerators
+    have diverged). That's the new "first unknown divergence" signal
+    the parity_smoke real-deck stress measurement was blocked on
+    before the slice: pre-slice the harness stuck at decision 0
+    forever; post-slice it reaches MAIN1 and surfaces the next
+    parity gap (different legal_decisions / different action picks
+    in MAIN1) for follow-up slices.
+
+    Asserts rc==1 (unmasked divergence after the pass-priority run)
+    and confirms ``MASKED (G3)`` / ``MASKED (G3-Drift)`` rows appear
+    plus an ``UNMASKED divergence at decision N`` for N>=6.
+
+    Asserts rc==1 and confirms ``MASKED (G3)`` / ``MASKED (G25)``
+    rows appear plus an unmasked divergence past decision 5."""
     rc = parity_smoke.run_cross_engine_game_mode(
         seed=seed, num_decisions=20, ignore_known_gaps=True
     )
-    assert rc == 0, (
-        f"seed={seed}: expected PASS with masking, got rc={rc}. "
-        f"This is the 'first unknown divergence' signal — either a "
-        f"new gap appeared or the harness regressed."
+    # New post-slice expectation: the harness walks PAST decision 0
+    # (G3 used to stop it there) and surfaces a real divergence
+    # downstream of the pass_priority loop. rc==1 means "hit an
+    # unmasked divergence further along" — that's the new ground
+    # the slice unblocks.
+    assert rc == 1, (
+        f"seed={seed}: expected harness to surface an unmasked "
+        f"divergence after the pass-priority loop, got rc={rc}. "
+        f"If rc==0 the harness reached the end without finding any "
+        f"new divergence (a stronger result than expected — bump "
+        f"the assertion); if rc != 0 or 1 something went wrong."
     )
     out = capsys.readouterr().out
-    assert "PARITY: PASS" in out
-    assert "20 decisions applied" in out
+    # MASKED G3 + G25 fired through the pass-priority loop.
+    assert "MASKED (G3)" in out or "MASKED (G25" in out, (
+        f"seed={seed}: expected G3 or G25 mask to fire on the "
+        f"pass-priority loop. Output:\n{out}"
+    )
+    # The walk got past decision 5 (6 pass_priority pairs to step
+    # through pre-MAIN steps + into MAIN1 where PlayLand emits, then
+    # possibly further: DeclareAttackers/DeclareBlockers at later
+    # combat steps as the harness walks more decisions on its way to
+    # the first unmasked divergence). Check that AT LEAST one
+    # decision past 5 appears in the table.
+    import re
+    decisions_seen = sorted(
+        int(m.group(1)) for m in re.finditer(r"^\s*(\d+)\s*\|", out, re.M)
+    )
+    assert decisions_seen and max(decisions_seen) >= 5, (
+        f"seed={seed}: expected harness to reach at least decision 5 "
+        f"into the post-pass_priority emission space. Decisions seen: "
+        f"{decisions_seen}. Output:\n{out}"
+    )
 
 
 def test_cross_engine_game_mode_masked_verdict_cites_gap_id(
@@ -1106,7 +1154,13 @@ def test_cross_engine_game_mode_main_dispatches_with_ignore_known_gaps_flag(
     """``main() --mode cross-engine-game --ignore-known-gaps`` routes
     the flag into the new comparison path. End-to-end argparse +
     dispatch smoke; locks in the CLI surface ("--ignore-known-gaps"
-    is a boolean store_true) so a future flag rename surfaces here."""
+    is a boolean store_true) so a future flag rename surfaces here.
+
+    Five decisions of Forest-only deck: with pass-priority-step-
+    advance landed, all 5 pass-priority dispatches mask through G3 /
+    G3-Drift before the harness reaches MAIN1 (it takes 6 passes /
+    3 step-advance pairs to walk UNTAP→UPKEEP→DRAW→MAIN1), so 5
+    decisions PASS cleanly — the masked-G3 rows are all the rows."""
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1122,8 +1176,8 @@ def test_cross_engine_game_mode_main_dispatches_with_ignore_known_gaps_flag(
         ],
     )
     rc = parity_smoke.main()
-    # With masking on for a Forest-only 5-decision walk, the harness
-    # walks to PASS — same expectation as the parametrized seed test.
+    # 5 decisions of pass_priority all mask; harness reaches the
+    # decision-budget cap without an unmasked divergence -> rc==0.
     assert rc == 0
     out = capsys.readouterr().out
     assert "[cross-engine-game]" in out

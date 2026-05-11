@@ -1236,17 +1236,50 @@ def _field_repr(value, max_len: int = 35) -> str:
 # order (which is gap-id order since the doc numbers them
 # monotonically).
 KNOWN_GAP_MASKS: dict[str, dict] = {
-    # G3: pass_priority is a pure toggle in Rust — flips
-    # `priority_player` without composing step-end / stack-resolution.
-    # Python's pass_priority is a no-op on the field. See
-    # docs/RUST_PARITY_GAPS.md#G3.
+    # G3: pass_priority composes CR 117.4 step-advance in Rust's
+    # apply_action layer (pass-priority-step-advance slice), while
+    # Python's apply_action(PassPriority()) is a no-op (Python drives
+    # the step machine via its outer search loop separately). Two
+    # divergence shapes fall out:
+    # 1. On the pass_priority action itself: priority_player toggles
+    #    diverge (Rust flips, Python no-ops).
+    # 2. Structural drift: once Rust composes step-advance for any
+    #    both-passed/empty-stack pair, Rust's step/phase moves ahead
+    #    of Python's. The drift persists across SUBSEQUENT actions
+    #    (PlayLand, ActivateAbility, ...) — Python's step stays where
+    #    Rust's was before the advance until Python's outer loop
+    #    pumps its own advance. So step/phase divergence with no
+    #    explicit trigger-action gate is also G3 fallout.
+    # The mask covers both: priority_player is gated on
+    # ``trigger_action_kinds=("pass_priority",)`` (only meaningful in
+    # that context), step/phase/turn/active_player drift through
+    # G3-Drift which has no trigger-action gate (the drift persists).
+    # See docs/RUST_PARITY_GAPS.md#G3.
     "G3": {
         "description": (
-            "pass_priority pure toggle — Rust flips priority_player, "
-            "Python no-ops on the field"
+            "pass_priority toggles priority_player in Rust, Python "
+            "no-ops on the field"
         ),
         "fields": ("priority_player",),
         "trigger_action_kinds": ("pass_priority",),
+    },
+    # G25: structural step/phase drift downstream of G3's CR 117.4
+    # step-advance composition. Distinct from G3 itself because the
+    # divergence persists across SUBSEQUENT (non-pass_priority)
+    # actions: once Rust composes step-advance, every later action
+    # observes Rust ahead of Python on step/phase/turn/active_player
+    # until Python's outer loop catches its own advance_phase up.
+    # No trigger-action gate — the drift is persistent. See
+    # docs/RUST_PARITY_GAPS.md#G3 for the upstream source and #G25
+    # for the drift entry itself.
+    "G25": {
+        "description": (
+            "step/phase/turn/active_player drift downstream of G3 "
+            "CR 117.4 step-advance — Rust's apply_action(pass_priority) "
+            "advances the step in the dispatcher, Python's stays put "
+            "until its outer loop pumps advance_phase separately"
+        ),
+        "fields": ("step", "phase", "turn", "active_player"),
     },
     # G14: advance_phase does NOT auto-fire draw_card on the DRAW
     # step in Rust. Python's turn machinery DOES draw. Visible as
