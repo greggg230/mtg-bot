@@ -433,10 +433,18 @@ behavior per CR / Python, parity impact, and closeable / accepted.
   the post-mulligan scry decision.
 - **Closeable**: yes — pending Paris-rule decision-callback slice.
 
-### G25. Cross-engine step/phase/turn/active_player drift downstream of G3's CR 117.4 step-advance composition
+### G25. Cross-engine step/phase/turn/active_player drift downstream of G3's CR 117.4 step-advance composition — ALIGNED at harness layer
 
-- **Pinned by**: `tests/test_parity_smoke.py::test_cross_engine_game_mode_with_flag_walks_past_pass_priority_loop_across_seeds[*]`;
-  `scripts/parity_smoke.py:KNOWN_GAP_MASKS["G25"]`.
+- **Pinned by**: `tests/test_parity_smoke.py::test_cross_engine_game_mode_with_alignment_emits_step_aligned_rows`,
+  `test_cross_engine_game_mode_no_step_aligned_row_when_no_rust_advance`,
+  `test_cross_engine_game_mode_first_unknown_index_past_pre_fix_g25_trap`,
+  `test_align_python_step_to_rust_bumps_python_when_rust_advances`,
+  `test_align_python_step_to_rust_wraps_turn_on_cleanup_advance`,
+  `test_align_python_step_to_rust_no_op_when_neither_engine_advances`,
+  `test_g25_mask_removed_from_known_gap_masks`. Shim helper lives at
+  `scripts/parity_smoke.py:_align_python_step_to_rust` /
+  `_advance_python_step_once` / `_rust_global_step_pos` /
+  `_python_global_step_pos`.
 - **Rust today**: `apply_action({"kind": "pass_priority"})` composes
   CR 117.4 step-advance via the `consecutive_passes` counter (G3,
   closed at the action layer). When both players pass with an empty
@@ -447,28 +455,45 @@ behavior per CR / Python, parity impact, and closeable / accepted.
   `STEP_ORDER` independently of the action dispatcher). So Python's
   step/phase/turn/active_player stay frozen across the same
   pass_priority dispatch.
-- **Cross-engine consequence**: once Rust has fired any
-  step-advance, every SUBSEQUENT action observes Rust ahead of
-  Python on the step ladder. The drift persists across non-
-  pass_priority actions (PlayLand, DeclareAttackers, ...) until
-  Python's outer loop catches up. The `parity_smoke.py` harness
-  masks the drift as G25 in its `cross-engine-game` mode so the
-  walk can proceed past G3 into the first real downstream
-  divergence (currently: different `legal_decisions` set between
-  the two engines because they're in different steps -> different
-  action picks -> battlefield / priority_player divergence at the
-  first MAIN1 / combat-step emission).
-- **Impact**: pre-slice — N/A (G3 prevented Rust from advancing at
-  all). Post-slice — HIGH for cross-engine parity testing, but
-  cleanly maskable (the drift is structural, not a bug). The
-  appropriate close-out path is a Python-side change: extend
-  Python's `apply_action(PassPriority())` to also compose CR 117.4
-  (or a one-time alignment pass in the harness that pumps Python's
-  step machine to match Rust's after each pass_priority pair).
-  Until then the mask lets real-deck parity testing continue.
-- **Closeable**: yes — pending a parity slice on the Python side
-  (or harness-side step-alignment shim) that mirrors Rust's action-
-  layer step-advance composition.
+- **Cross-engine consequence (pre-shim)**: once Rust fired any
+  step-advance, every SUBSEQUENT action observed Rust ahead of
+  Python on the step ladder. The drift persisted across non-
+  pass_priority actions and the field-diff harness masked it as
+  G25 to walk past — but the mask silently swallowed downstream
+  divergences too, dulling the smoke's signal.
+- **Resolution (harness-level shim)**: `parity_smoke.py`'s
+  cross-engine loop now snapshots Rust's pre-apply
+  ``turn_number * 12 + step_index`` ("global step position"),
+  applies the action on both engines, and if Rust's position
+  advanced past Python's, mirrors the same delta onto Python by
+  walking `state.step` through `STEP_ORDER` (and bumping
+  `turn_number` / rotating `active_player_idx` on the CLEANUP wrap).
+  The mirror is a pointer-set only — it does NOT fire the
+  turn-based actions (`run_untap_step`, `run_draw_step`, ...)
+  those step entries normally drive. That's deliberate: re-firing
+  them would re-introduce divergences on the SAME surfaces G14 /
+  G15 / G16 already track, and the shim's contract is "align the
+  step pointer only" so the downstream gaps stay observable.
+  Each alignment emits a `STEP_ALIGNED (+N step)` row in the trace
+  so operators see which step the shim closed. `KNOWN_GAP_MASKS`
+  no longer carries a G25 entry — alignment failures (rare; shim
+  diagnoses them with a `WARN: step-alignment shim could not reach
+  Rust's position` log) surface honestly as UNMASKED DIVERGE rows
+  instead.
+- **Impact**: HIGH for cross-engine parity testing — closed. The
+  first-unknown divergence index in the eoe-draft-style smoke is
+  unchanged at decision 6 (the real divergence at the first
+  cast_spell is downstream of step alignment, not caused by it).
+  The Forest-only seed-42 index moved from decision 0 (G3) /
+  decision 6 (post-G3-mask) to decision 18 — a real
+  `battlefield` divergence (Python lands ETB with summoning_sick
+  set, Rust lands don't), a separate gap unrelated to step
+  alignment.
+- **Closeable**: closed at the harness layer. A future engine-side
+  close-out — extending Python's `apply_action(PassPriority())` to
+  compose CR 117.4 step-advance like Rust's — would let the shim
+  retire entirely; until then the harness shim is the source of
+  truth for cross-engine step alignment.
 
 ---
 
