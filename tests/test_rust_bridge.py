@@ -310,3 +310,220 @@ def test_decklist_load_from_text_file_round_trips(tmp_path):
     snap = rust_state_to_snapshot_dict(state)
     assert len(snap["library_p0"]) == 60
     assert len(snap["library_p1"]) == 60
+
+
+# ---- gap-translator extension coverage tests ----------------------------
+#
+# These cover the second translator extension slice: Destroy / Exile /
+# Tap / Bounce / +1/+1 counter / SelfMill / TargetOpponentDiscards /
+# TargetPlayerLosesLife / CreateToken (registry-bound) + Sequence
+# unpacking. Each test exercises a previously-dirty real card going
+# clean post-extension or asserts the registry registers the new
+# effect dict shape without a parse_effect error.
+
+
+def _register_one(recipe: dict):
+    """Strip the bridge-internal marker and register the recipe in a
+    fresh Rust registry; returns ``(reg, pid)``. Surfaces any
+    parse_effect error as a test failure."""
+    recipe.pop("_unsupported_effects", None)
+    reg = mtg_bot_engine.Registry()
+    pid = reg.register_printing(recipe)
+    return reg, pid
+
+
+def test_translator_handles_destroy_target_creature_subclass_clean():
+    """Embrace Oblivion (DestroyTargetCreature with or_spacecraft=True)
+    translates to a single destroy_target effect with any_creature
+    filter. The narrower Python filter (creature-or-Spacecraft) lossily
+    falls through to any_creature — recipe registers cleanly."""
+    from mtg_bot.cards.source import get_active_source
+
+    embrace = get_active_source().get_printings()["Embrace Oblivion"]
+    recipe = python_card_to_rust_recipe(embrace)
+    assert recipe.get("_unsupported_effects") == []
+    assert len(recipe["effects"]) == 1
+    eff = recipe["effects"][0]
+    assert eff["kind"] == "destroy_target"
+    assert eff["target"] == {"kind": "any_creature"}
+    _register_one(recipe)  # parse_effect must succeed
+
+
+def test_translator_handles_exile_target_creature_clean():
+    """Gravkill (ExileTargetCreature with bare IsCreature filter)
+    translates to a single exile_target effect with any_creature
+    filter."""
+    from mtg_bot.cards.source import get_active_source
+
+    gravkill = get_active_source().get_printings()["Gravkill"]
+    recipe = python_card_to_rust_recipe(gravkill)
+    # Gravkill's spell_effect is ExileTargetCreature; the card may have
+    # other unsupported bits (e.g., warp cost) but the spell_effect
+    # itself must translate.
+    assert any(
+        e["kind"] == "exile_target" and e["target"] == {"kind": "any_creature"}
+        for e in recipe["effects"]
+    )
+    _register_one(recipe)
+
+
+def test_translator_unpacks_sequence_into_multiple_effects():
+    """Honor's spell_effect is a Sequence of PutPlusOneCounterOnTargetCreature
+    + DrawCards. The Sequence unpacker yields two top-level Rust
+    effects; neither sub-effect lands in the unsupported list."""
+    from mtg_bot.cards.source import get_active_source
+
+    honor = get_active_source().get_printings()["Honor"]
+    recipe = python_card_to_rust_recipe(honor)
+    # Both sub-effects translate cleanly.
+    assert recipe.get("_unsupported_effects") == []
+    kinds = sorted(e["kind"] for e in recipe["effects"])
+    assert kinds == ["add_counters", "draw_cards"]
+    # The add_counters effect carries the right amount / target.
+    add_eff = next(e for e in recipe["effects"] if e["kind"] == "add_counters")
+    assert add_eff["count"] == 1
+    assert add_eff["target"] == {"kind": "any_creature"}
+    # Recipe parses (no parse_effect error on the Rust side).
+    _register_one(recipe)
+
+
+def test_translator_handles_create_token_with_registrar():
+    """Honored Knight-Captain has a CreateToken ETB trigger. With a
+    token_registrar callback supplied, CreateToken translates to a
+    create_token Rust effect carrying the resolved token_printing_id.
+    Without a registrar, it stays unsupported (matches the
+    measurement-against-bare-translator path)."""
+    from mtg_bot.cards.source import get_active_source
+
+    captain = get_active_source().get_printings()["Honored Knight-Captain"]
+
+    # Without registrar: CreateToken in the unsupported list.
+    bare_recipe = python_card_to_rust_recipe(captain)
+    assert "CreateToken" in bare_recipe.get("_unsupported_effects", [])
+
+    # With registrar: CreateToken translates, recipe carries a
+    # create_token effect with a populated token_printing_id.
+    reg = mtg_bot_engine.Registry()
+    token_cache: dict[str, int] = {}
+
+    def _register_token(tp):
+        if tp.name in token_cache:
+            return token_cache[tp.name]
+        sub = python_card_to_rust_recipe(tp, token_registrar=None)
+        sub.pop("_unsupported_effects", None)
+        pid = reg.register_printing(sub)
+        token_cache[tp.name] = pid
+        return pid
+
+    rich_recipe = python_card_to_rust_recipe(
+        captain, token_registrar=_register_token,
+    )
+    assert "CreateToken" not in rich_recipe.get("_unsupported_effects", [])
+    # Captain has a single ETB trigger that creates a token.
+    etb = rich_recipe["etb_effects"]
+    assert any(e["kind"] == "create_token" for e in etb)
+    ct = next(e for e in etb if e["kind"] == "create_token")
+    assert ct["count"] == 1
+    assert ct["token_printing_id"] == token_cache["Human Soldier"]
+    # The card itself registers cleanly in the same registry.
+    rich_recipe.pop("_unsupported_effects", None)
+    pid = reg.register_printing(rich_recipe)
+    assert reg.get_printing_name(pid) == "Honored Knight-Captain"
+
+
+def test_translator_extension_reduces_dirty_count_on_full_pool():
+    """Full-EoE-pool sweep: with all gap translators wired (including
+    token_registrar threading), the count of cards whose recipe carries
+    at least one unsupported effect is strictly lower than the
+    pre-extension baseline (367/475).
+
+    Concrete check: post-extension dirty count < 350 -- gives the
+    extension headroom while still asserting the delta is real and
+    not a no-op."""
+    from mtg_bot.cards.source import get_active_source
+
+    printings = get_active_source().get_printings()
+
+    # Stand up a shared registry the way the deck-loader does, so
+    # CreateToken translators can resolve a token_printing_id.
+    reg = mtg_bot_engine.Registry()
+    token_cache: dict[str, int] = {}
+
+    def _register_token(tp):
+        if tp.name in token_cache:
+            return token_cache[tp.name]
+        sub = python_card_to_rust_recipe(tp, token_registrar=None)
+        sub.pop("_unsupported_effects", None)
+        pid = reg.register_printing(sub)
+        token_cache[tp.name] = pid
+        return pid
+
+    dirty = 0
+    for _name, printing in printings.items():
+        recipe = python_card_to_rust_recipe(
+            printing, token_registrar=_register_token,
+        )
+        if recipe.get("_unsupported_effects"):
+            dirty += 1
+
+    # Pre-extension dirty count was 367/475. Post-extension is
+    # expected to be ≤ 340 (assertion gives the extension some
+    # headroom; the headline number is in the commit message).
+    assert dirty < 350, (
+        f"expected gap-translator extension to push dirty count below 350; "
+        f"got {dirty}/{len(printings)}"
+    )
+
+
+def test_translator_real_60_card_eoe_deck_has_fewer_unsupported_than_before():
+    """A 60-card deck composed of EoE printings that previously hit
+    multiple unsupported branches (CreateToken, Sequence, Destroy,
+    Exile) loads with a measurably lower
+    ``cards_with_unsupported_effects`` than the pre-extension
+    baseline. Concrete delta: deck unique-card unsupported count is
+    strictly less than the unique-card count itself (some real cards
+    do translate fully)."""
+    # Use real EoE cards whose effects exercise the new translators.
+    # Honor (Sequence -> +1/+1 + DrawCards), Honored Knight-Captain
+    # (CreateToken ETB), Embrace Oblivion (DestroyTargetCreature),
+    # Gravkill (ExileTargetCreature).
+    deck = (
+        ["Forest"] * 20
+        + ["Mountain"] * 4
+        + ["Plains"] * 4
+        + ["Lightning Bolt"] * 4
+        + ["Honor"] * 4
+        + ["Honored Knight-Captain"] * 4
+        + ["Embrace Oblivion"] * 4
+        + ["Gravkill"] * 4
+        + ["Beyond the Quiet"] * 4  # still unsupported, verifies counter
+        + ["Llanowar Elves"] * 4
+        + ["Bears"] * 4
+    )
+    assert len(deck) == 60
+    state, stats = make_rust_state_from_python_decklist(
+        deck_card_names=deck, shuffle_seed=11,
+    )
+    snap = rust_state_to_snapshot_dict(state)
+    assert len(snap["library_p0"]) == 60
+    assert len(snap["library_p1"]) == 60
+    # 11 unique card names in the deck. Some are basics / builtins
+    # (translate cleanly), Honor / Honored Knight-Captain / Embrace
+    # Oblivion / Gravkill translate cleanly post-extension, and
+    # Beyond the Quiet remains dirty -- so at most a small portion
+    # of unique names are dirty.
+    assert stats["cards_loaded"] == 11
+    assert stats["cards_with_unsupported_effects"] <= 4, (
+        f"expected ≤4 dirty unique names after extension; got "
+        f"{stats['cards_with_unsupported_effects']} "
+        f"({stats['unsupported_effect_classes']})"
+    )
+    # Honor + Knight-Captain + Embrace Oblivion + Gravkill no longer
+    # surface their translated classes in the unsupported list.
+    unsup = set(stats["unsupported_effect_classes"])
+    assert "DestroyTargetCreature" not in unsup
+    assert "ExileTargetCreature" not in unsup
+    assert "PutPlusOneCounterOnTargetCreature" not in unsup
+    # Sequence is unpacked; only sub-effects (none in Honor's case)
+    # would land as unsupported.
+    assert "Sequence" not in unsup or unsup == set()
