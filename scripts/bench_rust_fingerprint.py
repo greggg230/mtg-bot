@@ -12,12 +12,20 @@ Run from a worktree:
     PYTHONPATH=src .venv-py313/Scripts/python.exe \\
         scripts/bench_rust_fingerprint.py
 
-Skips with a hint if ``mtg_bot_engine`` isn't installed yet (run
-``maturin develop --release -m rust/Cargo.toml``).
+Writes a CSV to ``bench_results/fingerprint_<UTC-timestamp>.csv`` with
+one row per benchmarked state size; columns: ``label``, ``bf_size``,
+``hand_size``, ``lib_size``, ``fp_us``, ``clone_us``, ``ratio``,
+``iters``. ``perf_summary.py`` reads the ``fp_us`` column as the
+fingerprint per-call cost. Skips with a hint if ``mtg_bot_engine``
+isn't installed yet (run ``maturin develop --release -m
+rust/Cargo.toml``).
 """
 
 from __future__ import annotations
 
+import csv
+import datetime as _dt
+import pathlib
 import time
 
 try:
@@ -85,9 +93,13 @@ def run_bench(n: int = DEFAULT_ITERS) -> list[dict]:
         rows.append(
             {
                 "label": label,
+                "bf_size": bf,
+                "hand_size": hand,
+                "lib_size": lib,
                 "fp_us": fp_us,
                 "clone_us": clone_us,
                 "ratio": ratio,
+                "iters": n,
             }
         )
     return rows
@@ -106,6 +118,37 @@ def print_table(rows: list[dict], n: int) -> None:
         )
 
 
+def write_csv(rows: list[dict], out_dir: pathlib.Path) -> pathlib.Path:
+    """Write rows as a CSV under ``out_dir``; return the path written.
+
+    Filename: ``fingerprint_<UTC-timestamp>.csv``. The dir is created
+    if it doesn't exist. Columns: ``label``, ``bf_size``, ``hand_size``,
+    ``lib_size``, ``fp_us``, ``clone_us``, ``ratio``, ``iters`` — one
+    row per benchmarked state size. ``perf_summary.py`` reads the
+    ``fp_us`` column as the fingerprint per-call cost; the other
+    columns mirror the sibling bench CSVs for cross-reference.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = out_dir / f"fingerprint_{stamp}.csv"
+    fieldnames = [
+        "label",
+        "bf_size",
+        "hand_size",
+        "lib_size",
+        "fp_us",
+        "clone_us",
+        "ratio",
+        "iters",
+    ]
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    return out_path
+
+
 def main() -> None:
     if mtg_bot_engine is None:
         print(
@@ -118,6 +161,12 @@ def main() -> None:
     print()
     rows = run_bench(DEFAULT_ITERS)
     print_table(rows, DEFAULT_ITERS)
+    # Default output dir is repo-relative ``bench_results/`` so the
+    # bench writes alongside the other bench artifacts in this dir.
+    out_dir = pathlib.Path(__file__).resolve().parents[1] / "bench_results"
+    csv_path = write_csv(rows, out_dir)
+    print()
+    print(f"wrote: {csv_path}")
 
 
 if __name__ == "__main__":

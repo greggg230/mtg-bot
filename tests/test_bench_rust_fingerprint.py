@@ -11,6 +11,7 @@ Skipped when ``mtg_bot_engine`` isn't installed.
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import pathlib
 import re
@@ -99,6 +100,57 @@ def test_fingerprint_is_at_least_2x_slower_than_clone_on_moderate(bench):
         f"expected fingerprint at least 2x slower than clone on a "
         f"(5, 7, 30) state, got ratio={ratio:.2f} "
         f"(fp_ns={fp_ns}, clone_ns={clone_ns})"
+    )
+
+
+def test_run_bench_writes_csv_with_distinct_sizes(bench, tmp_path):
+    """End-to-end smoke: ``run_bench`` + ``write_csv`` writes a CSV
+    under the given dir with a row per benchmarked state size, and
+    the rows cover at least 3 distinct ``(bf_size, hand_size,
+    lib_size)`` triples. Use a tiny iteration count so the test
+    stays fast — perf-quality numbers aren't the point here, well-
+    formedness is. The ``fp_us`` column is the one ``perf_summary.py``
+    reads as the fingerprint per-call cost, so verify it parses as a
+    positive float.
+    """
+    rows = bench.run_bench(n=50)
+    csv_path = bench.write_csv(rows, tmp_path)
+    assert csv_path.exists()
+    assert csv_path.parent == tmp_path
+    assert csv_path.name.startswith(
+        "fingerprint_"
+    ) and csv_path.name.endswith(".csv")
+
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        out_rows = list(reader)
+
+    # One row per benchmarked size.
+    assert len(out_rows) == len(bench.SIZES)
+    # Required columns are present and populated. ``fp_us`` is the
+    # column ``perf_summary.py`` reads; the others mirror the sibling
+    # bench CSVs for cross-reference.
+    for row in out_rows:
+        assert set(row.keys()) >= {
+            "label",
+            "bf_size",
+            "hand_size",
+            "lib_size",
+            "fp_us",
+            "clone_us",
+            "ratio",
+            "iters",
+        }
+        assert float(row["fp_us"]) > 0.0
+        assert float(row["clone_us"]) > 0.0
+        assert int(row["iters"]) == 50
+
+    distinct_triples = {
+        (row["bf_size"], row["hand_size"], row["lib_size"])
+        for row in out_rows
+    }
+    assert len(distinct_triples) >= 3, (
+        f"expected at least 3 distinct state sizes, got {distinct_triples}"
     )
 
 
