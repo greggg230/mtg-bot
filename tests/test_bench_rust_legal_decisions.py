@@ -13,6 +13,7 @@ Skipped when ``mtg_bot_engine`` isn't installed.
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import pathlib
 import sys
@@ -95,6 +96,57 @@ def test_legal_decisions_emits_at_least_one_action_at_every_size():
         assert len(actions) >= 1, (
             f"legal_decisions returned empty list at size {label}"
         )
+
+
+def test_run_bench_writes_csv_with_distinct_sizes(bench, tmp_path):
+    """End-to-end smoke: ``run_bench`` + ``write_csv`` writes a CSV
+    under the given dir with a row per benchmarked state size, and
+    the rows cover at least 3 distinct ``(bf_size, hand_size,
+    lib_size)`` triples. Use a tiny iteration count so the test
+    stays fast — perf-quality numbers aren't the point here, well-
+    formedness is. The ``us_per_call`` column is the one
+    ``perf_summary.py`` reads as the legal_decisions per-call cost,
+    so verify it parses as a positive float.
+    """
+    rows = bench.run_bench(n=50)
+    csv_path = bench.write_csv(rows, tmp_path)
+    assert csv_path.exists()
+    assert csv_path.parent == tmp_path
+    assert csv_path.name.startswith(
+        "legal_decisions_"
+    ) and csv_path.name.endswith(".csv")
+
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        out_rows = list(reader)
+
+    # One row per benchmarked size.
+    assert len(out_rows) == len(bench.SIZES)
+    # Required columns are present and populated. ``us_per_call`` is
+    # the column ``perf_summary.py`` reads; the others mirror the
+    # sibling bench CSVs for cross-reference.
+    for row in out_rows:
+        assert set(row.keys()) >= {
+            "label",
+            "bf_size",
+            "hand_size",
+            "lib_size",
+            "us_per_call",
+            "n_actions",
+            "us_per_action",
+            "iters",
+        }
+        assert float(row["us_per_call"]) > 0.0
+        assert int(row["n_actions"]) >= 1
+        assert int(row["iters"]) == 50
+
+    distinct_triples = {
+        (row["bf_size"], row["hand_size"], row["lib_size"])
+        for row in out_rows
+    }
+    assert len(distinct_triples) >= 3, (
+        f"expected at least 3 distinct state sizes, got {distinct_triples}"
+    )
 
 
 def test_legal_decisions_is_deterministic():
