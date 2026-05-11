@@ -629,3 +629,169 @@ def test_fingerprint_baselines_still_match(engine):
     small = engine.make_synthetic_state(2, 3, 5)
     assert default.fingerprint() == EXPECTED_FINGERPRINT_DEFAULT
     assert small.fingerprint() == EXPECTED_FINGERPRINT_SMALL
+
+
+# ---------------------------------------------------------------------------
+# Streaming-vs-reference parity (sanity check for the streaming optimization).
+#
+# The streaming-bytes optimization (commit landing this test) replaced the
+# original ``serde_json::Value`` tree build + ``serialize_python_compatible``
+# walker with a direct emit-into-Sha1::update path. The pinned baselines above
+# already guard byte-equality with the original impl, but they only assert
+# the truncated 12-char hex of the SHA1 digest — a divergence in a single
+# JSON byte would almost-always shift those digests, but in principle a
+# pair of compensating divergences in two bytes could land back on the
+# same digest. These tests close that gap by hashing the FULL streamed
+# blob via a Python-side reference path and asserting equality on the
+# 20-byte digest (and the blob bytes themselves), so any divergence in
+# the emitted bytes surfaces immediately.
+#
+# The Rust pymethod ``_fingerprint_blob`` returns the exact bytes the
+# streamer would feed to SHA1. We compare against the same blob shape
+# rebuilt from snapshot getters + Python's json.dumps, using the same
+# separators (``", "`` / ``": "``) and the same per-object 8-tuple
+# layout the streamer emits.
+# ---------------------------------------------------------------------------
+
+
+def _reference_blob_for_synthetic(state) -> bytes:
+    """Build a reference JSON blob that mirrors the streaming emitter
+    byte-for-byte for the synthetic-state shape (no stack items, no
+    non-ASCII names).
+
+    Uses ``json.dumps`` with the same ``(", ", ": ")`` separators the
+    Rust side emits. For the per-object 8-tuple and per-player 8-tuple
+    we mirror the field order from
+    ``rust/src/state_ops_fingerprint.rs:emit_object_signature`` /
+    ``emit_player_signature``.
+
+    Cross-references the snapshot getters for printing names + per-object
+    fields, so this is a from-scratch reconstruction that doesn't depend
+    on any internal Rust helper beyond the public snapshot APIs.
+    """
+    import json
+
+    def phase_step_name(phase: int) -> str | None:
+        return [
+            "UNTAP",
+            "UPKEEP",
+            "DRAW",
+            "PRECOMBAT_MAIN",
+            "BEGINNING_OF_COMBAT",
+            "DECLARE_ATTACKERS",
+            "DECLARE_BLOCKERS",
+            "COMBAT_DAMAGE",
+            "END_OF_COMBAT",
+            "POSTCOMBAT_MAIN",
+            "END",
+            "CLEANUP",
+        ][phase] if 0 <= phase < 12 else None
+
+    def obj_8tuple(snap: dict) -> list:
+        # Mirror of emit_object_signature: (name | None, int(tapped),
+        # int(summoning_sick), damage, counters, null, controller_id, id).
+        return [
+            snap.get("printing_name"),
+            int(bool(snap.get("tapped", False))),
+            int(bool(snap.get("summoning_sick", False))),
+            int(snap.get("damage", 0)),
+            int(snap.get("counters", 0)),
+            None,
+            int(snap.get("controller_id", 0)),
+            int(snap["id"]),
+        ]
+
+    def zone_sig(snaps: list[dict]) -> list:
+        return [obj_8tuple(s) for s in snaps]
+
+    def player_sig(idx: int) -> list:
+        pool = state.mana_pool_snapshot(idx)
+        life = state.life_totals[idx]
+        return [
+            idx,
+            life,
+            life <= 0,
+            zone_sig(state.hand_snapshot(idx)),
+            zone_sig(state.library_snapshot(idx)),
+            zone_sig(state.graveyard_snapshot(idx)),
+            zone_sig(state.exile_snapshot(idx)),
+            # Mana pool: fixed lex-sorted [["B", b], ["C", c], ...]
+            [[k, int(pool.get(k, 0))] for k in ("B", "C", "G", "R", "U", "W")],
+        ]
+
+    lives = state.life_totals
+    p0_lost = lives[0] <= 0
+    p1_lost = lives[1] <= 0
+    is_over = p0_lost or p1_lost
+    is_draw = p0_lost and p1_lost
+    if (not p0_lost) and p1_lost:
+        winner = 0
+    elif p0_lost and (not p1_lost):
+        winner = 1
+    else:
+        winner = None
+
+    # Battlefield: p0's then p1's (snapshot returns the chained list).
+    bf = state.battlefield_snapshot()
+    bf_sig = [obj_8tuple(s) for s in bf]
+
+    parts = [
+        int(state.turn_number),
+        phase_step_name(int(state.current_phase())),
+        int(state.active_player),
+        int(state.priority_player_idx),
+        is_over,
+        is_draw,
+        winner,
+        player_sig(0),
+        player_sig(1),
+        bf_sig,
+        [],  # stack: synthetic states start with empty stack
+    ]
+    return json.dumps(parts, separators=(", ", ": ")).encode("utf-8")
+
+
+def test_fingerprint_streaming_matches_reference_blob_default(synthetic_state):
+    """The streamer's emitted bytes for the default synthetic state
+    exactly equal a from-scratch Python reconstruction using
+    ``json.dumps`` with matching separators. This is a belt-and-braces
+    guard on top of the truncated-hash baselines — if any byte of the
+    JSON blob drifts (a missing space, a wrong escape, a flipped field
+    order), this assertion catches it before the 6-byte SHA1 prefix
+    could mask the divergence."""
+    blob = synthetic_state._fingerprint_blob()
+    ref = _reference_blob_for_synthetic(synthetic_state)
+    assert blob == ref, (
+        f"streaming blob diverged from reference\n"
+        f"  streaming: {blob[:200]!r}\n"
+        f"  reference: {ref[:200]!r}"
+    )
+
+
+def test_fingerprint_streaming_matches_reference_blob_small(engine):
+    """Same parity sanity check on the smaller (2, 3, 5) synthetic
+    state. Covers a different zone-size shape so any byte-divergence
+    that's specific to a particular zone size — e.g. a forgotten
+    separator on the last element of a multi-item array — surfaces
+    here instead of staying hidden in the (10, 7, 50) default."""
+    state = engine.make_synthetic_state(2, 3, 5)
+    blob = state._fingerprint_blob()
+    ref = _reference_blob_for_synthetic(state)
+    assert blob == ref, (
+        f"streaming blob diverged from reference\n"
+        f"  streaming: {blob[:200]!r}\n"
+        f"  reference: {ref[:200]!r}"
+    )
+
+
+def test_fingerprint_streaming_blob_full_sha1_matches_digest(synthetic_state):
+    """The streamer's emitted bytes, hashed end-to-end with SHA1 and
+    truncated to 12 hex chars, must equal ``fingerprint()``. This is
+    a direct correctness check: it proves the fingerprint method's
+    digest IS the SHA1 of the streamed blob (not a divergent
+    side-channel)."""
+    import hashlib
+
+    blob = synthetic_state._fingerprint_blob()
+    expected = hashlib.sha1(blob).hexdigest()[:12]
+    assert synthetic_state.fingerprint() == expected
