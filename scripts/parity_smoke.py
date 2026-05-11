@@ -1413,23 +1413,104 @@ _FOREST_RUST_DICT = {
 }
 
 
-def _build_python_state_for_cross_engine(seed: int, deck_size: int = 30):
-    """Build a Python ``GameState`` with Forest-only decks for both seats.
+# ---------- real-deck presets for the cross-engine-game stress mode ------
+#
+# The Forest-only default deck produces only one legal action per
+# decision (pass_priority), so the harness walks cleanly for 10k+ steps
+# without ever exercising non-trivial action variety. Real-deck presets
+# below mix basics with EoE printings present in the active Python
+# card source — `setup_game` will accept them and the Rust bridge can
+# translate the printings via `python_card_to_rust_recipe`. The point
+# is action-variety surface, not deckbuilding correctness; these are
+# stress fixtures, not playable archetypes.
+#
+# All preset card names MUST be in the OracleParserCardSource's
+# printings dict (i.e. one of the EoE / stellar_sights / special_guests
+# / duskmourn datasets), otherwise `setup_game` raises and the harness
+# can't build the Python side.
+_DECK_PRESETS: dict[str, list[str]] = {
+    # 40-card sealed-style mono-green deck: 17 Forests + EoE green
+    # creatures + a couple of spells. Picked so every name is in the
+    # Python card source (basics + EoE) and the bridge can translate
+    # the recipes via python_card_to_rust_recipe.
+    "eoe-draft-style": (
+        ["Forest"] * 17
+        + ["Anticausal Vestige"] * 4
+        + ["Beyond the Quiet"] * 4
+        + ["Dual-Sun Technique"] * 4
+        + ["Honor"] * 4
+        + ["Mountain"] * 3
+        + ["Plains"] * 2
+        + ["Island"] * 1
+        + ["Swamp"] * 1
+    ),
+    # Tiny preset used by tests — just basics + a handful of EoE
+    # cards. 24 cards, all definitely-present in the active source.
+    "tiny-mixed": (
+        ["Forest"] * 8
+        + ["Mountain"] * 4
+        + ["Plains"] * 4
+        + ["Beyond the Quiet"] * 4
+        + ["Anticausal Vestige"] * 4
+    ),
+}
+
+
+def _resolve_deck_preset(name: str) -> list[str]:
+    """Return a copy of the deck-name list for the named preset.
+    Raises KeyError with a helpful message if the preset isn't known."""
+    if name not in _DECK_PRESETS:
+        raise KeyError(
+            f"unknown deck preset {name!r}; known presets: "
+            f"{sorted(_DECK_PRESETS)}"
+        )
+    return list(_DECK_PRESETS[name])
+
+
+def _load_deck_path_for_cross_engine(path) -> list[str]:
+    """Read a deck file from disk as a flat list of card names.
+
+    Delegates to ``rust_bridge._load_python_decklist`` (same parser the
+    Rust-side path uses) so the file format stays consistent across the
+    two callers. Supports both the simple text format (one card per
+    line, with optional ``<count> <name>`` prefix and ``#`` comments)
+    and JSON shapes the bridge already knows.
+    """
+    from mtg_bot.rust_bridge import _load_python_decklist
+    return _load_python_decklist(path)
+
+
+def _build_python_state_for_cross_engine(
+    seed: int,
+    deck_size: int = 30,
+    *,
+    deck_card_names: list[str] | None = None,
+):
+    """Build a Python ``GameState`` for the cross-engine harness.
 
     Calls ``simulate.setup_game`` which shuffles + deals 7 to each
-    player (the production setup path). Forest is the only card so
-    every hand and library entry is Forest, which makes the
-    Python-vs-Rust deck-content mapping trivial: every card maps to
-    the single Forest printing-id on the Rust side.
+    player (the production setup path).
 
-    ``deck_size`` defaults to 30 — large enough to draw 7 + a few
-    extra without decking out in a short walk, small enough to keep
-    the snapshot loops fast.
+    Default behavior (``deck_card_names is None``): both seats run a
+    Forest-only deck of ``deck_size`` cards. Every name maps to the
+    single Forest printing on the Rust side — the original
+    cross-engine slice's deck shape.
+
+    Override with ``deck_card_names``: both seats run the supplied
+    decklist (each seat gets its OWN materialized copy of the cards;
+    no aliasing between seats). Every name must be in the active
+    Python card source — ``setup_game`` raises otherwise. Used by
+    the real-deck stress mode to surface non-trivial action variety
+    (cast spells, play multi-color lands, ...).
     """
     from mtg_bot.simulate import setup_game
     from mtg_bot.agents import RandomAgent
 
-    decks = [["Forest"] * deck_size, ["Forest"] * deck_size]
+    if deck_card_names is None:
+        deck = ["Forest"] * deck_size
+    else:
+        deck = list(deck_card_names)
+    decks = [list(deck), list(deck)]
     state = setup_game(
         agents=[RandomAgent(), RandomAgent()],
         decks=decks,
@@ -1441,35 +1522,70 @@ def _build_python_state_for_cross_engine(seed: int, deck_size: int = 30):
 def _build_rust_state_for_cross_engine(python_state):
     """Build a Rust ``GameState`` whose zone contents byte-match
     ``python_state``'s. Walks Python's per-player library + hand in
-    order and emits the matching Forest-printing-id list on the Rust
-    side. ``shuffle_seed=None`` because the Python setup already
-    permuted the library — we want byte-equal zone order, not
-    independently-shuffled order.
+    order and emits the matching printing-id list on the Rust side.
+    ``shuffle_seed=None`` because the Python setup already permuted
+    the library — we want byte-equal zone order, not independently-
+    shuffled order.
 
-    Only Forest is registered on the Rust side; if a non-Forest card
-    sneaks into the Python state's zones (won't happen for the
-    Forest-only deck shape but the assertion guards against future
-    callers passing a richer deck), the function raises so the
-    asymmetry surfaces immediately instead of a silent printing-id
-    map miss.
+    For the default Forest-only deck shape, only Forest is registered.
+    For richer real-deck shapes, every UNIQUE card name in Python's
+    zones is translated to a Rust recipe via
+    ``rust_bridge.python_card_to_rust_recipe`` (or a builtin
+    fallback for Forest) and registered exactly once. The result is
+    a Rust state whose per-zone printing-id list mirrors Python's
+    per-zone card-name list position-for-position — which is the
+    invariant the cross-engine position-based card-id translator
+    (``_translate_rust_card_id``) needs to hold.
+
+    Unsupported-effect classes on real-deck cards (``Beyond the
+    Quiet``'s ``ExileAllCreaturesAndSpacecraft``, etc.) are stripped
+    via the ``_unsupported_effects`` marker key per the bridge's
+    contract — Rust resolves those spells to no-ops, which is itself
+    a real divergence the smoke is here to measure.
+
+    Raises ``ValueError`` if a card name in a Python zone can't be
+    translated by the bridge AND isn't in the builtin recipe table.
+    Old callers passing Forest-only decks still hit the simple
+    Forest-builtin path; the change is additive.
     """
     import mtg_bot_engine
+    from mtg_bot.rust_bridge import (
+        python_card_to_rust_recipe,
+        get_builtin_card_recipe,
+    )
 
     reg = mtg_bot_engine.Registry()
-    forest_pid = reg.register_printing(_FOREST_RUST_DICT)
-    name_to_pid = {"Forest": forest_pid}
+    name_to_pid: dict[str, int] = {}
+
+    def _ensure_pid(printing) -> int:
+        name = printing.name
+        if name in name_to_pid:
+            return name_to_pid[name]
+        if name == "Forest":
+            # Fast-path the Forest-only deck shape — preserves the
+            # legacy minimal recipe so the existing measurement
+            # baselines (G3 at decision 0, etc.) don't drift.
+            recipe = dict(_FOREST_RUST_DICT)
+        else:
+            try:
+                recipe = python_card_to_rust_recipe(printing)
+                recipe.pop("_unsupported_effects", None)
+            except Exception:
+                # Fall back to the builtin table — covers basics that
+                # might not be in the Python source on some test paths.
+                try:
+                    recipe = get_builtin_card_recipe(name)
+                except KeyError as e:
+                    raise ValueError(
+                        f"cross-engine bridge: cannot translate card "
+                        f"{name!r} (not bridgeable + not a builtin)"
+                    ) from e
+        pid = reg.register_printing(recipe)
+        name_to_pid[name] = pid
+        return pid
 
     def to_pids(zone):
-        out = []
-        for obj in zone:
-            name = obj.printing.name
-            if name not in name_to_pid:
-                raise ValueError(
-                    f"cross-engine bridge: unsupported card {name!r} in "
-                    f"Python zone (only Forest is bridged in this slice)"
-                )
-            out.append(name_to_pid[name])
-        return out
+        return [_ensure_pid(obj.printing) for obj in zone]
 
     p0_lib = to_pids(python_state.players[0].library)
     p0_hand = to_pids(python_state.players[0].hand)
@@ -2001,14 +2117,27 @@ def _first_diverging_field(rust_view: dict, python_view: dict) -> str | None:
     return None
 
 
-def _print_cross_engine_header(seed: int, num_decisions: int, deck_size: int) -> None:
+def _print_cross_engine_header(
+    seed: int,
+    num_decisions: int,
+    deck_size: int,
+    *,
+    deck_label: str | None = None,
+) -> None:
     """Print the header line + table column headers for the per-step
     table. Factored out so tests can match exact column names without
     being coupled to the data-row format.
+
+    ``deck_label`` overrides the default "Forest x N per seat" string
+    when the harness is running a real-deck preset/file; format is
+    free-form, but typically something like "eoe-draft-style (40 cards,
+    8 unique, 4 unsupported)".
     """
+    if deck_label is None:
+        deck_label = f"Forest x {deck_size} per seat"
     print(
         f"[cross-engine-game] seed={seed}, num_decisions={num_decisions}, "
-        f"deck=Forest x {deck_size} per seat"
+        f"deck={deck_label}"
     )
     print()
     print(
@@ -2030,11 +2159,204 @@ def _print_cross_engine_row(row: CrossEngineStep) -> None:
     )
 
 
+def _print_cross_engine_summary(
+    *,
+    rows: list,
+    action_kind_counts: dict,
+    legal_kind_counts: dict,
+    walk_elapsed: float,
+) -> None:
+    """Print the post-walk summary block: action-kind distribution
+    (chosen + legal), step count, and per-decision wall time.
+
+    Pulled into its own helper so the real-deck stress measurement
+    has a single canonical rendering — tests pin the labels here
+    once and the divergence / pass / STOP paths can all reuse it.
+    """
+    n = max(1, len(rows))
+    chosen_render = (
+        ", ".join(f"{k}={v}" for k, v in sorted(action_kind_counts.items()))
+        or "(none)"
+    )
+    legal_render = (
+        ", ".join(f"{k}={v}" for k, v in sorted(legal_kind_counts.items()))
+        or "(none)"
+    )
+    distinct_chosen = len(action_kind_counts)
+    print()
+    print(
+        f"[cross-engine-game] summary: {len(rows)} decisions in "
+        f"{walk_elapsed:.3f}s ({(walk_elapsed / n) * 1000.0:.2f} ms/decision)"
+    )
+    print(
+        f"[cross-engine-game] action kinds chosen "
+        f"({distinct_chosen} distinct): {chosen_render}"
+    )
+    print(
+        f"[cross-engine-game] legal-action kinds seen: {legal_render}"
+    )
+
+
+def _run_cross_engine_rust_only(
+    *,
+    seed: int,
+    num_decisions: int,
+    deck_card_names: list | None,
+    deck_size: int,
+    deck_label_suffix: str,
+) -> int:
+    """Rust-only fallback for the cross-engine-game mode.
+
+    Builds a Rust state from the supplied decklist (or a Forest-only
+    default if ``deck_card_names is None``), walks ``num_decisions``
+    decisions, then clones-and-replays to check trajectory determinism.
+    Skips the Python side entirely — used when the Python card source
+    doesn't carry one of the deck-file's card names so ``setup_game``
+    would raise (the legacy synthetic-builtins like "Lightning Bolt"
+    only live in the Rust bridge's builtin recipe table).
+
+    Returns 0 on PASS (clone-replay matched), 1 on a determinism
+    divergence, 2 on a setup-time error. Renders the same action-
+    kind summary the full-walk path does so the operator sees
+    chosen/legal kinds regardless of which fallback fired.
+    """
+    import time
+    import mtg_bot_engine
+    from mtg_bot.rust_bridge import make_rust_state_from_python_decklist
+
+    # Build the Rust state. For Forest-only fallback, the simpler
+    # `_FOREST_RUST_DICT` path skips the python-source lookup; for
+    # real decks the bridge does the heavy lifting.
+    try:
+        if deck_card_names is None:
+            reg = mtg_bot_engine.Registry()
+            forest_pid = reg.register_printing(_FOREST_RUST_DICT)
+            lib = [forest_pid] * deck_size
+            state = mtg_bot_engine.make_state(
+                reg, list(lib), list(lib), shuffle_seed=seed,
+            )
+            unique = ["Forest"]
+            stats_unsup = 0
+        else:
+            state, stats = make_rust_state_from_python_decklist(
+                deck_card_names=deck_card_names,
+                shuffle_seed=seed,
+            )
+            unique = sorted({n for n in deck_card_names})
+            stats_unsup = stats.get("cards_with_unsupported_effects", 0)
+    except Exception as e:
+        print(
+            f"[cross-engine-game] ERROR: rust-only setup raised "
+            f"{type(e).__name__}: {e}"
+        )
+        return 2
+
+    deck_label = deck_label_suffix or f"Forest x {deck_size} per seat"
+    if deck_card_names is not None:
+        deck_label += (
+            f" ({len(deck_card_names)} cards, {len(unique)} unique, "
+            f"{stats_unsup} cards with unsupported effects)"
+        )
+
+    print(
+        f"[cross-engine-game] [rust-only] seed={seed}, "
+        f"num_decisions={num_decisions}, deck={deck_label}"
+    )
+
+    # Clone BEFORE any mutation so the clone is byte-identical to the
+    # starting state — mirrors run_trajectory_mode's check.
+    clone = state.clone_once()
+
+    rng = random.Random(seed)
+    action_kind_counts: dict[str, int] = {}
+    legal_kind_counts: dict[str, int] = {}
+    decisions_applied: list[dict] = []
+    trajectory: list[str] = [state.fingerprint()]
+    walk_start = time.perf_counter()
+
+    for step in range(num_decisions):
+        legal = state.legal_decisions(state.get_priority_player())
+        if not legal:
+            print(
+                f"[cross-engine-game] [rust-only] STOP at step {step}: "
+                f"legal_decisions empty (contract violation)"
+            )
+            break
+        for la in legal:
+            k = la.get("kind", "?")
+            legal_kind_counts[k] = legal_kind_counts.get(k, 0) + 1
+        choice = dict(rng.choice(legal))
+        chosen_kind = choice.get("kind", "?")
+        action_kind_counts[chosen_kind] = (
+            action_kind_counts.get(chosen_kind, 0) + 1
+        )
+        try:
+            state.apply_action(choice)
+        except Exception as e:
+            print(
+                f"[cross-engine-game] [rust-only] STOP at step {step}: "
+                f"apply_action raised {type(e).__name__}: {e}"
+            )
+            break
+        decisions_applied.append(choice)
+        trajectory.append(state.fingerprint())
+
+    walk_elapsed = time.perf_counter() - walk_start
+
+    # Render the same summary the full-walk path does.
+    _print_cross_engine_summary(
+        rows=[None] * len(decisions_applied),
+        action_kind_counts=action_kind_counts,
+        legal_kind_counts=legal_kind_counts,
+        walk_elapsed=walk_elapsed,
+    )
+
+    # Determinism check: replay the decisions on the clone and assert
+    # the fingerprint trajectory matches byte-for-byte.
+    try:
+        clone_trajectory = [clone.fingerprint()]
+        for action in decisions_applied:
+            clone.apply_action(action)
+            clone_trajectory.append(clone.fingerprint())
+    except Exception as e:
+        print(
+            f"[cross-engine-game] [rust-only] PARITY: FAIL — clone-replay "
+            f"raised {type(e).__name__}: {e}"
+        )
+        return 1
+
+    if trajectory == clone_trajectory:
+        print(
+            f"[cross-engine-game] [rust-only] PARITY: PASS — "
+            f"{len(decisions_applied)} decisions, "
+            f"clone-replay-matches=True (seed={seed})"
+        )
+        return 0
+
+    div_step = next(
+        (
+            i
+            for i, (a, b) in enumerate(zip(trajectory, clone_trajectory))
+            if a != b
+        ),
+        min(len(trajectory), len(clone_trajectory)),
+    )
+    print(
+        f"[cross-engine-game] [rust-only] PARITY: FAIL — clone-replay "
+        f"diverged at step {div_step} (seed={seed})"
+    )
+    return 1
+
+
 def run_cross_engine_game_mode(
     seed: int,
     num_decisions: int = 20,
     deck_size: int = 30,
     ignore_known_gaps: bool = False,
+    *,
+    deck_preset: str | None = None,
+    deck_path=None,
+    rust_only: bool = False,
 ) -> int:
     """Phase-5 prep: drive Python AND Rust through the SAME deterministic
     decision sequence one step at a time and report the first
@@ -2059,6 +2381,31 @@ def run_cross_engine_game_mode(
     know about G3, show me what's behind it" investigations; the
     default-False behavior preserves the original "stop at first
     divergence" measurement contract.
+
+    Deck-stress knobs
+    -----------------
+    By default (``deck_preset`` and ``deck_path`` both ``None``) the
+    harness uses a ``deck_size``-card Forest-only deck per seat — the
+    original cross-engine-game shape that exercises exactly one legal
+    action per decision (``pass_priority``) and is sufficient for the
+    G3/G5 toggle measurement contract.
+
+    Set ``deck_preset`` to a registered preset name (e.g.
+    ``"eoe-draft-style"``) or ``deck_path`` to a deck file on disk to
+    drive the walk against a richer deck — surfaces non-trivial action
+    variety (``play_land``, ``cast_spell``, ``activate_ability``) and
+    typically trips real (or known-masked) divergences faster than the
+    Forest-only loop.
+
+    Rust-only fallback
+    ------------------
+    Set ``rust_only=True`` to skip the Python state-construction step
+    entirely and run a Rust-only trajectory-determinism check against
+    the chosen deck (clone-replay matches). Useful when the chosen
+    deck contains card names the Python card source doesn't carry
+    (so ``setup_game`` raises) — the determinism check still has
+    real value as a Rust-side regression gate. The PASS message in
+    this mode cites ``[rust-only]``.
     """
     try:
         import mtg_bot_engine  # noqa: F401  (used by helpers below)
@@ -2067,8 +2414,53 @@ def run_cross_engine_game_mode(
         print("  -> run `maturin develop --release -m rust/Cargo.toml`")
         return 2
 
+    # Resolve deck contents (or fall back to Forest-only Deck-size).
+    deck_card_names: list[str] | None = None
+    deck_label_suffix = ""
+    if deck_preset is not None and deck_path is not None:
+        print(
+            "[cross-engine-game] ERROR: pass --deck-preset OR --deck-path, "
+            "not both"
+        )
+        return 2
+    if deck_preset is not None:
+        try:
+            deck_card_names = _resolve_deck_preset(deck_preset)
+        except KeyError as e:
+            print(f"[cross-engine-game] ERROR: {e}")
+            return 2
+        deck_label_suffix = f"preset={deck_preset}"
+    elif deck_path is not None:
+        try:
+            deck_card_names = _load_deck_path_for_cross_engine(deck_path)
+        except Exception as e:
+            print(
+                f"[cross-engine-game] ERROR: deck-path load failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            return 2
+        deck_label_suffix = f"path={deck_path}"
+
+    # Rust-only fallback path: skip Python state-construction; run a
+    # determinism check on the Rust trajectory against the supplied
+    # deck. Returns 0/1 same as full cross-engine mode but the PASS
+    # message cites [rust-only] so operators don't conflate the two
+    # measurement contracts.
+    if rust_only:
+        return _run_cross_engine_rust_only(
+            seed=seed,
+            num_decisions=num_decisions,
+            deck_card_names=deck_card_names,
+            deck_size=deck_size,
+            deck_label_suffix=deck_label_suffix,
+        )
+
     try:
-        py_state = _build_python_state_for_cross_engine(seed, deck_size=deck_size)
+        py_state = _build_python_state_for_cross_engine(
+            seed,
+            deck_size=deck_size,
+            deck_card_names=deck_card_names,
+        )
         rs_state = _build_rust_state_for_cross_engine(py_state)
     except Exception as e:
         print(
@@ -2077,7 +2469,46 @@ def run_cross_engine_game_mode(
         )
         return 2
 
-    _print_cross_engine_header(seed, num_decisions, deck_size)
+    # Render a deck-summary label so the operator sees what shape the
+    # walk was driven against. The label is freeform; for the
+    # Forest-only default the header keeps its legacy
+    # "Forest x N per seat" rendering.
+    if deck_card_names is not None:
+        unique = sorted({n for n in deck_card_names})
+        deck_label = (
+            f"{deck_label_suffix} "
+            f"({len(deck_card_names)} cards, {len(unique)} unique)"
+        )
+        # Stats roll-up: how many of those unique cards carry at least
+        # one unsupported effect class on the Rust side. Surfaces the
+        # parity-vocabulary measurement at the very top of the output.
+        try:
+            from mtg_bot.rust_bridge import python_card_to_rust_recipe
+            from mtg_bot.cards.source import get_active_source
+            py_printings = get_active_source().get_printings()
+            unsup_classes: set[str] = set()
+            unsup_count = 0
+            for n in unique:
+                if n in py_printings:
+                    recipe = python_card_to_rust_recipe(py_printings[n])
+                    per_card = recipe.get("_unsupported_effects", [])
+                    if per_card:
+                        unsup_count += 1
+                        unsup_classes.update(per_card)
+            print(
+                f"[cross-engine-game] deck stats: {len(deck_card_names)} cards, "
+                f"{len(unique)} unique, {unsup_count} cards with unsupported "
+                f"effect classes ({len(unsup_classes)} distinct classes)"
+            )
+        except Exception:
+            # Defensive: stats are an operator nicety, not load-bearing.
+            pass
+    else:
+        deck_label = None
+
+    _print_cross_engine_header(
+        seed, num_decisions, deck_size, deck_label=deck_label
+    )
 
     # Initial-state field-diff — if this trips, the cross-engine setup
     # itself drifted (zone-mirror bug). Report it as the "step -1" row
@@ -2116,13 +2547,29 @@ def run_cross_engine_game_mode(
     # measure against; G5 documents that off-priority callers get the
     # `[pass_priority]` singleton, so this is always non-empty.
     from mtg_bot.actions import apply_action as py_apply_action
+    import time
 
     rng = random.Random(seed)
     rows: list[CrossEngineStep] = []
 
+    # Per-step action-kind tally + legal-emission tally — the
+    # "action variety" signal the real-deck stress mode exists to
+    # surface. Both get rendered in the post-walk summary.
+    action_kind_counts: dict[str, int] = {}
+    legal_kind_counts: dict[str, int] = {}
+    walk_start = time.perf_counter()
+
     for step in range(num_decisions):
         priority_player = rs_state.get_priority_player()
         legal = rs_state.legal_decisions(priority_player)
+        # Tally the legal-action kinds emitted at this step so the
+        # summary distinguishes "the walker only saw pass_priority"
+        # from "the walker saw pass_priority + play_land + cast_spell
+        # but always picked pass_priority". The latter is itself a
+        # selection-bias signal worth surfacing.
+        for la in legal:
+            k = la.get("kind", "?")
+            legal_kind_counts[k] = legal_kind_counts.get(k, 0) + 1
         if not legal:
             row = CrossEngineStep(
                 index=step,
@@ -2136,6 +2583,10 @@ def run_cross_engine_game_mode(
 
         rust_action = dict(rng.choice(legal))
         rust_label = _rust_action_short_label(rust_action)
+        chosen_kind = rust_action.get("kind", "?")
+        action_kind_counts[chosen_kind] = (
+            action_kind_counts.get(chosen_kind, 0) + 1
+        )
 
         # Translate Rust ids to Python ids before building the
         # Python Action (Rust + Python allocate per-object ids in
@@ -2327,6 +2778,21 @@ def run_cross_engine_game_mode(
         )
         return 1
 
+    walk_elapsed = time.perf_counter() - walk_start
+
+    # Action-variety + per-decision wall-time summary. Always printed
+    # (even on the STOP / DIVERGE paths above when they fall through
+    # — those paths return early before this point, so this only
+    # fires on the natural-completion path). Operators reading the
+    # smoke want "did the walker actually see action variety, or
+    # did it just pass_priority 50 times?" answered up-front.
+    _print_cross_engine_summary(
+        rows=rows,
+        action_kind_counts=action_kind_counts,
+        legal_kind_counts=legal_kind_counts,
+        walk_elapsed=walk_elapsed,
+    )
+
     # Loop completed without divergence (or stopped on STOP: rows).
     # Distinguish the OK-finish case (return 0) from the STOP case
     # (return 1 — Python couldn't follow Rust's emission, which is
@@ -2468,6 +2934,40 @@ def main() -> int:
             "contract)."
         ),
     )
+    p.add_argument(
+        "--deck-preset",
+        type=str,
+        default=None,
+        help=(
+            "(cross-engine-game) name of a built-in deck preset to drive "
+            "the walk against. Mutually exclusive with --deck-path. "
+            f"Known presets: {', '.join(sorted(_DECK_PRESETS))}. Without "
+            "either flag the harness uses the default Forest-only deck."
+        ),
+    )
+    p.add_argument(
+        "--deck-path",
+        type=str,
+        default=None,
+        help=(
+            "(cross-engine-game) path to a deck file on disk to drive "
+            "the walk against. Mutually exclusive with --deck-preset. "
+            "Format matches make_rust_state_from_python_decklist's "
+            "deck_path arg (JSON or one-card-per-line text with "
+            "optional '<count> <name>' prefix)."
+        ),
+    )
+    p.add_argument(
+        "--rust-only",
+        action="store_true",
+        help=(
+            "(cross-engine-game) skip Python state construction and run "
+            "a Rust-only clone-replay determinism check against the "
+            "supplied deck. Useful when the deck contains names the "
+            "Python card source doesn't carry — the determinism check "
+            "still has value as a Rust-side regression gate."
+        ),
+    )
     args = p.parse_args()
 
     if args.mode == "initial-state":
@@ -2512,6 +3012,9 @@ def main() -> int:
             num_decisions=args.num_decisions,
             deck_size=args.deck_size,
             ignore_known_gaps=args.ignore_known_gaps,
+            deck_preset=args.deck_preset,
+            deck_path=args.deck_path,
+            rust_only=args.rust_only,
         )
 
     colors = args.colors.split(",")
