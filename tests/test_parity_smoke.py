@@ -1162,3 +1162,205 @@ def test_match_known_gap_returns_g3_for_priority_player_after_pass_priority(
     assert parity_smoke._match_known_gap(
         "priority_player", None, rust_view, python_view
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# --mode cross-engine-game with --deck-preset / --deck-path — real-deck
+# stress (action variety surface). The Forest-only default already
+# exercises G3 / G5 toggle measurement; the real-deck variants drive the
+# same walk against richer card pools so non-trivial action variety
+# (play_land, cast_spell, ...) has a chance to surface real (or
+# known-masked) divergences.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_engine_game_mode_deck_preset_runs_end_to_end(
+    parity_smoke, capsys
+):
+    """``run_cross_engine_game_mode(deck_preset='tiny-mixed')`` builds
+    both Python and Rust states from a real EoE-flavored decklist
+    and walks at least 5 decisions without crashing. The deck-stats
+    line lands at the top of the output and cites the preset name,
+    so operators reading the smoke can confirm WHICH deck shape was
+    walked.
+    """
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42,
+        num_decisions=5,
+        deck_preset="tiny-mixed",
+        ignore_known_gaps=True,
+    )
+    # rc=0 or 1 — either the walk passed or hit an unmasked divergence;
+    # the load-bearing assertion is that the harness didn't crash and
+    # emitted the deck-stats / header lines.
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    assert "[cross-engine-game]" in out
+    assert "tiny-mixed" in out
+    # Deck-stats line shows up at the top of real-deck runs.
+    assert "deck stats:" in out
+
+
+@pytest.mark.parametrize("seed", [42, 7, 123])
+def test_cross_engine_game_mode_deck_preset_no_crash_across_seeds(
+    parity_smoke, capsys, seed
+):
+    """Across multiple seeds, the real-deck preset runs without
+    crashing for at least 5 decisions. Pins "real-deck state
+    construction is seed-robust" so a future bridge change that
+    breaks one seed surfaces in the gate, not in production.
+    """
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=seed,
+        num_decisions=5,
+        deck_preset="tiny-mixed",
+        ignore_known_gaps=True,
+    )
+    # Walk completes (PASS or fall-through to unmasked divergence) —
+    # the harness should never crash here.
+    assert rc in (0, 1), f"seed={seed}: unexpected rc={rc}"
+
+
+def test_cross_engine_game_mode_rust_only_fallback_works(
+    parity_smoke, capsys
+):
+    """The ``rust_only=True`` fallback skips Python state construction
+    and runs a Rust-only clone-replay determinism check against the
+    real-deck preset. PASS proves the Rust trajectory is deterministic
+    for the same seed; the rendered summary still cites the action-kind
+    distribution.
+    """
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42,
+        num_decisions=10,
+        deck_preset="tiny-mixed",
+        rust_only=True,
+    )
+    assert rc == 0  # clone-replay must match for a deterministic walker
+    out = capsys.readouterr().out
+    assert "[rust-only]" in out
+    assert "clone-replay-matches=True" in out
+    # Action-kind summary lands even on the rust-only path.
+    assert "action kinds chosen" in out
+
+
+def test_cross_engine_game_mode_deck_path_loads_from_disk(
+    parity_smoke, capsys, tmp_path
+):
+    """The ``deck_path`` arg reads a one-card-per-line deck file
+    and feeds the contents into the same cross-engine flow as
+    ``deck_preset``. End-to-end smoke of the file-based entry
+    point.
+    """
+    deck_file = tmp_path / "small.deck"
+    deck_file.write_text(
+        "# small mixed deck\n"
+        "10 Forest\n"
+        "5 Mountain\n"
+        "5 Plains\n",
+        encoding="utf-8",
+    )
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42,
+        num_decisions=5,
+        deck_path=str(deck_file),
+        ignore_known_gaps=True,
+    )
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    assert "[cross-engine-game]" in out
+    # Deck-path is rendered in the header.
+    assert "path=" in out
+    assert "deck stats:" in out
+
+
+def test_cross_engine_game_mode_unknown_preset_returns_setup_error(
+    parity_smoke, capsys
+):
+    """Unknown preset name -> setup-error exit code (2). Operators
+    typoing a preset get a fast loud failure with the known-presets
+    list, not a confusing field-diff."""
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42,
+        num_decisions=5,
+        deck_preset="does-not-exist",
+    )
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "ERROR" in out
+
+
+def test_cross_engine_game_mode_main_dispatches_deck_preset_flag(
+    parity_smoke, monkeypatch, capsys
+):
+    """``main() --mode cross-engine-game --deck-preset tiny-mixed
+    --ignore-known-gaps`` routes the flag through argparse into the
+    cross-engine mode. Pins the CLI surface."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "parity_smoke.py",
+            "--mode",
+            "cross-engine-game",
+            "--seed",
+            "42",
+            "--num-decisions",
+            "5",
+            "--deck-preset",
+            "tiny-mixed",
+            "--ignore-known-gaps",
+        ],
+    )
+    rc = parity_smoke.main()
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    assert "tiny-mixed" in out
+
+
+def test_cross_engine_game_mode_deck_path_mutual_exclusion(
+    parity_smoke, capsys
+):
+    """Passing both ``deck_preset`` and ``deck_path`` is a usage
+    error — the harness fails loudly with a setup-error exit code
+    instead of silently picking one or merging them.
+    """
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42,
+        num_decisions=5,
+        deck_preset="tiny-mixed",
+        deck_path="ignored.deck",
+    )
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "ERROR" in out
+
+
+def test_resolve_deck_preset_returns_eoe_draft_list(parity_smoke):
+    """Direct unit on the preset resolver. ``eoe-draft-style`` resolves
+    to a 40-card list whose every entry is in the active Python card
+    source — otherwise setup_game would raise and the harness would
+    break in the integration test above. This locks the preset
+    contents in for future deck-pool changes."""
+    cards = parity_smoke._resolve_deck_preset("eoe-draft-style")
+    assert len(cards) == 40
+    # Every card name must resolve in the active Python source so
+    # setup_game accepts the deck.
+    from mtg_bot.cards.source import get_active_source
+    py_printings = get_active_source().get_printings()
+    missing = sorted({n for n in cards if n not in py_printings})
+    assert missing == [], (
+        f"eoe-draft-style preset has names missing from active source: "
+        f"{missing}"
+    )
+
+
+def test_resolve_deck_preset_unknown_raises(parity_smoke):
+    """Unknown preset name raises ``KeyError`` with a helpful list
+    of known presets — operators typoing a preset get a fast,
+    descriptive failure."""
+    with pytest.raises(KeyError) as exc_info:
+        parity_smoke._resolve_deck_preset("not-a-preset")
+    msg = str(exc_info.value)
+    assert "not-a-preset" in msg
+    assert "tiny-mixed" in msg or "known presets" in msg
