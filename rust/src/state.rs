@@ -108,6 +108,25 @@ pub struct GameState {
     pub blockers: Vec<(u32, u32)>,
     /// The stack — top is the LAST element of the Vec for O(1) pop.
     pub stack: Vec<StackItem>,
+    /// CR 117.4 counter: number of times priority has been passed in
+    /// succession (without any intervening non-pass action). The
+    /// `apply_action({"kind": "pass_priority"})` arm in
+    /// `state_ops_actions.rs` increments this on every pass; non-pass
+    /// arms reset to 0 (passes are no longer "consecutive" once any
+    /// other action mutates state). When the counter reaches 2 with
+    /// an empty stack, apply_action fires `advance_phase()` and
+    /// resets the counter — this closes RUST_PARITY_GAPS.md G3 at
+    /// the action-layer level while leaving the bare
+    /// `pass_priority()` primitive (state_ops_priority.rs) as a pure
+    /// toggle that doesn't touch this field.
+    ///
+    /// Not folded into the parity fingerprint: Python doesn't track
+    /// consecutive passes (its outer search loop drives the step
+    /// machine separately), so including this in `hash_state` would
+    /// produce gratuitous Rust↔Python divergence on the bookkeeping
+    /// field itself. The observable consequence (step advanced or
+    /// not) IS in the fingerprint via `phase`.
+    pub consecutive_passes: u8,
 }
 
 #[pymethods]
@@ -361,5 +380,6 @@ pub fn make_synthetic_state(
         attackers: Vec::new(),
         blockers: Vec::new(),
         stack: Vec::new(),
+        consecutive_passes: 0,
     }
 }

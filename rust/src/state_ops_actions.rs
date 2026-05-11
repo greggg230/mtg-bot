@@ -14,8 +14,14 @@
 //! 3rd-most-frequent variant), and `DeclareBlockers` (5 of 420 /
 //! ~1.2% — the 4th-most-frequent non-pass variant). Future slices
 //! grow the match arm (CastSpell, Activate, ...) plus a
-//! `legal_decisions` enumerator and a `state.consecutive_passes`
-//! field for the "both passed -> resolve / advance" composition.
+//! `legal_decisions` enumerator. The post-round-25
+//! `pass_priority-step-advance` slice closes G3 at this layer by
+//! adding a `state.consecutive_passes: u8` counter on `GameState`
+//! and wiring CR 117.4 in this dispatcher — empty-stack/both-passed
+//! fires `advance_phase()` from the PassPriority arm. The bare
+//! `pass_priority()` primitive in `state_ops_priority.rs` stays a
+//! pure toggle; G3's stack-resolution leg is still deferred (callers
+//! reach for `complete_priority_round()` explicitly).
 //!
 //! ## Actor convention for hand-targeting actions
 //!
@@ -87,7 +93,12 @@ impl GameState {
     ///
     /// Arms:
     /// - `{"kind": "pass_priority"}` → calls `pass_priority()`
-    ///   (round 22).
+    ///   (round 22) AND composes CR 117.4 step-advance
+    ///   (pass-priority-step-advance slice). When both players
+    ///   pass in succession with an empty stack, fires
+    ///   `advance_phase()` after the toggle. See the arm's inline
+    ///   comment for the `consecutive_passes` counter mechanics
+    ///   and why the bare primitive stays a pure toggle.
     /// - `{"kind": "play_land", "card_id": <u32>}` → calls
     ///   `play_land(card_id, priority_player)` (round 23).
     /// - `{"kind": "declare_attackers", "attacker_ids": [<u32>, ...]}`
@@ -135,13 +146,80 @@ impl GameState {
     /// `actions::parse_action`.
     fn apply_action(slf: Bound<'_, Self>, action_dict: &Bound<'_, PyDict>) -> PyResult<()> {
         let action = parse_action(action_dict)?;
+        // CR 117.4 composition (RUST_PARITY_GAPS.md G3): non-pass
+        // actions break any in-flight "consecutive passes" chain.
+        // Reset the counter up-front so e.g. PassPriority -> PlayLand
+        // -> PassPriority no longer counts the first pass toward
+        // round-completion. The PassPriority arm restores the
+        // increment itself. This keeps the bare `pass_priority()`
+        // primitive in `state_ops_priority.rs` unchanged — the round
+        // tracking lives entirely at the apply_action layer.
+        if !matches!(action, Action::PassPriority) {
+            slf.borrow_mut().consecutive_passes = 0;
+        }
         match action {
             Action::PassPriority => {
                 // Cross-file pymethod dispatch (round-16 pattern):
                 // `pass_priority` lives in state_ops_priority.rs and
                 // is private to that module's `impl GameState` block.
                 // Go through the Python attribute layer to call it.
+                //
+                // ## CR 117.4 composition (RUST_PARITY_GAPS.md G3)
+                //
+                // The bare primitive is a pure toggle on
+                // `priority_player`. At the action layer we wrap it
+                // with the CR 117.4 step-advance rule: when both
+                // players pass priority in succession with an empty
+                // stack, the game advances to the next step. Python's
+                // `apply_action(PassPriority())` is conceptually a
+                // no-op (its outer search loop drives the step
+                // machine separately) — for cross-engine parity to
+                // make progress on real decks we need ONE side to
+                // model the rule, and the cleanest choice is here.
+                //
+                // Implementation:
+                // 1. Call the bare toggle (sibling-file private
+                //    method, so go through the Python attribute
+                //    layer — same pattern as the other arms below).
+                // 2. Increment `consecutive_passes` (saturating; in
+                //    practice it never exceeds 2 because step 3
+                //    resets it the moment it hits 2).
+                // 3. If the counter reached 2 AND the stack is
+                //    empty, fire `advance_phase()` and zero the
+                //    counter. (Non-empty stack: G3 will close the
+                //    stack-resolution branch in a future slice via
+                //    the existing `complete_priority_round()`
+                //    primitive; this slice keeps the scope to
+                //    empty-stack step-advance, which is what
+                //    unblocks the parity_smoke real-deck stress
+                //    measurement getting past UNTAP.)
+                //
+                // The borrow split (drop the `&mut` borrow before
+                // re-entering Python via `call_method0`) mirrors the
+                // PlayLand arm's pattern below — `call_method0` may
+                // re-borrow under the hood and a held `RefMut` would
+                // collide.
                 slf.call_method0("pass_priority")?;
+                let should_advance = {
+                    let mut state = slf.borrow_mut();
+                    state.consecutive_passes = state.consecutive_passes.saturating_add(1);
+                    let go = state.consecutive_passes >= 2 && state.stack.is_empty();
+                    if go {
+                        state.consecutive_passes = 0;
+                    }
+                    go
+                };
+                if should_advance {
+                    // `advance_phase` is the cross-slice composition
+                    // hook: it also fires `untap_all_for_player` on
+                    // turn rollover (state_ops_steps.rs) so a chain
+                    // of pass_priority calls walks the full phase
+                    // ladder including the UNTAP entry sweep — which
+                    // is the parity-smoke unblocker: real decks now
+                    // reach MAIN1 via legal_decisions emitting
+                    // PassPriority pairs at each pre-main step.
+                    slf.call_method0("advance_phase")?;
+                }
             }
             Action::PlayLand { card_id } => {
                 // Same cross-file pattern as `pass_priority`, but

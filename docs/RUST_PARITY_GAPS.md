@@ -74,26 +74,56 @@ behavior per CR / Python, parity impact, and closeable / accepted.
   `end_turn_and_start_next`.
 - **Closeable**: yes — slice that wires cleanup into `advance_phase`.
 
-### G3. `pass_priority` is a pure toggle (no step-end / stack-resolution composition)
+### G3. `pass_priority` is a pure toggle at the bare-primitive layer (CLOSED at apply_action layer for the empty-stack branch)
 
-- **Pinned by**: `tests_rust/test_priority.py::test_both_pass_priority_with_empty_stack_does_not_advance_step`,
+- **Status (pass-priority-step-advance slice)**: CLOSED at the
+  `apply_action` layer for the empty-stack/step-advance branch of CR
+  117.4. The bare `state.pass_priority()` primitive remains a pure
+  toggle (intentional slice-boundary pin), but
+  `apply_action({"kind": "pass_priority"})` now wraps the toggle
+  with a `consecutive_passes` counter on `GameState` and fires
+  `advance_phase()` when both players have passed in succession with
+  an empty stack. Non-pass actions reset the counter. This unblocks
+  `scripts/parity_smoke.py` in `cross-engine-game` mode: pre-slice
+  the harness stuck at decision 0 forever (Rust toggled,
+  `legal_decisions` only emitted `pass_priority` from UNTAP without
+  ever advancing); post-slice it walks UNTAP→UPKEEP→DRAW→MAIN1 via
+  pass-priority pairs and reaches PlayLand / DeclareAttackers /
+  DeclareBlockers emissions. See `state_ops_actions.rs` PassPriority
+  arm for the implementation; `tests_rust/test_actions.py::test_
+  apply_action_pass_priority_*` for the action-layer pins.
+- **Still open**: the stack-resolution branch of CR 117.4 (both pass
+  with non-empty stack → top resolves) is still routed through
+  `state.complete_priority_round()` explicitly rather than composed
+  into `apply_action`'s PassPriority arm. A future slice may extend
+  the composition to handle stack-non-empty by inlining the pop +
+  effect dispatch — for now `apply_action(PassPriority)` on a
+  non-empty stack just toggles + increments the counter without
+  firing the step-advance (test:
+  `test_apply_action_pass_priority_with_nonempty_stack_does_not_advance`).
+- **Bare-primitive pins (unchanged, still green)**:
+  `tests_rust/test_priority.py::test_both_pass_priority_with_empty_stack_does_not_advance_step`,
   `test_both_pass_priority_with_nonempty_stack_does_not_resolve_top`,
   `test_priority_unaffected_by_phase_advance_in_this_slice`,
-  `test_advance_phase_full_lap_does_not_touch_priority`.
-- **Rust today**: `pass_priority` flips `priority_player` and nothing
-  else. Two `pass_priority` calls with an empty stack do NOT advance
-  the step; with a non-empty stack they do NOT resolve the top.
-  `advance_phase` does NOT reset priority to the new active player.
-- **CR / Python expected**: CR 117.4 — both-pass with empty stack ends
-  the step; with non-empty stack resolves the top. CR 117.1a — active
-  player gets priority at the start of each step.
-- **Impact**: low at primitive level (this is the slice-boundary
-  composition — callers like `complete_priority_round` exist for
-  explicit composition). The smoke harness drives state through
-  explicit composition calls; pure-toggle behavior is observable only
-  when the harness uses `pass_priority` directly without composing.
-- **Closeable**: yes — accepted slice-boundary pin. A future slice
-  will integrate priority + steps + stack.
+  `test_advance_phase_full_lap_does_not_touch_priority`. These pin
+  the bare `pass_priority()` primitive's pure-toggle shape — they're
+  the slice-boundary lock-in that the action-layer composition
+  doesn't leak into the primitive.
+- **CR / Python expected**: CR 117.4 — both-pass with empty stack
+  ends the step (Rust models this now at the apply_action layer);
+  with non-empty stack resolves the top (still deferred). CR 117.1a
+  — active player gets priority at the start of each step (still
+  open as G15 — `advance_phase` doesn't reset priority).
+- **Cross-engine drift fallout**: Python's
+  `apply_action(PassPriority())` is still conceptually a no-op (its
+  outer search loop drives the step machine separately), so once
+  Rust composes step-advance the engines structurally drift on
+  step/phase/turn/active_player. The drift is tracked separately as
+  G25 (see below).
+- **Impact**: pre-slice — HIGH for real-deck parity (the harness
+  couldn't reach MAIN1, so cross-engine parity testing on full decks
+  was structurally blocked). Post-slice — LOW; the residual gap is
+  the still-deferred non-empty-stack branch.
 
 ### G4. `cast_creature` / `activate_ability` do not touch priority
 
@@ -402,6 +432,43 @@ behavior per CR / Python, parity impact, and closeable / accepted.
 - **Impact**: low — only visible if the parity harness exercises
   the post-mulligan scry decision.
 - **Closeable**: yes — pending Paris-rule decision-callback slice.
+
+### G25. Cross-engine step/phase/turn/active_player drift downstream of G3's CR 117.4 step-advance composition
+
+- **Pinned by**: `tests/test_parity_smoke.py::test_cross_engine_game_mode_with_flag_walks_past_pass_priority_loop_across_seeds[*]`;
+  `scripts/parity_smoke.py:KNOWN_GAP_MASKS["G25"]`.
+- **Rust today**: `apply_action({"kind": "pass_priority"})` composes
+  CR 117.4 step-advance via the `consecutive_passes` counter (G3,
+  closed at the action layer). When both players pass with an empty
+  stack, Rust fires `advance_phase()` immediately.
+- **CR / Python expected**: Python's
+  `apply_action(PassPriority())` is conceptually a no-op (its outer
+  search loop drives the step machine separately — `turn.py` walks
+  `STEP_ORDER` independently of the action dispatcher). So Python's
+  step/phase/turn/active_player stay frozen across the same
+  pass_priority dispatch.
+- **Cross-engine consequence**: once Rust has fired any
+  step-advance, every SUBSEQUENT action observes Rust ahead of
+  Python on the step ladder. The drift persists across non-
+  pass_priority actions (PlayLand, DeclareAttackers, ...) until
+  Python's outer loop catches up. The `parity_smoke.py` harness
+  masks the drift as G25 in its `cross-engine-game` mode so the
+  walk can proceed past G3 into the first real downstream
+  divergence (currently: different `legal_decisions` set between
+  the two engines because they're in different steps -> different
+  action picks -> battlefield / priority_player divergence at the
+  first MAIN1 / combat-step emission).
+- **Impact**: pre-slice — N/A (G3 prevented Rust from advancing at
+  all). Post-slice — HIGH for cross-engine parity testing, but
+  cleanly maskable (the drift is structural, not a bug). The
+  appropriate close-out path is a Python-side change: extend
+  Python's `apply_action(PassPriority())` to also compose CR 117.4
+  (or a one-time alignment pass in the harness that pumps Python's
+  step machine to match Rust's after each pass_priority pair).
+  Until then the mask lets real-deck parity testing continue.
+- **Closeable**: yes — pending a parity slice on the Python side
+  (or harness-side step-alignment shim) that mirrors Rust's action-
+  layer step-advance composition.
 
 ---
 

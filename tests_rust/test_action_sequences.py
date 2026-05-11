@@ -201,15 +201,27 @@ def test_activate_mana_then_cast_spell_drains_pool(synthetic_state):
 
 
 def test_pass_priority_four_times_walks_full_cycle(synthetic_state):
-    """Four consecutive PassPriority dispatches walk the toggle through
-    a full 0→1→0→1→0 cycle. ``test_actions.py`` covers single + double
-    toggle; the four-step sequence pins that the toggle stays an
-    involution under repeated application — no edge case at 3 or 4
-    passes that produces a different outcome (e.g. an auto-resolve
-    side effect that fired only after N consecutive passes). At the
-    dispatch-layer scope, PassPriority is pure toggle — the
-    "consecutive_passes" round-complete bookkeeping lives on
-    ``complete_priority_round``, NOT on this arm."""
+    """Four consecutive PassPriority dispatches walk the priority
+    toggle through a full 0→1→0→1→0 cycle AT THE priority_player
+    LEVEL. ``test_actions.py`` covers single + double dispatch;
+    the four-step sequence pins that the priority toggle stays an
+    involution under repeated application.
+
+    G3 close-out aside (pass-priority-step-advance slice): in
+    addition to the priority toggle, the apply_action layer now also
+    fires ``advance_phase`` whenever both players pass in succession
+    with an empty stack. Four passes therefore walk TWO steps on the
+    phase ladder (UNTAP → UPKEEP after passes 1-2, UPKEEP → DRAW
+    after passes 3-4) — the priority-toggle pattern still matches
+    because each step-advance resets the consecutive-pass counter
+    AND the priority sequence returns to active player between each
+    pair of passes. See ``tests_rust/test_actions.py::test_apply_
+    action_pass_priority_four_passes_advance_two_steps`` for the
+    phase-side assertion that the step-advance fires. The bare
+    ``state.pass_priority()`` primitive in
+    ``state_ops_priority.rs`` remains a pure toggle that doesn't
+    touch the counter; the round-complete bookkeeping lives only at
+    the apply_action layer."""
     assert synthetic_state.get_priority_player() == 0
     synthetic_state.apply_action({"kind": "pass_priority"})
     assert synthetic_state.get_priority_player() == 1
@@ -219,7 +231,10 @@ def test_pass_priority_four_times_walks_full_cycle(synthetic_state):
     assert synthetic_state.get_priority_player() == 1
     synthetic_state.apply_action({"kind": "pass_priority"})
     assert synthetic_state.get_priority_player() == 0
-    # Active player never moved across the whole cycle.
+    # Active player never moved across the whole cycle (the
+    # advance_phase calls move only `phase`, not `active_player` —
+    # active rotates only at the CLEANUP→UNTAP wrap, which 4 passes
+    # at the start of the turn don't reach).
     assert synthetic_state.active_player == 0
 
 
