@@ -242,33 +242,59 @@ def make_rust_state_from_python_decks(
 # carries fields the Rust slice can't yet honor (e.g. a SearchLibrary
 # variant constrained by a predicate the Rust version doesn't accept);
 # the caller then treats the effect as unsupported.
+def _classify_target_filter(filt) -> str | None:
+    """Heuristic mapping Python TargetFilter -> Rust target-filter kind.
+
+    Returns ``"any_creature"`` for creature-only filters, ``"any_player"``
+    for player-only filters, ``"any_target"`` for filters that admit
+    both players and creatures, and ``None`` when the filter doesn't
+    resolve to a Rust-supported shape (e.g. lands, artifacts only).
+
+    Class-name / repr-string inspection is the cheapest discriminator
+    that doesn't pull the predicates sub-package into this bridge
+    module's import surface. The Rust closed vocab knows two filter
+    shapes: ``AnyPlayer`` and ``AnyCreature`` — anything narrower
+    (e.g. "controlled by you" / "with power N or less") is dropped to
+    the broader Rust shape, which over-targets relative to Python.
+    """
+    if filt is None:
+        return None
+    repr_str = repr(filt)
+    has_creature = "IsCreature" in repr_str
+    has_player = "IsPlayer" in repr_str
+    if has_creature and not has_player:
+        return "any_creature"
+    if has_player and not has_creature:
+        return "any_player"
+    if has_creature and has_player:
+        return "any_target"
+    return None
+
+
+def _single_target_filter_kind(eff) -> str | None:
+    """Extract the Rust target-filter kind from a single-slot effect.
+
+    Returns the Rust filter kind (``any_creature`` / ``any_player`` /
+    ``any_target``) for effects whose ``targets`` tuple holds exactly
+    one TargetSpec, or ``None`` if the effect doesn't have a clean
+    single-target shape.
+    """
+    targets = getattr(eff, "targets", ())
+    if len(targets) != 1:
+        return None
+    slot = targets[0]
+    return _classify_target_filter(getattr(slot, "filter", None))
+
+
 def _t_deal_damage(eff) -> dict | None:
     # The unified ``DealDamage`` carries an ``amount`` and a tuple of
     # target slots. The Rust ``deal_damage`` variant takes one target
     # filter; if Python's targets resolve to a single creature or
     # player slot we can translate, else we treat as unsupported.
-    targets = getattr(eff, "targets", ())
-    if len(targets) != 1:
+    kind = _single_target_filter_kind(eff)
+    if kind is None:
         return None
-    slot = targets[0]
-    filt = getattr(slot, "filter", None)
-    # The unified DealDamage hides its target shape behind a
-    # ``TargetFilter`` AST. Class-name inspection is the cheapest
-    # discriminator that doesn't pull the parser sub-package into this
-    # bridge module's import surface.
-    filt_cls = type(filt).__name__ if filt is not None else ""
-    # Heuristic kind mapping: any_target_filter() composes IsPlayer |
-    # IsCreature; bare IsPlayer / IsCreature point at the single-shape
-    # arms. We can't distinguish without a richer Rust target vocab,
-    # so prefer ``any_creature`` for creature-only slots, ``any_player``
-    # for player-only, and treat "any target" (player or creature) as
-    # creature for the first slice — same shape parity_smoke uses.
-    repr_str = repr(filt) if filt is not None else ""
-    if "IsCreature" in repr_str and "IsPlayer" not in repr_str:
-        kind = "any_creature"
-    elif "IsPlayer" in repr_str and "IsCreature" not in repr_str:
-        kind = "any_player"
-    else:
+    if kind == "any_target":
         # any-target shape — Python's any_target_filter() is IsPlayer
         # | IsCreature. Rust's ``deal_damage_any_target`` exists for
         # this and doesn't carry a target field.
@@ -415,6 +441,179 @@ def _t_add_mana_to_pool(eff) -> dict | None:
     return {"kind": "add_mana_to_pool", "color": color, "amount": int(amount)}
 
 
+# ---- additional effect translators (gap-coverage round) ----------------
+#
+# These cover Rust Effect variants the first translator landing missed.
+# Each maps a Python ``Effect`` subclass to the Rust ``parse_effect``
+# dict shape. Single-target effects use ``_single_target_filter_kind``
+# to map Python's predicate AST to Rust's closed filter vocab
+# (any_player / any_creature). When Python's filter is narrower than
+# Rust's vocab (e.g. ``IsCreature & ControlledByYou``), the translation
+# is lossy — Rust will over-target ("any creature" includes opponent's
+# creatures) — which is intentional under the parity-smoke-first stance:
+# a recipe that lands with a slightly-too-broad filter still resolves
+# without parse errors, and the per-step diff surfaces any divergence.
+
+
+def _t_destroy_target(eff) -> dict | None:
+    """Translate a single-slot ``Destroy``-family effect to ``destroy_target``.
+
+    Covers ``DestroyTargetCreature`` (incl. the ``or_spacecraft`` /
+    ``or_enchantment`` widenings), ``DestroyUpToOneTargetNonlandPermanent``,
+    ``DestroyTargetArtifactOrTappedCreature``, and other ``Destroy``
+    subclasses whose single-slot filter resolves to a creature / player /
+    any-target shape. Filters carrying rider checks the Rust vocab can't
+    honor (e.g. ``draw_if_undamaged_amount``, attacking-only) fall through
+    to the broader Rust filter — over-destroys lossily but lands without
+    parse errors.
+    """
+    # Rider effects the Rust unit variant can't express -- skip those
+    # so the loss is recorded as "unsupported" rather than silently
+    # destroying without the draw / attached follow-up.
+    if getattr(eff, "draw_if_undamaged_amount", 0) > 0:
+        return None
+    kind = _single_target_filter_kind(eff)
+    if kind is None:
+        return None
+    if kind == "any_target":
+        # Rust's destroy_target needs a TargetFilter; "any target"
+        # (player or creature) isn't a Rust shape. Default to creature.
+        kind = "any_creature"
+    return {"kind": "destroy_target", "target": {"kind": kind}}
+
+
+def _t_exile_target(eff) -> dict | None:
+    """Translate a single-slot ``Exile``-family effect to ``exile_target``.
+
+    Covers ``ExileTargetCreature`` and any ``Exile`` subclass whose
+    single-slot filter resolves to creature / player / any-target.
+    Narrower filters (e.g. ``HasPowerAtMost``) fall through to the
+    broader Rust filter — over-exiles but lands without parse errors.
+    """
+    kind = _single_target_filter_kind(eff)
+    if kind is None:
+        return None
+    if kind == "any_target":
+        kind = "any_creature"
+    return {"kind": "exile_target", "target": {"kind": kind}}
+
+
+def _t_return_to_hand(eff) -> dict | None:
+    """Translate ``Bounce`` / ``ReturnTargetCreatureToOwnersHand`` /
+    ``ReturnTargetPermanentYouControlToOwnersHand`` to ``return_to_hand``.
+
+    Single-target only (Rust's variant takes one TargetFilter).
+    """
+    # Bounce subclasses with the drone-create rider can't be expressed.
+    if getattr(eff, "create_drone_if_was_attacking", False):
+        return None
+    kind = _single_target_filter_kind(eff)
+    if kind is None:
+        return None
+    if kind == "any_target":
+        kind = "any_creature"
+    return {"kind": "return_to_hand", "target": {"kind": kind}}
+
+
+def _t_tap_target(eff) -> dict | None:
+    """Translate ``Tap`` / ``TapAnotherTargetCreature`` / etc to ``tap_target``."""
+    kind = _single_target_filter_kind(eff)
+    if kind is None:
+        return None
+    if kind == "any_target":
+        kind = "any_creature"
+    return {"kind": "tap_target", "target": {"kind": kind}}
+
+
+def _t_put_plus_one_counter_on_target(eff) -> dict | None:
+    """Translate ``PutPlusOneCounters`` / ``PutPlusOneCounterOnTargetCreature``
+    / ``PutPlusOneCounterOnCreatureYouControl`` / ``PutPlusOneCounterOnOpponentsCreature``
+    to ``add_counters``."""
+    # Carry-rider variants (granted keywords UEOT, etc.) handled by
+    # their own classes -- this only covers the simple base.
+    kind = _single_target_filter_kind(eff)
+    if kind is None:
+        return None
+    if kind == "any_target":
+        kind = "any_creature"
+    return {
+        "kind": "add_counters",
+        "count": int(getattr(eff, "amount", 1)),
+        "target": {"kind": kind},
+    }
+
+
+def _t_self_mill(eff) -> dict | None:
+    """Translate ``SelfMill`` to Rust ``mill`` (mill yourself N)."""
+    return {"kind": "mill", "count": int(eff.amount)}
+
+
+def _t_target_opponent_discards(eff) -> dict | None:
+    """Translate ``TargetOpponentDiscards`` to ``discard_card`` with any_player.
+
+    Rust's ``discard_card`` takes a target filter; "any player" is the
+    closest fit since "target opponent" can't be expressed precisely.
+    The lossy over-target (could resolve against the controller) is
+    accepted per the parity-smoke-first stance.
+    """
+    if int(getattr(eff, "count", 1)) != 1:
+        # Rust's discard_card discards one card per resolution; multi-
+        # count would need a Sequence of discard_card effects, which
+        # is out of scope for the first translation slice.
+        return None
+    return {"kind": "discard_card", "target": {"kind": "any_player"}}
+
+
+def _t_target_player_loses_life(eff) -> dict | None:
+    """Translate ``TargetPlayerLosesLife`` to ``target_opponent_loses_life``.
+
+    Python's ``TargetPlayerLosesLife`` takes a pre-selected target via
+    ``targets[0]`` (set by a triggered ability), while Rust's variant
+    is targeted-at-resolve. In a 2-player game, "that target player"
+    of an opponent-side trigger reduces to "target opponent loses N"
+    — the closest Rust shape.
+    """
+    return {"kind": "target_opponent_loses_life", "amount": int(eff.amount)}
+
+
+def _t_create_token(eff, *, token_registrar=None) -> dict | None:
+    """Translate ``CreateToken`` to Rust ``create_token``.
+
+    Rust's ``create_token`` carries a ``token_printing_id`` referring to
+    a registry-side printing — the token must be pre-registered. The
+    ``token_registrar`` argument is a callable that takes the Python
+    ``CardPrinting`` of the token and returns the Rust printing id;
+    when ``None`` (e.g. the translator is called without a registry
+    context), this falls through to unsupported.
+
+    The ``count`` field is preserved; the ``tapped`` / ``attacking`` /
+    ``each_player`` / ``schedule_end_of_combat_sacrifice`` riders are
+    Python-only widenings the Rust unit shape doesn't honor — when any
+    rider is set, treat as unsupported.
+    """
+    if token_registrar is None:
+        return None
+    if (
+        getattr(eff, "tapped", False)
+        or getattr(eff, "attacking", False)
+        or getattr(eff, "each_player", False)
+        or getattr(eff, "schedule_end_of_combat_sacrifice", False)
+    ):
+        return None
+    token_printing = getattr(eff, "token_printing", None)
+    if token_printing is None:
+        return None
+    try:
+        token_pid = token_registrar(token_printing)
+    except Exception:
+        return None
+    return {
+        "kind": "create_token",
+        "count": int(getattr(eff, "count", 1)),
+        "token_printing_id": int(token_pid),
+    }
+
+
 # Class-name -> translator dispatch. Keys are bare class names (no
 # module prefix) so a refactor of the Python-side module layout doesn't
 # break the bridge.
@@ -441,21 +640,107 @@ _EFFECT_TRANSLATORS: dict[str, Any] = {
     "PutPlusOneCounterOnSelf": _t_put_plus_one_counter_on_self,
     "Surveil": _t_surveil,
     "AddManaToPool": _t_add_mana_to_pool,
+    # ---- gap-coverage entries (gap-translator slice) ----
+    # Destroy family -- single-slot subclasses go through the unified
+    # destroy_target arm with filter classification.
+    "Destroy": _t_destroy_target,
+    "DestroyTargetCreature": _t_destroy_target,
+    "DestroyUpToOneTargetNonlandPermanent": _t_destroy_target,
+    "DestroyTargetArtifactOrTappedCreature": _t_destroy_target,
+    "DestroyTargetArtifactEnchantmentOrFlyingCreature": _t_destroy_target,
+    "DestroyTargetNoncreaturePermanent": _t_destroy_target,
+    # Exile family -- single-slot Exile subclasses.
+    "Exile": _t_exile_target,
+    "ExileTargetCreature": _t_exile_target,
+    "ExileTargetCreatureWithPowerOrToughnessAtMost": _t_exile_target,
+    # Bounce / return-to-hand family.
+    "Bounce": _t_return_to_hand,
+    "ReturnTargetCreatureToOwnersHand": _t_return_to_hand,
+    "ReturnTargetPermanentYouControlToOwnersHand": _t_return_to_hand,
+    # Tap family.
+    "Tap": _t_tap_target,
+    "TapAnotherTargetCreature": _t_tap_target,
+    "TapUpToOneTargetCreature": _t_tap_target,
+    "TapTargetArtifactOrCreature": _t_tap_target,
+    # +1/+1 counter family (single-target subclasses).
+    "PutPlusOneCounters": _t_put_plus_one_counter_on_target,
+    "PutPlusOneCounterOnTargetCreature": _t_put_plus_one_counter_on_target,
+    "PutPlusOneCounterOnCreatureYouControl": _t_put_plus_one_counter_on_target,
+    "PutPlusOneCounterOnOpponentsCreature": _t_put_plus_one_counter_on_target,
+    # Discard / mill family.
+    "SelfMill": _t_self_mill,
+    "TargetOpponentDiscards": _t_target_opponent_discards,
+    # Targeted-life-loss variant.
+    "TargetPlayerLosesLife": _t_target_player_loses_life,
 }
 
 
-def _translate_one_effect(py_eff) -> dict | None:
+# Translators that need extra context (e.g. a token registrar) live
+# here; they accept the standard ``eff`` plus context keyword args.
+_CONTEXTUAL_EFFECT_TRANSLATORS: dict[str, Any] = {
+    "CreateToken": _t_create_token,
+}
+
+
+def _translate_one_effect(py_eff, *, token_registrar=None) -> dict | None:
     """Translate a single Python ``Effect`` instance to a Rust dict.
 
     Returns ``None`` when the effect's class is not in the closed
     translation table or when translation finds a Python-only widening
     (e.g. ``use_controller_life`` on MillTargetPlayer) the Rust slice
-    can't honor."""
+    can't honor.
+
+    The ``token_registrar`` is threaded to translators that need to
+    pre-register Rust printings (CreateToken). When ``None`` (e.g.
+    the translator is called without a registry context), CreateToken
+    and other registry-bound translators fall through to unsupported.
+    """
     cls_name = type(py_eff).__name__
     fn = _EFFECT_TRANSLATORS.get(cls_name)
-    if fn is None:
-        return None
-    return fn(py_eff)
+    if fn is not None:
+        return fn(py_eff)
+    ctx_fn = _CONTEXTUAL_EFFECT_TRANSLATORS.get(cls_name)
+    if ctx_fn is not None:
+        return ctx_fn(py_eff, token_registrar=token_registrar)
+    return None
+
+
+def _translate_effect_or_sequence(
+    py_eff, *, token_registrar=None,
+) -> tuple[list[dict], list[str]]:
+    """Translate one Python effect (or a ``Sequence`` combinator) to a
+    list of Rust effect dicts.
+
+    Returns ``(translated_dicts, unsupported_class_names)``.
+
+    ``Sequence`` is unpacked one level deep: each sub-effect is run
+    through ``_translate_one_effect``; sub-effects that fail to
+    translate are captured in the unsupported list (so the per-card
+    stats correctly attribute the gap to the inner class, not the
+    outer Sequence). Nested Sequences (rare) are not recursively
+    unpacked — they fall through as unsupported under "Sequence".
+
+    Non-Sequence effects pass through the single-effect translator
+    directly.
+    """
+    if py_eff is None:
+        return [], []
+    cls_name = type(py_eff).__name__
+    if cls_name == "Sequence":
+        sub_effects = getattr(py_eff, "effects", ())
+        translated: list[dict] = []
+        unsupported: list[str] = []
+        for sub in sub_effects:
+            t = _translate_one_effect(sub, token_registrar=token_registrar)
+            if t is not None:
+                translated.append(t)
+            else:
+                unsupported.append(type(sub).__name__)
+        return translated, unsupported
+    t = _translate_one_effect(py_eff, token_registrar=token_registrar)
+    if t is not None:
+        return [t], []
+    return [], [cls_name]
 
 
 def _mana_cost_to_dict(mc) -> dict:
@@ -483,7 +768,7 @@ def _mana_cost_to_dict(mc) -> dict:
     return out
 
 
-def python_card_to_rust_recipe(py_card) -> dict:
+def python_card_to_rust_recipe(py_card, *, token_registrar=None) -> dict:
     """Translate one Python ``CardPrinting`` to a Rust registry dict.
 
     Returned dict carries the keys ``parse_printing`` in rust/src/cards.rs
@@ -492,16 +777,28 @@ def python_card_to_rust_recipe(py_card) -> dict:
     Any Python-side concept the Rust closed vocab doesn't model
     (oracle_text, set_code, supertypes, subtypes, triggered_abilities
     beyond plain ETBs, activated_abilities beyond tap-for-mana,
-    spell_effect nesting via Sequence/Modal) is silently dropped. The
+    spell_effect nesting via ModalChooseOne) is silently dropped. The
     returned dict also carries an out-of-band ``_unsupported_effects``
     list of bare class names whose translation failed -- callers
     surface that in their stats roll-up.
+
+    ``token_registrar`` is an optional callable used by translators
+    that need to pre-register a sub-printing (CreateToken) with the
+    enclosing Rust registry. It takes the Python ``CardPrinting`` of
+    the token and returns the Rust printing id assigned to it. When
+    ``None`` (e.g. ad-hoc translator calls without a registry yet),
+    CreateToken effects fall through to unsupported.
 
     The translator is best-effort and lossy; per parity-smoke's
     measurement-first stance, a recipe that lands SOMETHING (an empty
     effects list with the right card_types / mana_cost / mana_produced)
     is more useful for the 1000-game smoke than refusing to translate
     cards with effects Rust doesn't know about yet.
+
+    ``Sequence`` spell_effects are unpacked one level: each translatable
+    sub-effect lands as a separate Rust effect; failed sub-effects are
+    recorded individually in ``_unsupported_effects`` (so the per-card
+    stat correctly attributes the gap to the inner class).
     """
     # Accept either a Python ``CardPrinting`` (real path) or a plain
     # dict (lets tests stub a card without instantiating the dataclass).
@@ -537,15 +834,19 @@ def python_card_to_rust_recipe(py_card) -> dict:
     power = py_card.power
     toughness = py_card.toughness
 
-    # effects: from spell_effect (instants/sorceries) — walk one level.
+    # effects: from spell_effect (instants/sorceries) — walk one level
+    # via the Sequence-unpacking helper. A bare effect yields [one_dict];
+    # a Sequence yields the per-sub translation list; both update the
+    # unsupported list with class names of sub-effects that couldn't
+    # translate.
     effects: list[dict] = []
     spell_effect = getattr(py_card, "spell_effect", None)
     if spell_effect is not None:
-        translated = _translate_one_effect(spell_effect)
-        if translated is not None:
-            effects.append(translated)
-        else:
-            unsupported.append(type(spell_effect).__name__)
+        translated_list, sub_unsupported = _translate_effect_or_sequence(
+            spell_effect, token_registrar=token_registrar,
+        )
+        effects.extend(translated_list)
+        unsupported.extend(sub_unsupported)
 
     # etb_effects: walk triggered_abilities, pick out the ones whose
     # event is "enters the battlefield" and whose effect translates.
@@ -557,13 +858,16 @@ def python_card_to_rust_recipe(py_card) -> dict:
         event = getattr(ta, "event", None)
         event_name = getattr(event, "name", "") if event is not None else ""
         if event_name != "ENTERS":
+            # Non-ETB triggers (IS_CAST, ATTACKS, DIES, etc.) have no
+            # Rust counterpart yet -- record the inner-effect class
+            # name as unsupported so the gap is attributed correctly.
             unsupported.append(type(ta.effect).__name__)
             continue
-        translated = _translate_one_effect(ta.effect)
-        if translated is not None:
-            etb_effects.append(translated)
-        else:
-            unsupported.append(type(ta.effect).__name__)
+        translated_list, sub_unsupported = _translate_effect_or_sequence(
+            ta.effect, token_registrar=token_registrar,
+        )
+        etb_effects.extend(translated_list)
+        unsupported.extend(sub_unsupported)
 
     # activated_abilities: harvested implicitly via ``mana_produced``.
     # Non-mana activated abilities are unsupported and counted.
@@ -698,6 +1002,28 @@ def make_rust_state_from_python_decklist(
     unsupported_classes: set[str] = set()
     cards_with_unsupported = 0
 
+    # Token printings are sub-printings referenced by CreateToken
+    # effects on top-level cards. They need their own Rust registry
+    # entries before any effect that references them. Cache by token
+    # name so the same Drone / Robot / Soldier token (cross-card) only
+    # registers once.
+    token_name_to_pid: dict[str, int] = {}
+
+    def _token_registrar(token_printing) -> int:
+        tname = token_printing.name
+        if tname in token_name_to_pid:
+            return token_name_to_pid[tname]
+        # Translate the token recursively (no nested CreateToken
+        # expected; if one shows up, it falls through to unsupported
+        # at the inner level rather than recursing further).
+        sub_recipe = python_card_to_rust_recipe(
+            token_printing, token_registrar=None,
+        )
+        sub_recipe.pop("_unsupported_effects", None)
+        sub_pid = reg.register_printing(sub_recipe)
+        token_name_to_pid[tname] = sub_pid
+        return sub_pid
+
     unique_names: list[str] = []
     seen: set[str] = set()
     for n in card_names:
@@ -707,7 +1033,9 @@ def make_rust_state_from_python_decklist(
 
     for name in unique_names:
         if name in py_printings:
-            recipe = python_card_to_rust_recipe(py_printings[name])
+            recipe = python_card_to_rust_recipe(
+                py_printings[name], token_registrar=_token_registrar,
+            )
         else:
             try:
                 recipe = get_builtin_card_recipe(name)
