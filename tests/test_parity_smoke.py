@@ -812,3 +812,156 @@ def test_field_diff_mode_unknown_inject_field_errors(parity_smoke, capsys):
     out = capsys.readouterr().out
     assert "ERROR" in out
     assert "this_is_not_a_field" in out
+
+
+# ---------------------------------------------------------------------------
+# --mode cross-engine-game — Phase-5 prep. Drive Python + Rust through the
+# SAME deterministic decision sequence one step at a time and report the
+# first decision index where they diverge per field. The smoke is expected
+# to trip on the known G1-G24 gaps in docs/RUST_PARITY_GAPS.md (specifically
+# G3 — Rust pass_priority is a pure toggle, Python is a no-op — fires on
+# decision 0 for any seed because pass_priority is the only legal Rust
+# action at PHASE_UNTAP). The harness's deliverable is the measurement,
+# not a parity-clean run.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_engine_game_mode_runs_end_to_end_fixed_seed(parity_smoke, capsys):
+    """Mode runs end-to-end on a fixed seed without raising. The exit
+    code is 0 OR 1 (a measurement outcome — neither is wrong), but the
+    process must not abort with an unhandled exception."""
+    rc = parity_smoke.run_cross_engine_game_mode(seed=42, num_decisions=5)
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    assert "[cross-engine-game]" in out
+    # Either PASS or FAIL — both are acceptable outcomes for the measurement.
+    assert ("PARITY: PASS" in out) or ("PARITY: FAIL" in out)
+
+
+@pytest.mark.parametrize("seed", [42, 7, 123, 999, 2026])
+def test_cross_engine_game_mode_returns_0_or_1_across_seeds(
+    parity_smoke, capsys, seed
+):
+    """Across multiple seeds the mode either passes (exit 0) or
+    detects a divergence (exit 1) — never an unhandled exception or
+    a different rc value. Locks in the "robust to seed variation"
+    contract from the task brief."""
+    rc = parity_smoke.run_cross_engine_game_mode(seed=seed, num_decisions=5)
+    assert rc in (0, 1), f"seed={seed}: rc={rc} (expected 0 or 1)"
+    _ = capsys.readouterr()  # drain the captured output
+
+
+def test_cross_engine_game_mode_output_table_has_expected_columns(
+    parity_smoke, capsys
+):
+    """The per-decision output table contains the expected column
+    headers: step, rust_action, python_action, verdict. Pin the
+    column names so a future column rename surfaces as a test
+    failure rather than as silent loss of operator-readable output."""
+    parity_smoke.run_cross_engine_game_mode(seed=42, num_decisions=3)
+    out = capsys.readouterr().out
+    # Header line — all four column names in order.
+    assert "step" in out
+    assert "rust_action" in out
+    assert "python_action" in out
+    assert "verdict" in out
+    # Separator row — pin so a future "wider table" change is intentional.
+    assert "-----" in out
+
+
+def test_cross_engine_game_mode_divergence_reports_field_name(
+    parity_smoke, capsys
+):
+    """When the mode catches a divergence, the output mentions a
+    field name from FIELD_DIFF_FIELDS. With Forest-only decks at
+    seed 42 the G3 pure-toggle pass_priority gap fires on decision 0
+    and the diverging field is ``priority_player`` — pinning this
+    specific known-gap surfacing locks in that the measurement loop
+    is actually exercising the per-step field-diff machinery (not
+    silently passing on a stale early return)."""
+    rc = parity_smoke.run_cross_engine_game_mode(seed=42, num_decisions=5)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "PARITY: FAIL" in out
+    # Some field from the canonical FIELD_DIFF_FIELDS list must appear
+    # in the divergence report — this is the load-bearing contract
+    # (the report tells the operator WHICH field diverged).
+    matching = [f for f in parity_smoke.FIELD_DIFF_FIELDS if f in out]
+    assert matching, (
+        f"divergence output should cite at least one field from "
+        f"FIELD_DIFF_FIELDS; got output:\n{out}"
+    )
+    # G3 specifically: pass_priority toggles the priority_player field
+    # in Rust but is a no-op in Python, so decision 0 always diverges
+    # there. If a future Rust slice closes G3 this assertion needs to
+    # be relaxed — but until then it's the specific signal we want.
+    assert "priority_player" in out
+
+
+def test_cross_engine_game_mode_zero_decisions_passes(parity_smoke, capsys):
+    """``--num-decisions 0`` exercises the "initial states match,
+    no decisions applied" path. Initial-state setup matches between
+    Python and Rust under the cross-engine canonicalization (zone
+    contents byte-equal after the id-slot / summoning-sick /
+    mana-pool normalizations), so the loop runs zero iterations and
+    returns 0. Locks in the smoke-of-the-smoke: the mode CAN exit 0
+    when no divergence is detected, not just exit 1 on every seed."""
+    rc = parity_smoke.run_cross_engine_game_mode(seed=42, num_decisions=0)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PARITY: PASS" in out
+    assert "0 decisions applied" in out
+
+
+def test_cross_engine_game_mode_main_dispatches(
+    parity_smoke, monkeypatch, capsys
+):
+    """``main() --mode cross-engine-game`` routes to the new
+    comparison path. End-to-end argparse + dispatch smoke. Accepts
+    either rc=0 or rc=1 since the measurement outcome depends on
+    Rust+Python state agreement under the current G1-G24 gap set."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "parity_smoke.py",
+            "--mode",
+            "cross-engine-game",
+            "--seed",
+            "42",
+            "--num-decisions",
+            "3",
+        ],
+    )
+    rc = parity_smoke.main()
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    assert "[cross-engine-game]" in out
+
+
+def test_cross_engine_game_mode_translates_card_ids_via_position(parity_smoke):
+    """Direct unit on the Rust-id -> Python-id translator. Python
+    and Rust allocate per-object ids in different orders so the
+    harness translates by zone-position; this test exercises that
+    bridge in isolation without depending on which gap fires first
+    in the full run."""
+    import mtg_bot_engine
+    py_state = parity_smoke._build_python_state_for_cross_engine(42)
+    rs_state = parity_smoke._build_rust_state_for_cross_engine(py_state)
+
+    # The first card in Rust's p0 hand should translate to the first
+    # card in Python's p0 hand — both are Forests (interchangeable),
+    # but position is the stable correspondence.
+    rust_hand = rs_state.hand_snapshot(0)
+    rust_first_id = rust_hand[0]["id"]
+    py_first_id = py_state.players[0].hand[0].id
+
+    translated = parity_smoke._translate_rust_card_id(
+        rust_first_id, rs_state, py_state
+    )
+    assert translated == py_first_id
+
+    # An id that doesn't exist on either side translates to None.
+    assert parity_smoke._translate_rust_card_id(
+        99999, rs_state, py_state
+    ) is None
