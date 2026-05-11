@@ -7502,3 +7502,614 @@ def test_resolve_destroy_target_land_skips_active_players_own(engine):
     assert state.find_object_zone(own_land_id) == ZONE_BATTLEFIELD
     assert state.battlefield_sizes[0] == p0_bf_before
     assert state.battlefield_sizes[1] == p1_bf_before
+
+
+# --- multi-effect resolution chains (cross-arm dependencies) --------
+#
+# These tests cover sequences where one Effect's resolution influences
+# whether or how the next Effect resolves correctly. The single-Effect
+# tests above each verify their dispatch in isolation; the chain tests
+# verify that the **effect order matters** — specifically that the
+# bf[0]-of-defender / bf[0]-of-active targeting convention re-reads the
+# battlefield AFTER the previous effect mutated it.
+#
+# Sequencing options exercised here:
+#
+# 1. **Within a single multi-effect printing** — `effects: [E1, E2]`
+#    fires E1 then E2 from one stack-item resolution. Used when both
+#    effects share the same controller / source / target convention
+#    (e.g. DealDamage + DestroyTarget on the same any_creature target).
+#
+# 2. **Across stack items** — push A then B, resolve top (B) first.
+#    Used for counter chains (B counters A) and for cases where the
+#    resolved state needs to settle between effects (e.g. CounterTarget
+#    A->B->C topmost-non-self).
+#
+# The point of these tests is to surface behaviors that look right in
+# isolation but break when chained — e.g. bf[0] re-reading after
+# mutation, fizzle paths through cleared zones, SBA interactions with
+# counter-induced toughness changes.
+
+
+def _zap_then_destroy_dict():
+    """Multi-effect: deal 1 damage to any_creature, THEN destroy_target
+    (any_creature). Both effects target the FIRST creature on the
+    defender's battlefield (smallest index). After E1 the target's
+    damage marker is 1; after E2 the SAME target moves to graveyard
+    (damage doesn't move the object, so bf[0] is still the same obj).
+    The net effect on the destroyed object is: it lands in graveyard
+    via destroy_target's path, and per CR 400.7 the damage marker
+    resets on zone change."""
+    return {
+        "name": "Test Zap-Then-Destroy",
+        "card_types": ["Instant"],
+        "mana_cost": {"B": 1, "R": 1},
+        "effects": [
+            {
+                "kind": "deal_damage",
+                "amount": 1,
+                "target": {"kind": "any_creature"},
+            },
+            {
+                "kind": "destroy_target",
+                "target": {"kind": "any_creature"},
+            },
+        ],
+    }
+
+
+def test_resolve_chain_damage_then_destroy_same_target_one_move(
+    synthetic_state,
+):
+    """Multi-effect chain [DealDamage, DestroyTarget] both targeting
+    any_creature. Both effects pick the defender's bf[0] (obj_id 67 in
+    the synthetic seed). E1 stamps damage=1 on bf[0] (object stays);
+    E2 destroys bf[0] (object moves to graveyard, damage marker reset
+    by zone change per CR 400.7).
+
+    The chain-load-bearing assertion: defender's battlefield shrinks by
+    EXACTLY one, defender's graveyard grows by EXACTLY one — the second
+    effect didn't accidentally re-pick the same object after the first
+    moved it, nor did it pick a different bf[0] after E1 (DealDamage
+    doesn't move objects).
+    """
+    target_obj_id = 67  # First p1 battlefield object (Forest).
+    assert synthetic_state.find_object_zone(target_obj_id) == ZONE_BATTLEFIELD
+    assert synthetic_state.get_damage(target_obj_id) == 0
+    p1_bf_before = synthetic_state.battlefield_sizes[1]
+    p1_grave_before = synthetic_state.graveyard_sizes[1]
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _zap_then_destroy_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # Target moved bf -> graveyard exactly once; damage marker reset on
+    # zone change.
+    assert synthetic_state.find_object_zone(target_obj_id) == ZONE_GRAVEYARD
+    assert synthetic_state.battlefield_sizes[1] == p1_bf_before - 1
+    assert synthetic_state.graveyard_sizes[1] == p1_grave_before + 1
+    assert synthetic_state.get_damage(target_obj_id) == 0
+    # Stack drained, source instant in p0's graveyard.
+    assert synthetic_state.is_stack_empty() is True
+    assert synthetic_state.find_object_zone(spell_obj_id) == ZONE_GRAVEYARD
+
+
+def test_resolve_chain_three_counters_topmost_non_self(synthetic_state):
+    """Triple counter chain. Push A, B, C from bottom to top — all
+    three are Annul-shaped counterspells. Resolve top once: C counters
+    B (the topmost-non-self), C post-resolves to its controller's
+    graveyard. Stack now has [A] (B was removed mid-resolve). Resolve
+    top again: A is now "only-self" — fizzle silently, then A
+    post-resolves to its controller's graveyard.
+
+    The chain-load-bearing assertion: B never resolves (its
+    counter-target effect never fires — it was removed from the stack
+    before its own resolution), and the final stack-empty + three
+    graveyard moves all land correctly. Specifically guards against an
+    off-by-one where "A is now top after B was removed" gets confused
+    with "A was the one countered".
+    """
+    a_obj_id = synthetic_state.register_and_inject_object(
+        _annul_dict(), 0, ZONE_HAND
+    )
+    b_obj_id = synthetic_state.register_and_inject_object(
+        _annul_dict(), 0, ZONE_HAND
+    )
+    c_obj_id = synthetic_state.register_and_inject_object(
+        _annul_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(a_obj_id, 0)
+    synthetic_state.push_to_stack(b_obj_id, 0)
+    synthetic_state.push_to_stack(c_obj_id, 0)
+    assert synthetic_state.stack_size() == 3
+    p0_grave_before = synthetic_state.graveyard_sizes[0]
+
+    # First resolve: C counters B, then C post-resolves to graveyard.
+    synthetic_state.resolve_top_of_stack()
+
+    assert synthetic_state.stack_size() == 1
+    top = synthetic_state.peek_top_of_stack()
+    assert top == {"source_obj_id": a_obj_id, "controller": 0}
+    assert synthetic_state.find_object_zone(b_obj_id) == ZONE_GRAVEYARD
+    assert synthetic_state.find_object_zone(c_obj_id) == ZONE_GRAVEYARD
+    # A still in hand, not on stack-source-zone.
+    assert synthetic_state.find_object_zone(a_obj_id) == ZONE_HAND
+
+    # Second resolve: A is now only-self -> silent fizzle, A
+    # post-resolves to graveyard.
+    synthetic_state.resolve_top_of_stack()
+    assert synthetic_state.is_stack_empty() is True
+    assert synthetic_state.find_object_zone(a_obj_id) == ZONE_GRAVEYARD
+    # Three sources in p0's graveyard (A, B, C).
+    assert synthetic_state.graveyard_sizes[0] == p0_grave_before + 3
+
+
+def _draw_then_discard_dict(draw_count=2):
+    """Multi-effect: draw N cards, then make defender discard one.
+    The chain test verifies hand-size invariants on both sides
+    (controller's hand vs defender's hand) since the two effects route
+    to DIFFERENT players' hands."""
+    return {
+        "name": "Test Draw-Then-Discard",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"B": 1, "U": 1},
+        "effects": [
+            {"kind": "draw_cards", "count": draw_count},
+            {
+                "kind": "discard_card",
+                "target": {"kind": "any_player"},
+            },
+        ],
+    }
+
+
+def test_resolve_chain_draw_then_discard_hand_size_invariants(
+    synthetic_state,
+):
+    """Multi-effect chain [DrawCards N, DiscardCard]. Source is a
+    Sorcery in p0's hand; defender = p1.
+
+    Controller hand delta: -1 (source leaves hand on cast/post-resolve)
+    + N (draw). Defender hand delta: -1 (one card discarded).
+
+    The chain-load-bearing assertion: the discard effect targets p1's
+    hand, NOT p0's. Even though p0 just drew, the second effect's
+    target is the DEFENDER and is unaffected by what p0's hand size
+    became. A bug where discard accidentally pulled from active-player
+    instead of defender would surface as an off-by-one on either side.
+    """
+    n = 2
+    p1_hand_before = synthetic_state.hand_sizes[1]
+    p1_grave_before = synthetic_state.graveyard_sizes[1]
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _draw_then_discard_dict(draw_count=n), 0, ZONE_HAND
+    )
+    # Capture sizes AFTER register (which itself adds 1 to p0's hand)
+    # so the post-resolve assertion has a clean baseline.
+    p0_hand_before = synthetic_state.hand_sizes[0]
+    p0_library_before = synthetic_state.library_sizes[0]
+
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # p0: drew N, source left hand on post-resolve. Net: -1 + N.
+    assert synthetic_state.hand_sizes[0] == p0_hand_before - 1 + n
+    assert synthetic_state.library_sizes[0] == p0_library_before - n
+    # p1: discarded 1 card to graveyard.
+    assert synthetic_state.hand_sizes[1] == p1_hand_before - 1
+    assert synthetic_state.graveyard_sizes[1] == p1_grave_before + 1
+
+
+def _two_mana_then_two_mana_dict():
+    """Multi-effect: add G to active player's pool, THEN add R. Verifies
+    Effect-driven mana additions accumulate in the same resolution."""
+    return {
+        "name": "Test Bicycle Land",
+        "card_types": ["Land"],
+        "effects": [
+            {"kind": "add_mana_to_pool", "color": "G", "amount": 1},
+            {"kind": "add_mana_to_pool", "color": "R", "amount": 1},
+        ],
+    }
+
+
+def test_resolve_chain_add_mana_pool_accumulates_across_effects(
+    synthetic_state,
+):
+    """Two AddManaToPool effects in sequence within one printing both
+    credit the active player's pool. Pre-seed G=2 via the round-2
+    primitive so the assertion proves the second effect didn't
+    accidentally reset the prior credit (i.e. AddManaToPool's
+    saturating_add path is reached, not a slot-overwrite).
+
+    The chain-load-bearing assertion: pool[G] grows from 2 to 3 (not
+    1 — slot wasn't overwritten by E2's R-side write), and pool[R]
+    grows from 0 to 1.
+    """
+    # Pre-seed.
+    synthetic_state.add_mana(0, "G", 2)
+    pre = dict(synthetic_state.get_mana_pool(0))
+    assert pre["G"] == 2
+    assert pre["R"] == 0
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _two_mana_then_two_mana_dict(), 0, ZONE_BATTLEFIELD
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    pool = dict(synthetic_state.get_mana_pool(0))
+    # G grew by 1 (preserved prior 2); R grew by 1 (fresh slot).
+    assert pool["G"] == 3
+    assert pool["R"] == 1
+    # Other colors stay 0.
+    assert pool["U"] == 0 and pool["W"] == 0 and pool["B"] == 0 and pool["C"] == 0
+
+
+def _destroy_then_return_dict():
+    """Multi-effect: destroy_target then return_to_hand, both
+    any_creature. After E1, the original bf[0] is gone; E2 must
+    re-read bf[0] and either fizzle (if empty) or target the new
+    bf[0]. With multiple defender bf objects, E2 picks the NEW bf[0]
+    (the object that slid into index 0 after the destroy)."""
+    return {
+        "name": "Test Destroy-Then-Bounce",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"B": 1, "U": 1},
+        "effects": [
+            {
+                "kind": "destroy_target",
+                "target": {"kind": "any_creature"},
+            },
+            {
+                "kind": "return_to_hand",
+                "target": {"kind": "any_creature"},
+            },
+        ],
+    }
+
+
+def test_resolve_chain_destroy_then_return_picks_new_bf_zero(
+    synthetic_state,
+):
+    """Multi-effect chain [DestroyTarget, ReturnToHand]. With 10 p1
+    battlefield objects (synthetic seed), E1 destroys p1's bf[0] (obj
+    67, Forest) — bf[1] (obj 68, Forest) slides into index 0. E2 then
+    re-reads bf[0] and bounces the NEW bf[0] (obj 68) to p1's hand.
+
+    The chain-load-bearing assertion: TWO different defender objects
+    end up moved — one to graveyard (the destroyed one), one to hand
+    (the bounced one). A bug where the second effect cached the
+    original bf[0] obj_id would surface as the same object being
+    "moved" twice (or only one move happening at all).
+    """
+    destroyed_id = 67  # p1's bf[0] before resolution.
+    bounced_id = 68    # p1's bf[1] before resolution — slides to bf[0].
+    assert synthetic_state.find_object_zone(destroyed_id) == ZONE_BATTLEFIELD
+    assert synthetic_state.find_object_zone(bounced_id) == ZONE_BATTLEFIELD
+    p1_bf_before = synthetic_state.battlefield_sizes[1]
+    p1_grave_before = synthetic_state.graveyard_sizes[1]
+    p1_hand_before = synthetic_state.hand_sizes[1]
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _destroy_then_return_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # First object went to graveyard, second went to hand. Net bf -2.
+    assert synthetic_state.find_object_zone(destroyed_id) == ZONE_GRAVEYARD
+    assert synthetic_state.find_object_zone(bounced_id) == ZONE_HAND
+    assert synthetic_state.battlefield_sizes[1] == p1_bf_before - 2
+    assert synthetic_state.graveyard_sizes[1] == p1_grave_before + 1
+    assert synthetic_state.hand_sizes[1] == p1_hand_before + 1
+
+
+def _exile_then_damage_dict(damage_amount=3):
+    """Multi-effect: exile_target then deal_damage (any_creature). The
+    exile removes the original bf[0]; damage then targets the new
+    bf[0]. The CHAIN guarantees the damage never lands on the exiled
+    object (which has been removed and per CR 400.7 had its damage
+    marker reset)."""
+    return {
+        "name": "Test Exile-Then-Zap",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"W": 1, "R": 1},
+        "effects": [
+            {
+                "kind": "exile_target",
+                "target": {"kind": "any_creature"},
+            },
+            {
+                "kind": "deal_damage",
+                "amount": damage_amount,
+                "target": {"kind": "any_creature"},
+            },
+        ],
+    }
+
+
+def test_resolve_chain_exile_then_damage_damage_lands_on_new_target(
+    synthetic_state,
+):
+    """Multi-effect chain [ExileTarget, DealDamage]. E1 exiles p1's
+    bf[0] (obj 67, Forest); E2 deals damage to the NEW bf[0] (obj 68
+    after the shift).
+
+    The chain-load-bearing assertion: damage=0 on the exiled object
+    (it has left the battlefield and reset state on zone change) AND
+    damage=N on the new bf[0]. A bug where DealDamage doesn't re-read
+    bf[0] would either crash trying to write to the now-exiled object,
+    or no-op when it should have hit the new bf[0].
+    """
+    exiled_id = 67  # p1's bf[0] before resolution.
+    damaged_id = 68  # p1's bf[1] — slides to bf[0] after exile.
+    n = 3
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _exile_then_damage_dict(damage_amount=n), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # First object in p1's exile; damage on it is reset.
+    assert synthetic_state.exile_contains(exiled_id) is True
+    assert synthetic_state.exile_object_damage(exiled_id) == 0
+    # Second object took the damage hit and is still on battlefield.
+    assert synthetic_state.find_object_zone(damaged_id) == ZONE_BATTLEFIELD
+    assert synthetic_state.get_damage(damaged_id) == n
+
+
+def _wrath_then_destroy_nonland_dict():
+    """Multi-effect: destroy_all_creatures then destroy_target_nonland_
+    permanent. After the wrath clears creatures, only lands remain on
+    defender's battlefield — the second effect finds no nonland-
+    permanent target and silently fizzles."""
+    return {
+        "name": "Test Wrath-Then-Strip",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"W": 1, "B": 1, "generic": 3},
+        "effects": [
+            {"kind": "destroy_all_creatures"},
+            {"kind": "destroy_target_nonland_permanent"},
+        ],
+    }
+
+
+def test_resolve_chain_wrath_then_destroy_nonland_second_fizzles(
+    synthetic_state,
+):
+    """Multi-effect chain [DestroyAllCreatures, DestroyTargetNonland
+    Permanent]. Synthetic seed: 5 Forests + 5 Bears on each side. E1
+    destroys all 10 Bears (creatures); only Forests (Lands) remain.
+    E2 scans defender's bf for a nonland permanent and finds none —
+    silent fizzle.
+
+    The chain-load-bearing assertion: defender's bf went from 10 to 5
+    (lost all 5 Bears; lands survived); defender's graveyard grew by
+    EXACTLY 5 (Bears) — NOT 6 (which would mean DestroyTargetNonland
+    Permanent accidentally destroyed a land or grabbed something it
+    shouldn't have). The second effect must observe the post-Wrath
+    state, not the pre-Wrath state.
+    """
+    bear_ids_p1 = (72, 73, 74, 75, 76)
+    forest_ids_p1 = (67, 68, 69, 70, 71)
+    p1_bf_before = synthetic_state.battlefield_sizes[1]
+    p1_grave_before = synthetic_state.graveyard_sizes[1]
+    assert p1_bf_before == 10
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _wrath_then_destroy_nonland_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # All Bears destroyed.
+    for cid in bear_ids_p1:
+        assert synthetic_state.find_object_zone(cid) == ZONE_GRAVEYARD
+    # All Forests survived — the second effect found no nonland
+    # target and fizzled.
+    for lid in forest_ids_p1:
+        assert synthetic_state.find_object_zone(lid) == ZONE_BATTLEFIELD
+    # Defender bf shrank by exactly 5 (Bears); graveyard grew by
+    # exactly 5 (Bears) — NOT 6.
+    assert synthetic_state.battlefield_sizes[1] == p1_bf_before - 5
+    assert synthetic_state.graveyard_sizes[1] == p1_grave_before + 5
+
+
+def _zap_player_then_gain_life_dict(damage=2, life=3):
+    """Multi-effect: deal_damage (any_player) then gain_life. Both
+    are player-life adjusters but route to opposite sides — damage
+    hits defender, gain_life heals active player. Verifies independent
+    routing in a single resolution.
+    """
+    return {
+        "name": "Test Zap-And-Heal",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"R": 1, "W": 1, "generic": 1},
+        "effects": [
+            {
+                "kind": "deal_damage",
+                "amount": damage,
+                "target": {"kind": "any_player"},
+            },
+            {"kind": "gain_life", "amount": life},
+        ],
+    }
+
+
+def test_resolve_chain_damage_player_then_gain_life_both_independent(
+    synthetic_state,
+):
+    """Multi-effect chain [DealDamage(any_player), GainLife]. The two
+    effects touch DIFFERENT players' life totals — defender for
+    damage, controller for life — so the final state should reflect
+    BOTH deltas independently (not "net swing" semantics).
+
+    The chain-load-bearing assertion: life_totals[1] dropped by
+    `damage` and life_totals[0] rose by `life`. A bug where the
+    GainLife accidentally routed to the just-damaged defender (or
+    where the order of the effects collapsed onto a single life total)
+    would surface as an off-by-one or as one of the two effects
+    appearing to no-op.
+    """
+    damage = 2
+    life = 3
+    life_before = list(synthetic_state.life_totals)
+    assert life_before == [20, 20]
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _zap_player_then_gain_life_dict(damage=damage, life=life),
+        0,
+        ZONE_HAND,
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # Both deltas land independently.
+    assert synthetic_state.life_totals[0] == life_before[0] + life
+    assert synthetic_state.life_totals[1] == life_before[1] - damage
+
+
+def _search_then_scry_dict(search_count=1, scry_count=2):
+    """Multi-effect: search_library_for_basic_land_tapped then scry_n.
+    Both touch the top of the library — the search yanks a Land and
+    shuffles isn't modeled (first-slice deterministic pick); the scry
+    then looks at the new top. First-slice scry keeps all on top, so
+    the chain is observable as: library shrank by `search_count`, and
+    no error occurred mid-chain.
+    """
+    return {
+        "name": "Test Search-Then-Scry",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"G": 1, "U": 1},
+        "effects": [
+            {
+                "kind": "search_library_for_basic_land_tapped",
+                "count": search_count,
+            },
+            {"kind": "scry_n", "count": scry_count},
+        ],
+    }
+
+
+def test_resolve_chain_search_library_then_scry_composes(synthetic_state):
+    """Multi-effect chain [SearchLibraryForBasicLandTapped, ScryN].
+    Synthetic seed: p0 library is 50 Forests (lands). E1 yanks one
+    Forest from the library onto p0's battlefield (tapped). E2
+    scry-2's — first-slice keep-all-on-top, mechanically a no-op on
+    the library.
+
+    The chain-load-bearing assertion: library shrank by exactly 1
+    (from the search), bf grew by exactly 1 (the tapped Forest), AND
+    the second effect (ScryN) didn't crash on the post-search library
+    state. A bug where ScryN walked a stale top-of-library snapshot
+    cached from before the search would surface as a panic on an
+    off-by-one index read.
+    """
+    p0_lib_before = synthetic_state.library_sizes[0]
+    p0_bf_before = synthetic_state.battlefield_sizes[0]
+
+    spell_obj_id = synthetic_state.register_and_inject_object(
+        _search_then_scry_dict(search_count=1, scry_count=2),
+        0,
+        ZONE_HAND,
+    )
+    synthetic_state.push_to_stack(spell_obj_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    # Library -1 (search), bf +1 (the tapped Forest from the search).
+    assert synthetic_state.library_sizes[0] == p0_lib_before - 1
+    assert synthetic_state.battlefield_sizes[0] == p0_bf_before + 1
+    # Stack drained cleanly.
+    assert synthetic_state.is_stack_empty() is True
+
+
+def _minus_one_counters_then_pyroclasm_dict(counter_amount=-1, damage=1):
+    """Multi-effect: add -1/-1 counters to any_creature, THEN
+    damage_each_creature. The counter shrinks the bf[0] creature's
+    effective toughness; the damage marks every creature. After the
+    resolution, apply_sbas should kill the counter-shrunk creature
+    (because its effective toughness is now <= marked damage) AND any
+    other creature whose toughness <= damage."""
+    return {
+        "name": "Test Wither-Then-Pyroclasm",
+        "card_types": ["Sorcery"],
+        "mana_cost": {"B": 1, "R": 1},
+        "effects": [
+            {
+                "kind": "add_counters",
+                "count": counter_amount,
+                "target": {"kind": "any_creature"},
+            },
+            {
+                "kind": "damage_each_creature",
+                "amount": damage,
+            },
+        ],
+    }
+
+
+def test_resolve_chain_minus_counter_then_damage_each_creature_sba_kills(
+    engine,
+):
+    """Multi-effect chain [AddCounters(-1, any_creature),
+    DamageEachCreature(1)] with explicit creatures injected so the
+    -1/-1 lands on a creature (not a Forest land like the synthetic
+    seed's bf[0]).
+
+    Setup: each side has one 2/2 vanilla creature on bf[0]. E1 stamps
+    -1 counters on defender's bf[0] (a 2/2 -> effectively 1/1). E2
+    marks damage=1 on every creature on both sides — both 2/2's now
+    have damage=1.
+
+    After resolution + apply_sbas:
+    - defender's bf[0]: marked damage=1 AND effective toughness=1
+      (2 + (-1) counters = 1). 1 >= 1 -> destroyed by CR 704.5g (lethal
+      damage).
+    - active's bf[0]: marked damage=1 AND effective toughness=2.
+      1 < 2 -> survives.
+
+    The chain-load-bearing assertion: apply_sbas returns EXACTLY 1
+    (only one death), and only the counter-shrunk creature died. A bug
+    where DamageEachCreature ran BEFORE AddCounters in the effects
+    list would surface as no death (both creatures keep their 2
+    toughness against 1 damage). A bug where SBA fires once per
+    creature in the chain would surface as 2 deaths.
+    """
+    state = engine.make_synthetic_state(
+        num_battlefield=0, num_hand=1, num_library=1
+    )
+    p0_bear = state.register_and_inject_object(
+        _wrath_vanilla_creature_dict(), 0, ZONE_BATTLEFIELD
+    )
+    p1_bear = state.register_and_inject_object(
+        _wrath_vanilla_creature_dict(), 1, ZONE_BATTLEFIELD
+    )
+
+    spell_obj_id = state.register_and_inject_object(
+        _minus_one_counters_then_pyroclasm_dict(
+            counter_amount=-1, damage=1
+        ),
+        0,
+        ZONE_HAND,
+    )
+    state.push_to_stack(spell_obj_id, 0)
+    state.resolve_top_of_stack()
+
+    # Both creatures took damage=1 from DamageEachCreature.
+    # The defender's bear has counters=-1 (from AddCounters), active's
+    # has counters=0.
+    assert state.get_damage(p0_bear) == 1
+    assert state.get_damage(p1_bear) == 1
+    assert state.get_counters(p1_bear) == -1
+    assert state.get_counters(p0_bear) == 0
+
+    # SBA pass: exactly one death, the counter-shrunk defender bear.
+    destroyed = state.apply_sbas()
+    assert destroyed == 1
+    assert state.find_object_zone(p1_bear) == ZONE_GRAVEYARD
+    assert state.find_object_zone(p0_bear) == ZONE_BATTLEFIELD
