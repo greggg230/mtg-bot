@@ -1219,6 +1219,254 @@ def test_match_known_gap_returns_g3_for_priority_player_after_pass_priority(
 
 
 # ---------------------------------------------------------------------------
+# G25 step-alignment shim — after Rust r26 closed G3 at the apply_action
+# layer (pass_priority composes CR 117.4 step-advance), the harness
+# mirrors any Rust-side step advance onto Python via
+# ``_align_python_step_to_rust``. These tests pin the shim's contract:
+# (a) when Rust advances step the harness aligns Python and logs a
+# STEP_ALIGNED row, (b) when neither engine advances no alignment row
+# fires, and (c) the cross-engine first-unknown divergence index has
+# shifted PAST the previous pre-fix decision-6 (eoe-draft-style) or
+# decision-18 (Forest) trap that G25 used to mask.
+# ---------------------------------------------------------------------------
+
+
+def test_align_python_step_to_rust_bumps_python_when_rust_advances(
+    parity_smoke,
+):
+    """When Rust just advanced its step (i.e. its global step position
+    moved past the captured pre-position) and Python's step stayed put,
+    ``_align_python_step_to_rust`` bumps Python's step by the same
+    delta. Direct unit on the shim helper — uses minimal stub objects
+    so the test is decoupled from setup_game's deck-stress shape.
+    """
+    from mtg_bot.turn import Step
+
+    class _StubPyState:
+        def __init__(self, step, turn_number=1, active_player_idx=0):
+            self.step = step
+            self.turn_number = turn_number
+            self.active_player_idx = active_player_idx
+
+    class _StubRustState:
+        def __init__(self, step, turn_number=1, active_player_idx=0):
+            self.step = step
+            self.turn_number = turn_number
+            self.active_player_idx = active_player_idx
+
+    py = _StubPyState(step=Step.UNTAP, turn_number=1, active_player_idx=0)
+    rs = _StubRustState(
+        step="UPKEEP", turn_number=1, active_player_idx=0,
+    )
+
+    # Pre-state: Rust was at UNTAP (idx 0); now it's at UPKEEP (idx 1).
+    pre_pos = 1 * 12 + 0  # turn 1, step UNTAP
+    bumps = parity_smoke._align_python_step_to_rust(py, rs, pre_pos)
+    assert bumps == 1
+    assert py.step == Step.UPKEEP
+    # Turn / active_player unchanged on a non-wrap advance.
+    assert py.turn_number == 1
+    assert py.active_player_idx == 0
+
+
+def test_align_python_step_to_rust_no_op_when_neither_engine_advances(
+    parity_smoke,
+):
+    """When Rust did NOT advance (its global step position is unchanged
+    across the action), the shim is a no-op: it returns 0 bumps and
+    leaves Python's step alone. Pins the "STEP_ALIGNED row only fires
+    on actual Rust advance" contract — the negative case must not
+    spuriously log alignment rows."""
+    from mtg_bot.turn import Step
+
+    class _StubPyState:
+        def __init__(self, step, turn_number=1, active_player_idx=0):
+            self.step = step
+            self.turn_number = turn_number
+            self.active_player_idx = active_player_idx
+
+    class _StubRustState:
+        def __init__(self, step, turn_number=1, active_player_idx=0):
+            self.step = step
+            self.turn_number = turn_number
+            self.active_player_idx = active_player_idx
+
+    py = _StubPyState(step=Step.UPKEEP, turn_number=1, active_player_idx=0)
+    rs = _StubRustState(
+        step="UPKEEP", turn_number=1, active_player_idx=0,
+    )
+    pre_pos = 1 * 12 + 1  # turn 1, step UPKEEP — same as current
+    bumps = parity_smoke._align_python_step_to_rust(py, rs, pre_pos)
+    assert bumps == 0
+    assert py.step == Step.UPKEEP  # untouched
+
+
+def test_align_python_step_to_rust_wraps_turn_on_cleanup_advance(
+    parity_smoke,
+):
+    """When Rust wraps from CLEANUP to UNTAP (the turn boundary), the
+    shim bumps Python's step to UNTAP, increments ``turn_number``, and
+    rotates ``active_player_idx``. Mirrors Rust's
+    ``state_ops_steps.rs:advance_phase`` wrap logic exactly so the
+    cross-engine compare lines up at the start of each new turn."""
+    from mtg_bot.turn import Step
+
+    class _StubPyState:
+        def __init__(self, step, turn_number=1, active_player_idx=0):
+            self.step = step
+            self.turn_number = turn_number
+            self.active_player_idx = active_player_idx
+
+    class _StubRustState:
+        def __init__(self, step, turn_number=1, active_player_idx=0):
+            self.step = step
+            self.turn_number = turn_number
+            self.active_player_idx = active_player_idx
+
+    py = _StubPyState(
+        step=Step.CLEANUP, turn_number=1, active_player_idx=0
+    )
+    # Rust just wrapped: turn_number=2, active_player_idx=1, step=UNTAP.
+    rs = _StubRustState(
+        step="UNTAP", turn_number=2, active_player_idx=1,
+    )
+    pre_pos = 1 * 12 + 11  # turn 1, step CLEANUP
+    bumps = parity_smoke._align_python_step_to_rust(py, rs, pre_pos)
+    assert bumps == 1
+    assert py.step == Step.UNTAP
+    assert py.turn_number == 2
+    assert py.active_player_idx == 1
+
+
+def test_cross_engine_game_mode_with_alignment_emits_step_aligned_rows(
+    parity_smoke, capsys
+):
+    """End-to-end shim integration test. With ``ignore_known_gaps=True``
+    and a Forest-only deck, the harness walks several pass_priority
+    pairs. After Rust's r26 closed G3 at the apply_action layer, every
+    even-step pass_priority pair triggers a Rust-side step advance —
+    the shim mirrors it onto Python and emits a ``STEP_ALIGNED`` row.
+
+    Pinning the row label in the trace so a future refactor that
+    drops the informational rendering surfaces here, not in operators'
+    cross-engine traces being silently shorter."""
+    parity_smoke.run_cross_engine_game_mode(
+        seed=42, num_decisions=10, ignore_known_gaps=True
+    )
+    out = capsys.readouterr().out
+    # At least one STEP_ALIGNED row must appear — Rust fires step-advance
+    # every other pass_priority dispatch, so 10 decisions guarantees
+    # multiple alignment events.
+    assert "STEP_ALIGNED" in out, (
+        f"expected the alignment shim to emit a STEP_ALIGNED row "
+        f"after a Rust step advance; trace:\n{out}"
+    )
+    # The row format includes a per-step count ("+N step[s]").
+    assert "STEP_ALIGNED (+1 step" in out
+
+
+def test_cross_engine_game_mode_no_step_aligned_row_when_no_rust_advance(
+    parity_smoke, capsys
+):
+    """The very first dispatched action (decision 0) is a pass_priority,
+    and Rust's `consecutive_passes` counter is 0 going in — the FIRST
+    pass increments to 1 but does NOT fire advance_phase (that needs
+    `>= 2`). So decision 0 should NEVER carry a STEP_ALIGNED row.
+
+    Pins the negative half of the shim contract: alignment fires
+    only on actual Rust advances, never speculatively."""
+    parity_smoke.run_cross_engine_game_mode(
+        seed=42, num_decisions=1, ignore_known_gaps=True
+    )
+    out = capsys.readouterr().out
+    # Decision 0 is a single pass_priority — Rust's consecutive_passes
+    # goes 0 -> 1, no step-advance fires, no STEP_ALIGNED row.
+    assert "STEP_ALIGNED" not in out, (
+        f"unexpected STEP_ALIGNED row at decision 0 — Rust shouldn't "
+        f"have advanced after a single pass_priority. Trace:\n{out}"
+    )
+
+
+def test_cross_engine_game_mode_first_unknown_index_past_pre_fix_g25_trap(
+    parity_smoke, capsys
+):
+    """Post-shim regression gate on the cross-engine first-unknown
+    divergence index. Pre-fix (G25 mask still active in
+    KNOWN_GAP_MASKS) the eoe-draft-style smoke would surface its first
+    unknown divergence at decision 6 — the masked G25 step-drift
+    walked the harness past G3 but the field-diff still tripped on the
+    first cast_spell once the engines reached MAIN1 in different step
+    states. Post-shim, the engines reach MAIN1 in the SAME step state
+    on both sides (Python's step bumps in lockstep with Rust's), so
+    the divergence at decision 6 is no longer the masked-G25 story —
+    it's a real signal worth exposing.
+
+    The expected post-shim first-unknown index for the Forest-only
+    seed-42 case is 18: 18 pass_priority pairs walk through pre-main
+    steps without divergence (STEP_ALIGNED rows mirror Rust's
+    advances) and the first PlayLand at decision 18 surfaces a real
+    `battlefield` divergence (Python lands enter summoning-sick on
+    the engine's flat-grant rule; Rust lands don't — separate gap,
+    unrelated to G25). That's the new first-unknown index this test
+    pins.
+    """
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42, num_decisions=50, ignore_known_gaps=True
+    )
+    # The harness reaches a real divergence, not a step drift.
+    assert rc == 1, (
+        f"expected rc=1 (first unknown divergence past the pass-priority "
+        f"loop), got rc={rc}"
+    )
+    out = capsys.readouterr().out
+    # G3 still masks the pass_priority priority_player toggle.
+    assert "MASKED (G3)" in out
+    # G25 must NOT appear anymore — the shim aligns instead of masking.
+    assert "MASKED (G25" not in out, (
+        f"G25 mask still firing after the alignment shim — the shim "
+        f"should make G25 unnecessary. Trace:\n{out}"
+    )
+    # The post-alignment first-unknown index is past decision 5 (the
+    # pre-shim eoe-preset trip point). Forest-only seed 42 reaches a
+    # PlayLand at decision 18; pinning ">= 6" (not exact equality) so
+    # rng variance from a future numpy/random change doesn't break
+    # the regression gate spuriously.
+    import re
+    match = re.search(
+        r"first UNMASKED divergence at decision (\d+)", out,
+    )
+    assert match is not None, (
+        f"expected a 'first UNMASKED divergence at decision N' line; "
+        f"trace:\n{out}"
+    )
+    decision_idx = int(match.group(1))
+    assert decision_idx >= 6, (
+        f"expected first-unknown divergence at decision >= 6 (past the "
+        f"pre-fix G25 trap); got decision {decision_idx}"
+    )
+
+
+def test_g25_mask_removed_from_known_gap_masks(parity_smoke):
+    """``KNOWN_GAP_MASKS`` no longer contains a ``G25`` entry — the
+    step-alignment shim closes the gap at the harness layer, so the
+    field-diff need not (and should not) silently swallow step-drift
+    rows under a G25 mask. Pins the registry change so a future
+    well-intentioned re-add lands a regression here.
+    """
+    assert "G25" not in parity_smoke.KNOWN_GAP_MASKS, (
+        "G25 should not be in KNOWN_GAP_MASKS — the step-alignment "
+        "shim closes this gap at the harness layer (see "
+        "`_align_python_step_to_rust`). Restoring the mask would "
+        "silently hide alignment-failure cases the shim's WARN log "
+        "is designed to surface."
+    )
+    # G3 mask MUST still be in place — it covers the priority_player
+    # toggle that the shim does NOT touch (the shim only aligns step
+    # / phase / turn / active_player).
+    assert "G3" in parity_smoke.KNOWN_GAP_MASKS
+
+
+# ---------------------------------------------------------------------------
 # --mode cross-engine-game with --deck-preset / --deck-path — real-deck
 # stress (action variety surface). The Forest-only default already
 # exercises G3 / G5 toggle measurement; the real-deck variants drive the

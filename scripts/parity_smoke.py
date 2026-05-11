@@ -1263,24 +1263,18 @@ KNOWN_GAP_MASKS: dict[str, dict] = {
         "fields": ("priority_player",),
         "trigger_action_kinds": ("pass_priority",),
     },
-    # G25: structural step/phase drift downstream of G3's CR 117.4
-    # step-advance composition. Distinct from G3 itself because the
-    # divergence persists across SUBSEQUENT (non-pass_priority)
-    # actions: once Rust composes step-advance, every later action
-    # observes Rust ahead of Python on step/phase/turn/active_player
-    # until Python's outer loop catches its own advance_phase up.
-    # No trigger-action gate — the drift is persistent. See
-    # docs/RUST_PARITY_GAPS.md#G3 for the upstream source and #G25
-    # for the drift entry itself.
-    "G25": {
-        "description": (
-            "step/phase/turn/active_player drift downstream of G3 "
-            "CR 117.4 step-advance — Rust's apply_action(pass_priority) "
-            "advances the step in the dispatcher, Python's stays put "
-            "until its outer loop pumps advance_phase separately"
-        ),
-        "fields": ("step", "phase", "turn", "active_player"),
-    },
+    # G25 was the structural step/phase drift downstream of G3's CR
+    # 117.4 step-advance composition. It is now ALIGNED at the
+    # harness layer by `_align_python_step_to_rust` — after Rust
+    # advances its step via the action composition, the harness
+    # bumps Python's `state.step` (and turn / active_player on the
+    # CLEANUP wrap) to match before the field-diff fires. The mask
+    # entry was removed so any future REAL step divergence — i.e.
+    # the harness's alignment shim itself failing to keep up, or
+    # Rust's step-advance composition drifting — surfaces honestly
+    # as an UNMASKED DIVERGE row instead of being silently swallowed.
+    # See docs/RUST_PARITY_GAPS.md#G25 for the doc entry (kept as
+    # ALIGNED at harness layer for cross-reference).
     # G14: advance_phase does NOT auto-fire draw_card on the DRAW
     # step in Rust. Python's turn machinery DOES draw. Visible as
     # an off-by-one on the active player's hand / library. See
@@ -2206,7 +2200,15 @@ def _print_cross_engine_summary(
     has a single canonical rendering — tests pin the labels here
     once and the divergence / pass / STOP paths can all reuse it.
     """
-    n = max(1, len(rows))
+    # Exclude STEP_ALIGNED informational rows from the decision tally.
+    # They share their `index` with the next real decision row and are
+    # not themselves decisions — counting them inflates the "decisions
+    # in" total and skews the ms/decision figure.
+    decision_rows = [
+        r for r in rows
+        if r is None or not r.verdict.startswith("STEP_ALIGNED")
+    ]
+    n = max(1, len(decision_rows))
     chosen_render = (
         ", ".join(f"{k}={v}" for k, v in sorted(action_kind_counts.items()))
         or "(none)"
@@ -2218,7 +2220,7 @@ def _print_cross_engine_summary(
     distinct_chosen = len(action_kind_counts)
     print()
     print(
-        f"[cross-engine-game] summary: {len(rows)} decisions in "
+        f"[cross-engine-game] summary: {len(decision_rows)} decisions in "
         f"{walk_elapsed:.3f}s ({(walk_elapsed / n) * 1000.0:.2f} ms/decision)"
     )
     print(
@@ -2379,6 +2381,199 @@ def _run_cross_engine_rust_only(
         f"diverged at step {div_step} (seed={seed})"
     )
     return 1
+
+
+# ---------- step-alignment shim (G25 closeout) ---------------------------
+#
+# After Rust's r26 closed G3 at the apply_action layer, Rust's
+# `apply_action({"kind": "pass_priority"})` composes CR 117.4 step-
+# advance via the `consecutive_passes` counter. Python's
+# `apply_action(PassPriority())` does NOT — Python's outer search loop
+# (simulate.run_turn / engine_adapter._advance_to_next_step) drives the
+# step machine separately. The cross-engine harness sits BELOW that
+# outer loop on the Python side: it dispatches actions directly,
+# bypassing run_turn, so Python's step never advances at all.
+#
+# The shim closes G25 at the harness level by mirroring Rust's step
+# advance onto Python's `state.step` (and turn_number / active_player_idx
+# at the CLEANUP wrap). It does NOT modify Python's `apply_action`
+# semantics — production callers (the real search loop, the run-a-game
+# entry point) still drive the step machine from their own outer loop.
+# This is a measurement-tool shim, not an engine fix.
+#
+# The shim is intentionally minimal: it just sets `state.step` to the
+# new Step enum value and (on the CLEANUP -> UNTAP wrap) bumps
+# `state.turn_number` and rotates `state.active_player_idx`. It does
+# NOT fire `run_untap_step`, `run_draw_step`, or the other per-step
+# turn-based actions Python's `simulate.run_step` would — those are
+# G14 / G15 / G16's job (they document Rust-side gaps for the same
+# turn-based actions, so re-firing them on the Python side here would
+# RE-introduce a divergence on the SAME surfaces the documented gaps
+# already track). The shim's contract is "align the step pointer only";
+# downstream zone divergences from skipped TBAs are themselves real
+# parity signals to surface.
+
+# Lazily-imported on first use so `parity_smoke.py` can be loaded
+# without pulling in `mtg_bot.turn` (the import is heavy on first hit
+# because it transitively pulls in the engine module tree).
+_PYTHON_STEP_ORDER = None
+
+
+def _python_step_order():
+    """Return Python's ``STEP_ORDER`` tuple (cached). Lazy import to
+    keep the top of parity_smoke.py cheap to load — only the cross-
+    engine-game mode needs it."""
+    global _PYTHON_STEP_ORDER
+    if _PYTHON_STEP_ORDER is None:
+        from mtg_bot.turn import STEP_ORDER
+        _PYTHON_STEP_ORDER = STEP_ORDER
+    return _PYTHON_STEP_ORDER
+
+
+def _advance_python_step_once(state) -> None:
+    """Bump Python ``state.step`` by exactly one position in
+    ``STEP_ORDER``. On the CLEANUP -> UNTAP wrap, also increment
+    ``turn_number`` and rotate ``active_player_idx`` (mirrors the
+    `_advance_to_next_step` primitive in
+    ``src/mtg_bot/search/engine_adapter.py:1191``, minus the
+    `_step_entered` bookkeeping — the harness doesn't drive
+    per-step pre-priority logic).
+
+    Pre-condition: ``state.step`` is non-None and is a member of
+    ``STEP_ORDER``. The harness only calls this after both engines
+    successfully applied a ``pass_priority`` action, so this holds.
+    """
+    from mtg_bot.turn import Step
+    order = _python_step_order()
+    current = state.step
+    if current == Step.CLEANUP:
+        state.turn_number += 1
+        # Two-player swap. Mirrors Rust's `1 - active_player` in
+        # `state_ops_steps.rs:advance_phase`. If the engine ever
+        # grows past two players, replace with the proper
+        # extra-turn-aware rotation (see
+        # ``simulate._advance_to_next_active_player``).
+        state.active_player_idx = 1 - state.active_player_idx
+        state.step = Step.UNTAP
+    else:
+        idx = order.index(current)
+        state.step = order[idx + 1]
+
+
+def _rust_step_index(step_name: str | None) -> int | None:
+    """Return the 0..11 ordinal position of a Rust step name within
+    ``STEP_ORDER``, or ``None`` if the step is unknown / missing.
+
+    Rust returns the step as an uppercase string (``"UNTAP"``,
+    ``"UPKEEP"``, ...) matching Python ``Step.<NAME>.name`` —
+    documented at ``rust/src/state_ops_steps.rs:step`` getter.
+    """
+    if step_name is None:
+        return None
+    from mtg_bot.turn import Step
+    try:
+        step_enum = Step[step_name]
+    except KeyError:
+        return None
+    return _python_step_order().index(step_enum)
+
+
+def _rust_global_step_pos(rust_state) -> int:
+    """Return a monotonically-increasing "global step position" for
+    a Rust state: ``turn_number * len(STEP_ORDER) + step_index``.
+
+    Used to detect "Rust advanced its step" across a single
+    ``apply_action`` call by comparing pre / post values. Wraps
+    cleanly across the CLEANUP -> UNTAP turn boundary because the
+    turn_number bump compensates for the step_index resetting to 0.
+    A monotonic single integer means "Rust advanced by K steps" is
+    just `post - pre`, no special-casing of the wrap.
+    """
+    step_idx = _rust_step_index(rust_state.step)
+    if step_idx is None:
+        # Mid-setup state with step==None — treat as -1 so the
+        # subtraction still surfaces a "moved off None" delta as
+        # >0 once a real step lands.
+        step_idx = -1
+    return rust_state.turn_number * len(_python_step_order()) + step_idx
+
+
+def _python_global_step_pos(python_state) -> int:
+    """Python-side mirror of ``_rust_global_step_pos``. Reads
+    ``state.step`` (a ``Step`` enum) and translates to its ordinal
+    in ``STEP_ORDER``, then composes with ``turn_number``.
+
+    ``state.step is None`` (fresh state) renders as step_idx -1, same
+    handling as the Rust side.
+    """
+    raw_step = python_state.step
+    order = _python_step_order()
+    if raw_step is None:
+        step_idx = -1
+    else:
+        try:
+            step_idx = order.index(raw_step)
+        except ValueError:
+            step_idx = -1
+    return python_state.turn_number * len(order) + step_idx
+
+
+def _align_python_step_to_rust(
+    python_state, rust_state, pre_rust_pos: int
+) -> int:
+    """If Rust just advanced its step (i.e. its global step position
+    moved past ``pre_rust_pos`` while Python's stayed put), bump
+    Python's step the same number of times.
+
+    Returns the number of step bumps applied to Python (0 if no
+    alignment was needed). The caller logs a STEP_ALIGNED row when
+    the return value is > 0.
+
+    Symmetry contract:
+      - We only align when Rust ADVANCED past Python. The reverse
+        case (Python advanced past Rust) doesn't occur in the harness
+        today because Python's `apply_action` never advances the
+        step on its own; if it ever did, that would be a real
+        bidirectional alignment problem worth surfacing rather than
+        silently masking.
+      - The alignment is a Python-side pointer set, NOT a Python-side
+        engine pump. See the module docstring for `_advance_python_
+        step_once` — turn-based actions (untap sweep, draw step) are
+        deliberately NOT fired here.
+    """
+    post_rust_pos = _rust_global_step_pos(rust_state)
+    pre_py_pos = _python_global_step_pos(python_state)
+
+    rust_delta = post_rust_pos - pre_rust_pos
+    py_delta = _python_global_step_pos(python_state) - pre_py_pos
+
+    if rust_delta <= 0:
+        return 0
+    if py_delta >= rust_delta:
+        # Python advanced on its own (or further). No shim needed.
+        return 0
+
+    # Bump Python's step by (rust_delta - py_delta) positions so its
+    # global step position lands on Rust's.
+    bumps_needed = rust_delta - py_delta
+    for _ in range(bumps_needed):
+        _advance_python_step_once(python_state)
+
+    # Sanity: Python's global step position should now equal Rust's.
+    # Surfacing a mismatch here would mean the step-ordering or
+    # turn-rollover logic drifted between the two engines — load-
+    # bearing for the harness contract.
+    final_py_pos = _python_global_step_pos(python_state)
+    if final_py_pos != post_rust_pos:
+        # Don't raise — the harness should keep walking and surface
+        # the drift as a divergence row downstream. But log it so
+        # operators reading the trace see the shim failed to align.
+        print(
+            f"[cross-engine-game] WARN: step-alignment shim could not "
+            f"reach Rust's position (rust_pos={post_rust_pos}, "
+            f"python_pos={final_py_pos}, bumps_applied={bumps_needed})"
+        )
+    return bumps_needed
 
 
 def run_cross_engine_game_mode(
@@ -2621,6 +2816,12 @@ def run_cross_engine_game_mode(
             action_kind_counts.get(chosen_kind, 0) + 1
         )
 
+        # Snapshot Rust's pre-apply global step position so the
+        # step-alignment shim (G25 closeout) can detect a Rust-side
+        # step advance and mirror it onto Python's `state.step`. See
+        # `_align_python_step_to_rust` for the contract.
+        pre_rust_step_pos = _rust_global_step_pos(rs_state)
+
         # Translate Rust ids to Python ids before building the
         # Python Action (Rust + Python allocate per-object ids in
         # different orders; see ``_translate_rust_card_id`` docstring
@@ -2687,6 +2888,31 @@ def run_cross_engine_game_mode(
             rows.append(row)
             _print_cross_engine_row(row)
             break
+
+        # Step-alignment shim (G25 closeout). Rust's apply_action
+        # composes CR 117.4 step-advance via the `consecutive_passes`
+        # counter; Python's apply_action does not (its outer search
+        # loop drives the step machine separately, but the harness
+        # bypasses that outer loop). After both engines apply, mirror
+        # any Rust-side step advance onto Python so the rest of the
+        # per-step diff compares engines at the same step position.
+        # See `_align_python_step_to_rust` for the contract.
+        alignment_bumps = _align_python_step_to_rust(
+            py_state, rs_state, pre_rust_step_pos
+        )
+        if alignment_bumps > 0:
+            align_row = CrossEngineStep(
+                index=step,
+                rust_label=rust_label,
+                python_label=python_label,
+                verdict=f"STEP_ALIGNED (+{alignment_bumps} step{'s' if alignment_bumps > 1 else ''})",
+            )
+            rows.append(align_row)
+            _print_cross_engine_row(align_row)
+            # Fall through to field-diff so any remaining divergences
+            # (zone deltas, priority shifts, ...) still surface on
+            # this same step index. The STEP_ALIGNED row is purely
+            # informational — it doesn't `continue`-skip the diff.
 
         # Field-diff after both applies succeeded. Use the
         # cross-engine view (7-tuple, no id slot) on both sides —
