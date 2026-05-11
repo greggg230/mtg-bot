@@ -965,3 +965,200 @@ def test_cross_engine_game_mode_translates_card_ids_via_position(parity_smoke):
     assert parity_smoke._translate_rust_card_id(
         99999, rs_state, py_state
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# --ignore-known-gaps — masking flag that skips documented G1-G24
+# divergences so the harness can walk past them and surface the FIRST
+# UNKNOWN divergence. Today the cross-engine harness trips at decision 0
+# on every seed because of G3 (`pass_priority` is a pure toggle in Rust);
+# with the flag set the harness walks indefinitely on a Forest-only deck
+# because the only legal action is pass_priority and G3 catches every
+# divergence.
+# ---------------------------------------------------------------------------
+
+
+def test_known_gap_masks_has_at_least_four_entries_with_gap_citations(
+    parity_smoke,
+):
+    """``KNOWN_GAP_MASKS`` must document at least 4 gaps, each with a
+    clear gap-id citation (G\\d+ shape matching the doc anchors in
+    docs/RUST_PARITY_GAPS.md) and a non-empty ``fields`` tuple of
+    canonical FIELD_DIFF_FIELDS names. Locks in the mask schema so a
+    future "let's add a fifth mask" change can't accidentally land
+    with a wrong-shaped entry."""
+    masks = parity_smoke.KNOWN_GAP_MASKS
+    assert len(masks) >= 4, f"expected at least 4 mask entries, got {len(masks)}"
+    import re
+    for gap_id, mask in masks.items():
+        # Gap-id shape matches the ### Gn anchors in the doc.
+        assert re.fullmatch(r"G\d+", gap_id), (
+            f"gap_id {gap_id!r} doesn't match the G\\d+ shape used "
+            f"in docs/RUST_PARITY_GAPS.md"
+        )
+        # Mandatory keys.
+        assert "description" in mask and mask["description"], (
+            f"mask {gap_id} missing or empty 'description'"
+        )
+        assert "fields" in mask and mask["fields"], (
+            f"mask {gap_id} missing or empty 'fields'"
+        )
+        # Every field is a canonical FIELD_DIFF_FIELDS name.
+        for field_name in mask["fields"]:
+            assert field_name in parity_smoke.FIELD_DIFF_FIELDS, (
+                f"mask {gap_id} cites unknown field {field_name!r}; "
+                f"must be one of FIELD_DIFF_FIELDS"
+            )
+
+
+def test_cross_engine_game_mode_without_flag_still_stops_at_g3(
+    parity_smoke, capsys
+):
+    """Default behavior is preserved: without ``--ignore-known-gaps``
+    the harness stops at the first divergence (G3's priority_player
+    toggle at decision 0) per the original measurement contract."""
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42, num_decisions=20, ignore_known_gaps=False
+    )
+    assert rc == 1
+    out = capsys.readouterr().out
+    # G3 fires at decision 0 — both the DIVERGE row and the PARITY:
+    # FAIL summary cite priority_player.
+    assert "DIVERGE: priority_player" in out
+    assert "PARITY: FAIL" in out
+    # The harness should NOT have masked anything when the flag is
+    # off — no MASKED rows in the output.
+    assert "MASKED" not in out
+
+
+def test_cross_engine_game_mode_with_flag_walks_past_g3(
+    parity_smoke, capsys
+):
+    """With ``--ignore-known-gaps`` set, the harness walks past the
+    G3 divergence at decision 0 and reaches either a deeper UNKNOWN
+    divergence OR a clean N-decision completion. The Forest-only
+    deck's only legal action is pass_priority, so G3 catches every
+    divergence and the harness walks to completion."""
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=42, num_decisions=20, ignore_known_gaps=True
+    )
+    # rc=0 means "walked to completion without unmasked divergence",
+    # rc=1 means "hit an unmasked divergence further along". Either
+    # outcome is the harness working as designed; the load-bearing
+    # contract is that it didn't stop at decision 0.
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    # G3 fires every odd step, so MASKED (G3) must appear at least
+    # once — proving the mask path actually engaged.
+    assert "MASKED (G3)" in out
+    # And the walk got past decision 0 — either at least 2 rows were
+    # printed (decision 0 + decision 1) or the harness reached PASS.
+    assert ("PARITY: PASS" in out) or ("decision 1" in out) or (
+        "decision 2" in out
+    ), (
+        f"harness should have walked past decision 0 when masking "
+        f"was on; got output:\n{out}"
+    )
+
+
+@pytest.mark.parametrize("seed", [42, 7, 123, 999, 2026])
+def test_cross_engine_game_mode_with_flag_walks_at_least_20_decisions_across_seeds(
+    parity_smoke, capsys, seed
+):
+    """For the Forest-only deck on every seed, masking G3 (the only
+    documented divergence the slice's emitted actions trigger) lets
+    the harness walk through 20 decisions WITHOUT hitting an unmasked
+    divergence. Locks in the "G3 mask alone is sufficient for this
+    deck shape" measurement; if a future change adds an unmasked
+    divergence to the Forest-pass_priority loop, this test fails
+    loudly so we know to investigate before merging."""
+    rc = parity_smoke.run_cross_engine_game_mode(
+        seed=seed, num_decisions=20, ignore_known_gaps=True
+    )
+    assert rc == 0, (
+        f"seed={seed}: expected PASS with masking, got rc={rc}. "
+        f"This is the 'first unknown divergence' signal — either a "
+        f"new gap appeared or the harness regressed."
+    )
+    out = capsys.readouterr().out
+    assert "PARITY: PASS" in out
+    assert "20 decisions applied" in out
+
+
+def test_cross_engine_game_mode_masked_verdict_cites_gap_id(
+    parity_smoke, capsys
+):
+    """The MASKED verdict in the table cites the gap-id in the form
+    'MASKED (Gxx)' — operators reading the output need the
+    cross-reference back to docs/RUST_PARITY_GAPS.md. Pinning the
+    exact verdict shape so a future render-change is intentional."""
+    parity_smoke.run_cross_engine_game_mode(
+        seed=42, num_decisions=5, ignore_known_gaps=True
+    )
+    out = capsys.readouterr().out
+    # The G3 mask fires on decision 0 — its verdict cites the gap id.
+    assert "MASKED (G3)" in out
+
+
+def test_cross_engine_game_mode_main_dispatches_with_ignore_known_gaps_flag(
+    parity_smoke, monkeypatch, capsys
+):
+    """``main() --mode cross-engine-game --ignore-known-gaps`` routes
+    the flag into the new comparison path. End-to-end argparse +
+    dispatch smoke; locks in the CLI surface ("--ignore-known-gaps"
+    is a boolean store_true) so a future flag rename surfaces here."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "parity_smoke.py",
+            "--mode",
+            "cross-engine-game",
+            "--seed",
+            "42",
+            "--num-decisions",
+            "5",
+            "--ignore-known-gaps",
+        ],
+    )
+    rc = parity_smoke.main()
+    # With masking on for a Forest-only 5-decision walk, the harness
+    # walks to PASS — same expectation as the parametrized seed test.
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[cross-engine-game]" in out
+    assert "MASKED (G3)" in out
+
+
+def test_match_known_gap_returns_g3_for_priority_player_after_pass_priority(
+    parity_smoke,
+):
+    """Direct unit on the ``_match_known_gap`` helper. A
+    priority_player divergence right after a pass_priority action
+    matches G3; a priority_player divergence after a play_land
+    action does NOT (no documented gap explains that)."""
+    rust_view = {"step": "UPKEEP", "priority_player": 1}
+    python_view = {"step": "UPKEEP", "priority_player": 0}
+
+    # After pass_priority → G3 mask applies.
+    assert parity_smoke._match_known_gap(
+        "priority_player",
+        {"kind": "pass_priority"},
+        rust_view,
+        python_view,
+    ) == "G3"
+
+    # After play_land → no mask applies (G3's trigger is
+    # action-kind-gated).
+    assert parity_smoke._match_known_gap(
+        "priority_player",
+        {"kind": "play_land", "card_id": 0},
+        rust_view,
+        python_view,
+    ) is None
+
+    # Initial-state (no last_action) → no action-kind-gated mask
+    # matches.
+    assert parity_smoke._match_known_gap(
+        "priority_player", None, rust_view, python_view
+    ) is None

@@ -1185,6 +1185,175 @@ def _field_repr(value, max_len: int = 35) -> str:
     return rendered
 
 
+# ---------- known-gap masks ----------------------------------------------
+#
+# `docs/RUST_PARITY_GAPS.md` lists G1-G24 known divergences between
+# Python and Rust. Several of those gaps fire reliably inside the
+# cross-engine-game harness — most prominently G3 (`pass_priority`
+# pure toggle), which trips at decision 0 on every seed and masks
+# the more interesting *unknown* divergences that would surface
+# further down the trajectory.
+#
+# ``--ignore-known-gaps`` tells the harness "I already know about
+# these — skip them and walk further". The harness then prints
+# ``MASKED (Gxx)`` for the divergence row and keeps walking; only
+# the FIRST UNKNOWN divergence stops the walk.
+#
+# The mask schema below is intentionally simple: each entry is a
+# gap_id -> dict mapping listing the fields the gap touches and the
+# trigger context (action kind it was preceded by, step in which it
+# applies, or simply "always" for context-free masks). A divergence
+# is "known" if it lives on one of the gap's fields AND the trigger
+# context matches. If a divergence on a masked field doesn't match
+# the trigger context, the harness still flags it as a DIVERGE (it's
+# a *new* signal on a documented-but-different surface).
+#
+# Coverage today: a representative subset (G3 / G14 / G15 / G18) —
+# not every gap. The harness errs on the side of "stop loudly on
+# anything unrecognized" so adding masks is an explicit decision.
+# When a new gap surfaces in practice, document it in
+# RUST_PARITY_GAPS.md first, then add an entry here.
+
+# Module-level mapping of gap_id (matching the ``### Gn`` anchors in
+# ``docs/RUST_PARITY_GAPS.md``) to mask metadata. Each value is a
+# dict with:
+#   - description: 1-line summary of the gap (mirrors the doc).
+#   - fields: tuple of FIELD_DIFF_FIELDS names the gap can touch.
+#   - trigger_action_kinds: optional tuple of action ``kind`` strings
+#     that must have just been applied for the mask to apply. If
+#     absent, the mask is action-context-free.
+#   - trigger_steps: optional tuple of step-name strings ("UNTAP",
+#     "DRAW", ...) the state must be in for the mask to apply. If
+#     absent, the mask is step-context-free.
+#
+# A divergence matches a gap iff:
+#   1. The diverging field is in ``gap["fields"]``, AND
+#   2. (if ``trigger_action_kinds`` is present) the last action's
+#      kind is in it, AND
+#   3. (if ``trigger_steps`` is present) the current step is in it.
+#
+# The first matching gap wins; gaps are checked in dict-insertion
+# order (which is gap-id order since the doc numbers them
+# monotonically).
+KNOWN_GAP_MASKS: dict[str, dict] = {
+    # G3: pass_priority is a pure toggle in Rust — flips
+    # `priority_player` without composing step-end / stack-resolution.
+    # Python's pass_priority is a no-op on the field. See
+    # docs/RUST_PARITY_GAPS.md#G3.
+    "G3": {
+        "description": (
+            "pass_priority pure toggle — Rust flips priority_player, "
+            "Python no-ops on the field"
+        ),
+        "fields": ("priority_player",),
+        "trigger_action_kinds": ("pass_priority",),
+    },
+    # G14: advance_phase does NOT auto-fire draw_card on the DRAW
+    # step in Rust. Python's turn machinery DOES draw. Visible as
+    # an off-by-one on the active player's hand / library. See
+    # docs/RUST_PARITY_GAPS.md#G14. Note: in the current harness
+    # `advance_phase` is engine-internal and not directly emitted by
+    # legal_decisions, so this mask is precautionary — it will fire
+    # if a future Rust slice exposes step transitions to the action
+    # dispatcher.
+    "G14": {
+        "description": (
+            "no auto-draw on DRAW step — Rust hand/library stay "
+            "frozen across the DRAW transition"
+        ),
+        "fields": ("hand_p0", "hand_p1", "library_p0", "library_p1"),
+        "trigger_steps": ("DRAW",),
+    },
+    # G15: advance_phase's CLEANUP -> UNTAP wrap does NOT reset
+    # priority to the new active player in Rust. Python's wrap does.
+    # Distinct trigger context from G3 — fires on phase advance, not
+    # on pass_priority. See docs/RUST_PARITY_GAPS.md#G15. Same
+    # precautionary note as G14 re: advance_phase not being a
+    # legal_decisions action today.
+    "G15": {
+        "description": (
+            "no priority reset on CLEANUP->UNTAP wrap — Rust keeps "
+            "the old priority_player after the turn boundary"
+        ),
+        "fields": ("priority_player",),
+        "trigger_steps": ("UNTAP",),
+    },
+    # G18: ActivateAbility credits the SOURCE's controller, not
+    # `active_player`. Documented as a parity invariant (I9) for the
+    # behavior, BUT listed here because if a future change drifts
+    # either side, the mana-pool delta will land on the "wrong"
+    # player and surface as a mana_pool_pN divergence right after
+    # the activate_ability action. See docs/RUST_PARITY_GAPS.md#G18
+    # / #I9.
+    "G18": {
+        "description": (
+            "ActivateAbility credits source.controller not "
+            "active_player — mana lands on the source's controller"
+        ),
+        "fields": ("mana_pool_p0", "mana_pool_p1"),
+        "trigger_action_kinds": ("activate_ability",),
+    },
+}
+
+
+def _match_known_gap(
+    field: str,
+    last_action: dict | None,
+    rust_view: dict,
+    python_view: dict,
+) -> str | None:
+    """Return the gap_id whose mask matches the ``(field, action,
+    step)`` divergence context, or ``None`` if no documented gap
+    explains the divergence.
+
+    Gaps are checked in ``KNOWN_GAP_MASKS`` insertion order; the
+    first match wins. A gap's mask matches iff (a) the field is in
+    its ``fields`` tuple, (b) if it specifies
+    ``trigger_action_kinds``, the last action's ``kind`` is in that
+    set, and (c) if it specifies ``trigger_steps``, the current
+    step (read from the Rust view — Python view's step is canonicalized
+    to the same string shape) is in that set.
+
+    ``last_action`` may be ``None`` for the initial-state diff (no
+    action has been applied yet); in that case action-kind-gated
+    masks won't match.
+    """
+    last_kind = last_action.get("kind") if last_action else None
+    # Both views encode the step as the same uppercase string, so
+    # either works; prefer Rust's since the mask is about Rust's
+    # documented behavior.
+    current_step = rust_view.get("step")
+    for gap_id, mask in KNOWN_GAP_MASKS.items():
+        if field not in mask["fields"]:
+            continue
+        if "trigger_action_kinds" in mask:
+            if last_kind not in mask["trigger_action_kinds"]:
+                continue
+        if "trigger_steps" in mask:
+            if current_step not in mask["trigger_steps"]:
+                continue
+        return gap_id
+    return None
+
+
+def _diverging_fields(rust_view: dict, python_view: dict) -> list[str]:
+    """Return every field in canonical ``FIELD_DIFF_FIELDS`` order
+    whose value differs between the two views. Empty list when the
+    views agree on every field.
+
+    Sibling of ``_first_diverging_field``; used by the masking path
+    which needs to inspect every divergent field, not just the
+    first, so it can distinguish "the only divergence was a masked
+    one" (continue walking) from "there's also an unmasked
+    divergence" (stop).
+    """
+    out: list[str] = []
+    for field_name in FIELD_DIFF_FIELDS:
+        if rust_view.get(field_name) != python_view.get(field_name):
+            out.append(field_name)
+    return out
+
+
 # ---------- cross-engine-game mode ---------------------------------------
 #
 # Phase-5 prep: drive Python AND Rust through the SAME deterministic
@@ -1865,6 +2034,7 @@ def run_cross_engine_game_mode(
     seed: int,
     num_decisions: int = 20,
     deck_size: int = 30,
+    ignore_known_gaps: bool = False,
 ) -> int:
     """Phase-5 prep: drive Python AND Rust through the SAME deterministic
     decision sequence one step at a time and report the first
@@ -1879,6 +2049,16 @@ def run_cross_engine_game_mode(
     The harness deliberately reports divergence rather than masking
     it: see the module-level docstring on ``cross-engine-game mode``
     for the "this is a measurement loop, gaps are the signal" rationale.
+
+    When ``ignore_known_gaps`` is True, the harness consults
+    ``KNOWN_GAP_MASKS`` after each per-step diff. Divergences that
+    match a documented gap render as ``MASKED (Gxx)`` and the walk
+    continues; the walk only stops on a divergence that DOES NOT
+    match any known gap — the more interesting "first unknown
+    divergence" signal. The masking knob is intended for "I already
+    know about G3, show me what's behind it" investigations; the
+    default-False behavior preserves the original "stop at first
+    divergence" measurement contract.
     """
     try:
         import mtg_bot_engine  # noqa: F401  (used by helpers below)
@@ -2024,12 +2204,66 @@ def run_cross_engine_game_mode(
             _print_cross_engine_row(row)
             break
 
-        # Field-diff after both applies succeeded.
-        rust_view = _build_field_view(rs_state)
+        # Field-diff after both applies succeeded. Use the
+        # cross-engine view (7-tuple, no id slot) on both sides —
+        # using ``_build_field_view`` here (8-tuple, with id) was a
+        # pre-existing bug that the original "stop at G3 priority_player
+        # before we even compare zones" measurement contract hid; once
+        # ``--ignore-known-gaps`` masks the priority_player divergence
+        # past, the zone fields become the next divergence and surface
+        # the shape mismatch as a false-positive UNKNOWN. Matches the
+        # initial-state check above which already used the cross-engine
+        # view.
+        rust_view = _build_rust_cross_engine_view(rs_state)
         python_view = _build_python_field_view(py_state)
-        diff_field = _first_diverging_field(rust_view, python_view)
 
-        if diff_field is None:
+        if not ignore_known_gaps:
+            # Fast-path: original behavior — stop on first
+            # divergence of any kind.
+            diff_field = _first_diverging_field(rust_view, python_view)
+
+            if diff_field is None:
+                row = CrossEngineStep(
+                    index=step,
+                    rust_label=rust_label,
+                    python_label=python_label,
+                    verdict="OK",
+                )
+                rows.append(row)
+                _print_cross_engine_row(row)
+                continue
+
+            row = CrossEngineStep(
+                index=step,
+                rust_label=rust_label,
+                python_label=python_label,
+                verdict=f"DIVERGE: {diff_field}",
+                diverging_field=diff_field,
+                rust_value=_field_repr(rust_view.get(diff_field)),
+                python_value=_field_repr(python_view.get(diff_field)),
+            )
+            rows.append(row)
+            _print_cross_engine_row(row)
+            print()
+            print(
+                f"PARITY: FAIL — first divergence at decision {step} "
+                f"on field {diff_field!r}"
+            )
+            print(
+                f"  rust  = {_field_repr(rust_view.get(diff_field))}"
+            )
+            print(
+                f"  python= {_field_repr(python_view.get(diff_field))}"
+            )
+            return 1
+
+        # Masking path: walk EVERY divergent field, classify each
+        # against KNOWN_GAP_MASKS. If all divergences are masked,
+        # report MASKED (Gxx) and continue. Otherwise the first
+        # UNMASKED divergence stops the walk (the interesting
+        # signal).
+        diverging = _diverging_fields(rust_view, python_view)
+        if not diverging:
             row = CrossEngineStep(
                 index=step,
                 rust_label=rust_label,
@@ -2040,27 +2274,56 @@ def run_cross_engine_game_mode(
             _print_cross_engine_row(row)
             continue
 
+        # Classify every diverging field.
+        first_unmasked: str | None = None
+        masked_gap_ids: list[str] = []
+        for field_name in diverging:
+            gap_id = _match_known_gap(
+                field_name, rust_action, rust_view, python_view
+            )
+            if gap_id is None:
+                first_unmasked = field_name
+                break
+            if gap_id not in masked_gap_ids:
+                masked_gap_ids.append(gap_id)
+
+        if first_unmasked is None:
+            # All divergences were masked. Cite the gap(s) and walk on.
+            gap_label = ",".join(masked_gap_ids)
+            row = CrossEngineStep(
+                index=step,
+                rust_label=rust_label,
+                python_label=python_label,
+                verdict=f"MASKED ({gap_label})",
+            )
+            rows.append(row)
+            _print_cross_engine_row(row)
+            continue
+
+        # First unmasked field — stop and surface as a real
+        # divergence. This is the "the FIRST UNKNOWN divergence"
+        # signal the masking flag exists to surface.
         row = CrossEngineStep(
             index=step,
             rust_label=rust_label,
             python_label=python_label,
-            verdict=f"DIVERGE: {diff_field}",
-            diverging_field=diff_field,
-            rust_value=_field_repr(rust_view.get(diff_field)),
-            python_value=_field_repr(python_view.get(diff_field)),
+            verdict=f"DIVERGE: {first_unmasked}",
+            diverging_field=first_unmasked,
+            rust_value=_field_repr(rust_view.get(first_unmasked)),
+            python_value=_field_repr(python_view.get(first_unmasked)),
         )
         rows.append(row)
         _print_cross_engine_row(row)
         print()
         print(
-            f"PARITY: FAIL — first divergence at decision {step} "
-            f"on field {diff_field!r}"
+            f"PARITY: FAIL — first UNMASKED divergence at decision "
+            f"{step} on field {first_unmasked!r}"
         )
         print(
-            f"  rust  = {_field_repr(rust_view.get(diff_field))}"
+            f"  rust  = {_field_repr(rust_view.get(first_unmasked))}"
         )
         print(
-            f"  python= {_field_repr(python_view.get(diff_field))}"
+            f"  python= {_field_repr(python_view.get(first_unmasked))}"
         )
         return 1
 
@@ -2191,6 +2454,20 @@ def main() -> int:
             "keep the snapshot loops fast."
         ),
     )
+    p.add_argument(
+        "--ignore-known-gaps",
+        action="store_true",
+        help=(
+            "(cross-engine-game) when set, divergences that match a "
+            "documented gap in docs/RUST_PARITY_GAPS.md (G1-G24, see "
+            "KNOWN_GAP_MASKS) render as 'MASKED (Gxx)' instead of "
+            "stopping the walk. The walk only stops on the FIRST "
+            "UNKNOWN divergence — the more interesting 'what's behind "
+            "G3?' signal. Without this flag the harness stops at the "
+            "first divergence of any kind (the original measurement "
+            "contract)."
+        ),
+    )
     args = p.parse_args()
 
     if args.mode == "initial-state":
@@ -2234,6 +2511,7 @@ def main() -> int:
             seed=args.seed,
             num_decisions=args.num_decisions,
             deck_size=args.deck_size,
+            ignore_known_gaps=args.ignore_known_gaps,
         )
 
     colors = args.colors.split(",")
