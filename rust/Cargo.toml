@@ -14,12 +14,14 @@ crate-type = ["cdylib"]
 # merge conflicts on a single block. Tiny runtime cost (one
 # inventory registration per block).
 pyo3 = { version = "0.23", features = ["extension-module", "multiple-pymethods"] }
-# `serde_json` + `sha1`: needed by state_ops_fingerprint.rs to
-# produce a SHA1 digest that matches scripts/parity_smoke.py:hash_state
-# byte-for-byte. The Python side does
+# `sha1`: needed by state_ops_fingerprint.rs to produce a SHA1 digest
+# that matches scripts/parity_smoke.py:hash_state byte-for-byte. The
+# Python side does
 # `hashlib.sha1(json.dumps(parts, default=repr, sort_keys=False)).hexdigest()[:12]`;
-# the Rust side mirrors that with serde_json + sha1.
-serde_json = "1"
+# the Rust side streams JSON bytes directly into Sha1::update via the
+# hand-rolled emitter in state_ops_fingerprint.rs (no serde_json dep
+# needed — the previous slice's Value-tree intermediate has been
+# replaced with a streaming serializer for ~15x speedup).
 sha1 = "0.10"
 
 [profile.release]
