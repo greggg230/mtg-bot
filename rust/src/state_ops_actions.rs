@@ -502,25 +502,37 @@ impl GameState {
                         // tap cost (or use itself for an "activate
                         // only as a sorcery" cost that involves
                         // tapping). The general rule is
-                        // `summoning_sick && requires_tap_cost`; for
-                        // the only ability currently wired through
+                        // `is_creature && summoning_sick && requires_tap_cost`;
+                        // for the only ability currently wired through
                         // this dispatch arm (mana abilities at
                         // `ability_index = 0`), every printing's
                         // tap-for-mana ability has an implicit `{T}`
-                        // cost, so a positive `summoning_sick` flag
-                        // is sufficient to reject. A future slice
-                        // that lands non-mana activated abilities
-                        // will narrow the gate to
-                        // `summoning_sick && ability.cost.tap_self`
+                        // cost, so `is_creature && summoning_sick` is
+                        // sufficient to reject. A future slice that
+                        // lands non-mana activated abilities will
+                        // narrow this to
+                        // `is_creature && summoning_sick && ability.cost.tap_self`
                         // — until then this approximation is exact
                         // (mana abilities always tap). Mirrors
                         // Python's `legal.py:661-663` gate
                         // (`is_creature_now(obj) && obj.summoning_sick`)
                         // and the matching dispatch precheck in
                         // `actions.py:_activate_ability` /
-                        // `_can_fire_sac_for_mana`. Pins G6 closure;
-                        // see `docs/RUST_PARITY_GAPS.md`.
-                        if obj.summoning_sick {
+                        // `_can_fire_sac_for_mana`.
+                        //
+                        // **Creature-only gating (CR 302.1).** Summoning
+                        // sickness applies ONLY to creatures; lands
+                        // (Forests, Mountains, etc.) can tap for mana
+                        // the turn they enter the battlefield. Without
+                        // this guard, a freshly-played Forest with
+                        // `summoning_sick = true` (inherited from the
+                        // CE1 universal-true default on every new
+                        // permanent) would be rejected, which is
+                        // wrong per the rules.  Pins G6 closure; see
+                        // `docs/RUST_PARITY_GAPS.md` I17.
+                        let is_creature =
+                            printing.card_types.iter().any(|t| t == "Creature");
+                        if is_creature && obj.summoning_sick {
                             return Err(PyValueError::new_err(format!(
                                 "ActivateAbility: source {source_id} is \
                                  summoning-sick (CR 302.1) — can't tap \

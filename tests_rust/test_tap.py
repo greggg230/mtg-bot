@@ -394,6 +394,62 @@ def test_activate_ability_on_summoning_sick_creature_with_tap_cost_is_rejected(
     assert state.is_summoning_sick(elves_id) is True
 
 
+def test_activate_ability_on_summoning_sick_land_with_tap_cost_is_allowed(
+    engine,
+):
+    """**CR 302.1 creature-only gating.** Summoning sickness applies
+    ONLY to creatures tapping for tap-cost abilities — lands (Forests,
+    Mountains, etc.) can tap for mana the turn they enter the
+    battlefield even though every freshly-allocated permanent carries
+    `summoning_sick = true` (the CE1 universal-true default).
+
+    Setup: take a Forest from p0's battlefield (id 0), route it
+    through graveyard, then reanimate it via
+    `move_object_from_graveyard_to_battlefield` — that primitive
+    stamps `summoning_sick = true` on the reanimated permanent (CR
+    302.1 / 400.7 reset). The reanimated Forest is now on the
+    battlefield with `summoning_sick = true`. Per CR 302.1, this is
+    a NON-CREATURE permanent with summoning sickness — Rust must NOT
+    reject `activate_ability` on it.
+
+    Inversion of `test_activate_ability_on_summoning_sick_creature_with_tap_cost_is_rejected`
+    above: same shape (sick + tap-cost), opposite expectation
+    because the source is a land, not a creature.
+
+    Pins the side-finding documented under CE5 in
+    `docs/RUST_PARITY_GAPS.md` — the workaround in
+    `cross_engine.py`'s `cast_bears_selector` (sick-land filter) is
+    no longer load-bearing once this test goes green."""
+    state = engine.make_synthetic_state()
+    # Synthetic state: p0 battlefield is ids 0..4 Forest, 5..9 Bears.
+    forest_id = 0
+    assert state.printing_name_of(forest_id) == "Forest"
+    # Route Forest through graveyard so reanimation sets
+    # summoning_sick=true on the way back to the battlefield.
+    assert state.move_object(forest_id, 3, 0) is True  # ZONE_GRAVEYARD=3
+    assert state.move_object_from_graveyard_to_battlefield(0, forest_id) is True
+    # Sanity: Forest now on bf with summoning_sick=true.
+    assert state.is_summoning_sick(forest_id) is True
+    assert state.is_tapped(forest_id) is False
+    pool_before = state.get_mana_pool(0)["G"]
+    # CR 302.1 — lands are exempt from summoning sickness. The
+    # activate_ability call should SUCCEED: Forest taps + one G in
+    # pool, no ValueError raised.
+    state.apply_action(
+        {
+            "kind": "activate_ability",
+            "source_id": forest_id,
+            "ability_index": 0,
+        }
+    )
+    # Mutation observed: Forest tapped + one G added to pool.
+    assert state.is_tapped(forest_id) is True
+    assert state.get_mana_pool(0)["G"] == pool_before + 1
+    # summoning_sick is unaffected by the activation (the per-turn
+    # untap step clears it; activate_ability does not).
+    assert state.is_summoning_sick(forest_id) is True
+
+
 
 
 # Zone constants for the round-28 tap-aoc tests below.

@@ -1696,6 +1696,58 @@ def test_legal_decisions_activate_ability_excludes_summoning_sick_creature(
     assert len(aas) == 5
 
 
+def test_legal_decisions_activate_ability_emits_for_summoning_sick_land(
+    synthetic_state,
+):
+    """**CR 302.1 creature-only gating (companion of the
+    creature-rejection test above).** Summoning sickness applies ONLY
+    to creatures; a sick LAND can still tap for mana the turn it
+    enters the battlefield. The Rust `legal_decisions` emitter
+    must NOT skip a sick land's ActivateAbility — Python's
+    `legal.py:661-663` gate reads `is_creature_now(obj) &&
+    obj.summoning_sick`, so non-creature sources fall through to the
+    tap-self cost-payability check regardless of summoning_sick.
+
+    Setup: route Forest id 0 through graveyard so the
+    `move_object_from_graveyard_to_battlefield` primitive stamps
+    `summoning_sick=true` on the way back to the battlefield. The
+    Forest is now on p0's bf with summoning_sick=true. The remaining
+    4 Forests (ids 1..4) stay summoning_sick=false. Expected
+    emission: 5 ActivateAbility (one per Forest, including the
+    sick reanimated one).
+
+    Pins the legal-emission half of the bug fix; the
+    dispatch-arm half is pinned by
+    `test_tap.py::test_activate_ability_on_summoning_sick_land_with_tap_cost_is_allowed`.
+    """
+    forest_id = P0_FIRST_BATTLEFIELD_ID  # id 0, a Forest
+    assert synthetic_state.printing_name_of(forest_id) == "Forest"
+    # Move Forest to graveyard then reanimate so it lands on bf with
+    # summoning_sick=true (CR 302.1 / 400.7 reset on reanimation).
+    ZONE_GRAVEYARD = 3
+    assert synthetic_state.move_object(forest_id, ZONE_GRAVEYARD, 0) is True
+    assert (
+        synthetic_state.move_object_from_graveyard_to_battlefield(0, forest_id)
+        is True
+    )
+    assert synthetic_state.is_summoning_sick(forest_id) is True
+
+    _empty_hand(synthetic_state, 0)
+    synthetic_state.set_phase(PHASE_MAIN1)
+    actions = synthetic_state.legal_decisions(0)
+
+    aas = [a for a in actions if a["kind"] == "activate_ability"]
+    source_ids = {a["source_id"] for a in aas}
+    # The sick Forest IS in the emission set (CR 302.1 is creature-only).
+    assert forest_id in source_ids
+    # All 5 Forests emit; the 5 Bears are creatures with no mana_produced,
+    # so they remain excluded.
+    assert source_ids == {
+        P0_FIRST_BATTLEFIELD_ID + i for i in range(5)
+    }
+    assert len(aas) == 5
+
+
 # --- DeclareBlockers emission --------------------------------------
 #
 # rust(legal-decisions-declare-blockers) — extends `legal_decisions`

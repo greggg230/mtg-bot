@@ -869,21 +869,31 @@ impl GameState {
             if obj.tapped {
                 continue;
             }
-            // CR 302.1 — summoning-sick permanents can't pay a tap
-            // cost. See the long-form note above for why the gate is
-            // `summoning_sick` alone (not `summoning_sick &&
-            // ability.cost.tap_self`) in this slice's mana-only
-            // approximation. Mirrors Python's
-            // `legal.py`:661-663 short-circuit (the `tap_self` cost
-            // block returns `continue` when the source is a
-            // summoning-sick creature). Closes G6.
-            if obj.summoning_sick {
-                continue;
-            }
             let Some(printing) = self.registry.lookup(obj.printing_id) else {
                 continue;
             };
             if printing.mana_produced.is_none() {
+                continue;
+            }
+            // CR 302.1 — summoning sickness applies ONLY to creatures
+            // tapping for tap-cost abilities. Lands (Forests,
+            // Mountains, etc.) can tap for mana the turn they enter
+            // the battlefield, even though every new permanent
+            // carries `summoning_sick = true` (the CE1 universal
+            // default). The gate is
+            // `is_creature && summoning_sick && requires_tap_cost`;
+            // for this mana-only slice every emitted ability has an
+            // implicit `{T}` cost (CR 605.1a), so
+            // `is_creature && summoning_sick` is sufficient.
+            // Mirrors Python's `legal.py:661-663` short-circuit
+            // (`is_creature_now(obj) && obj.summoning_sick` inside
+            // the `tap_self` cost-payability block). A future slice
+            // that lands non-mana activated abilities will narrow
+            // this to "skip the source ONLY for abilities whose
+            // `cost.tap_self` is true". See I17 in
+            // `docs/RUST_PARITY_GAPS.md`.
+            let is_creature = printing.card_types.iter().any(|t| t == "Creature");
+            if is_creature && obj.summoning_sick {
                 continue;
             }
             actions.push(activate_ability_dict(py, obj.id, 0)?);

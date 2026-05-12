@@ -316,24 +316,38 @@ refactor on either side that breaks the parity surfaces immediately.
 - **Invariant**: Every library object reads `ZONE_LIBRARY`; every
   hand object reads `ZONE_HAND` immediately after `make_state`.
 
-### I17. Summoning-sick permanents with tap-cost activated abilities are excluded from both dispatch and emission
+### I17. Summoning-sick **creatures** with tap-cost activated abilities are excluded from both dispatch and emission
 
-- **Pinned by**: `tests_rust/test_tap.py::test_activate_ability_on_summoning_sick_creature_with_tap_cost_is_rejected`;
-  `tests_rust/test_legal.py::test_legal_decisions_activate_ability_excludes_summoning_sick_creature`.
-- **Invariant**: CR 302.1 — a creature with `summoning_sick == true`
+- **Pinned by**: `tests_rust/test_tap.py::test_activate_ability_on_summoning_sick_creature_with_tap_cost_is_rejected`
+  (creature rejected),
+  `tests_rust/test_tap.py::test_activate_ability_on_summoning_sick_land_with_tap_cost_is_allowed`
+  (land allowed — creature-only gating);
+  `tests_rust/test_legal.py::test_legal_decisions_activate_ability_excludes_summoning_sick_creature`
+  (creature not emitted),
+  `tests_rust/test_legal.py::test_legal_decisions_activate_ability_emits_for_summoning_sick_land`
+  (land emitted).
+- **Invariant**: CR 302.1 — a **creature** with `summoning_sick == true`
   whose activated ability has a tap cost (e.g. `{T}`) cannot pay
-  that cost. The Rust port enforces this gate on BOTH sides:
+  that cost. **Lands (and other non-creature permanents) are
+  exempt** — they can tap for mana the turn they enter the
+  battlefield even though every freshly-allocated permanent carries
+  `summoning_sick = true` (the CE1 universal-true default). The
+  Rust port enforces the gate on BOTH sides:
   `apply_action`'s `ActivateAbility` arm in `state_ops_actions.rs`
-  raises `ValueError` (no mutation), and the `legal_decisions`
-  emitter in `state_ops_legal.rs` does NOT emit an
-  `ActivateAbility` dict for the sick source. The general gate is
-  `summoning_sick && requires_tap_cost`; the first-slice
-  mana-only filter (the only wired ActivateAbility dispatch case
-  today, where every printing's mana ability has an implicit
-  `{T}`) gates on `summoning_sick` alone. Mirrors Python's
-  `legal.py:661-663` and `actions.py:_activate_ability`
-  precheck. Closes parity gap G6 (entry removed from "Confirmed
-  gaps" above).
+  raises `ValueError` (no mutation) and the `legal_decisions`
+  emitter in `state_ops_legal.rs` skips emission — but ONLY when
+  the source is a creature (`printing.card_types.contains("Creature")`).
+  The general gate is
+  `is_creature && summoning_sick && requires_tap_cost`; the
+  first-slice mana-only filter (the only wired ActivateAbility
+  dispatch case today, where every printing's mana ability has an
+  implicit `{T}`) gates on `is_creature && summoning_sick`.
+  Mirrors Python's `legal.py:661-663`
+  (`is_creature_now(obj) && obj.summoning_sick`) and
+  `actions.py:_activate_ability` precheck. Closes parity gap G6
+  (entry removed from "Confirmed gaps" above); the cast-bears
+  probe's sick-land filter in `cross_engine.py::cast_bears_selector`
+  is now defensive-only and removable in a future cleanup.
 
 ### I18. `advance_phase` auto-fires `draw_card` on entry to PHASE_DRAW, gated by CR 103.7c
 
