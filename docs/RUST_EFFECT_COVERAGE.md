@@ -6,11 +6,11 @@ This page is the rolling-progress snapshot for the Rust engine port's `Effect` e
 
 ## Headline numbers
 
-- **74 of 228 Python Effect classes covered (32.5%)** — by distinct-class count.
-- **522 of 690 per-card emissions covered (75.7%)** — weighted by how many cards each class appears on. This is the more load-bearing metric: high-frequency classes pull the bulk of cards into Rust even at low class-count coverage.
+- **76 of 228 Python Effect classes covered (33.3%)** — by distinct-class count.
+- **538 of 690 per-card emissions covered (78.0%)** — weighted by how many cards each class appears on. This is the more load-bearing metric: high-frequency classes pull the bulk of cards into Rust even at low class-count coverage.
 - **80 Rust `Effect` variants** in `rust/src/cards.rs` today; 475 parser-claimed printings across the loaded pools.
-- **WARNING: 3 Rust variant(s) with no Python counterpart**: `Effect::ChooseOneMode` -> `ChooseOneMode`, `Effect::GrantKeywordToTargetCreatureUntilEOT` -> `GrantKeywordToTargetCreatureUntilEOT`, `Effect::SetBasePTUntilEOT` -> `SetBasePTUntilEOT`. This indicates bridge drift — either Python emits the class under a different name, or the Rust variant is unused. Audit `RUST_TO_PYTHON_OVERRIDES` / `RUST_AHEAD_OF_POOL` in `scripts/measure_effect_coverage.py`.
-- **1 Rust variant(s) built ahead of the pool** (allowlisted in `RUST_AHEAD_OF_POOL`): `ScryN`. These have no pool card exercising them today and are NOT counted as orphans.
+- **0 Rust variants without a Python counterpart** — the bridge is in sync with the Python vocabulary.
+- **2 Rust variant(s) built ahead of the pool** (allowlisted in `RUST_AHEAD_OF_POOL`): `ScryN`, `SetBasePTUntilEOT`. These have no pool card exercising them today and are NOT counted as orphans.
 
 ## Coverage by frequency tier
 
@@ -18,7 +18,7 @@ Python Effect classes are split by how many cards they appear on. The Rust port 
 
 ### Frequency >= 10 (14 classes)
 
-- Covered by Rust: **13 / 14** (92.9%)
+- Covered by Rust: **14 / 14** (100.0%)
 
 | Python class | Frequency | Rust support |
 |---|---:|---|
@@ -33,13 +33,13 @@ Python Effect classes are split by how many cards they appear on. The Rust port 
 | `SearchLibraryForBasicLandTapped` | 15 | yes |
 | `EquipToTargetCreatureYouControl` | 14 | yes |
 | `BecomeLandCreatureUEOT` | 13 | yes |
-| `ModalChooseOne` | 13 | no |
+| `ModalChooseOne` | 13 | yes |
 | `PumpSelfUntilEOT` | 12 | yes |
 | `ManifestDread` | 10 | yes |
 
 ### Frequency 2-9 (53 classes)
 
-- Covered by Rust: **52 / 53** (98.1%)
+- Covered by Rust: **53 / 53** (100.0%)
 
 ### Frequency 1 (161 singletons)
 
@@ -111,12 +111,12 @@ Python Effect classes are split by how many cards they appear on. The Rust port 
 | 59 | `Effect::ExileOpponentsNonlandPermanentUntilLeaves` | `ExileOpponentsNonlandPermanentUntilLeaves` | 4 |
 | 60 | `Effect::MayDo` | `MayDo` | 4 |
 | 61 | `Effect::LookTopNPutOneInHandRestToGraveyard` | `LookTopNPutOneInHandRestToGraveyard` | 1 |
-| 62 | `Effect::ChooseOneMode` | `ChooseOneMode` | 0 |
+| 62 | `Effect::ChooseOneMode` | `ModalChooseOne` | 13 |
 | 63 | `Effect::IfYouDo` | `IfYouDo` | 4 |
 | 64 | `Effect::EachOpponentMillsCards` | `EachOpponentMillsCards` | 1 |
 | 65 | `Effect::PumpTargetArtifactOrCreatureUntilEOT` | `PumpTargetArtifactOrCreatureUntilEOT` | 1 |
 | 66 | `Effect::EachOpponentSacrificesCreature` | `EachOpponentSacrificesCreature` | 1 |
-| 67 | `Effect::GrantKeywordToTargetCreatureUntilEOT` | `GrantKeywordToTargetCreatureUntilEOT` | 0 |
+| 67 | `Effect::GrantKeywordToTargetCreatureUntilEOT` | `GrantUnblockableUEOT` | 3 |
 | 68 | `Effect::UntapTargetOtherPermanent` | `UntapTargetOtherPermanent` | 1 |
 | 69 | `Effect::TapAnotherTargetCreature` | `TapAnotherTargetCreature` | 1 |
 | 70 | `Effect::ReturnAllCreaturesFromYourGraveyardToBattlefield` | `ReturnAllCreaturesFromYourGraveyardToBattlefield` | 1 |
@@ -130,12 +130,4 @@ Python Effect classes are split by how many cards they appear on. The Rust port 
 | 78 | `Effect::BecomeLandCreatureUEOT` | `BecomeLandCreatureUEOT` | 13 |
 | 79 | `Effect::OptionalManaCostThenEffect` | `OptionalManaCostThenEffect` | 2 |
 | 80 | `Effect::DrawCardsEqualToResolvingCombatDamage` | `DrawCardsEqualToResolvingCombatDamage` | 2 |
-
-## High-frequency Python classes NOT yet in Rust
-
-These are the next-best ports by cards-covered-per-variant and are the recommended top of the to-do queue:
-
-| Python class | Frequency | Example card |
-|---|---:|---|
-| `ModalChooseOne` | 13 | Archenemy's Charm |
 

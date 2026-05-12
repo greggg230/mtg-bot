@@ -99,6 +99,23 @@ RUST_TO_PYTHON_OVERRIDES: dict[str, str] = {
     "DamageEachOpponent": "DealDamageEachOpponent",
     "DamageEachCreature": "DealNDamageToEachCreature",
     "DealDamageAnyTarget": "DealDamageAnyTarget",
+    # Rust's ``ChooseOneMode { modes: Vec<Effect> }`` is the modal
+    # "choose one" combinator (CR 700.2 / 700.2d) — Python's
+    # ``ModalChooseOne`` (``effects/combinators.py``). Names differ
+    # because Rust collapses the "ChooseOne" + "Mode" pair into a
+    # single variant name while Python keeps the historical
+    # ``Modal*`` prefix.
+    "ChooseOneMode": "ModalChooseOne",
+    # Rust's ``GrantKeywordToTargetCreatureUntilEOT { keyword }`` is
+    # a keyword-agnostic parametric generalization (1:N). Python's
+    # current vocabulary spells each keyword as its own class —
+    # today only ``GrantUnblockableUEOT`` (3 EoE cards) is in pool,
+    # so the override pins to that. Once a future pool ships a
+    # ``GrantHasteUEOT`` / ``GrantFlyingUEOT`` class, the single
+    # Rust variant will cover those Python classes too; the
+    # override only nominates the highest-frequency current member
+    # for the coverage-by-class metric.
+    "GrantKeywordToTargetCreatureUntilEOT": "GrantUnblockableUEOT",
 }
 
 # Rust variants that have NO direct Python counterpart in the current
@@ -112,6 +129,17 @@ RUST_AHEAD_OF_POOL: set[str] = {
     # in-pool sibling). When a pool with scry-bearing cards is added,
     # remove this entry and add an override or 1:1 ``ScryN`` class.
     "ScryN",
+    # The Rust ``SetBasePTUntilEOT { power, toughness }`` variant
+    # mirrors Python's ``SetBasePTUntilEOT`` (effects/generic/pump.py,
+    # CR 613.4 layer 7b base-P/T override). The Python class is
+    # defined but not currently emitted by any pool card — the only
+    # in-pool base-P/T setter today is Genemorph Imago's
+    # ``SetBasePTConditionalUntilEOT`` (the conditional cousin, which
+    # calls ``grant_set_base_pt_ueot`` directly without composing the
+    # unconditional class). When a future pool ships a printing that
+    # parses to the bare ``SetBasePTUntilEOT``, drop this entry — the
+    # 1:1 identity mapping will pick it up.
+    "SetBasePTUntilEOT",
 }
 
 
