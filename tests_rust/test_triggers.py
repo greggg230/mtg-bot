@@ -1894,6 +1894,176 @@ def test_dies_event_parses_via_cross_engine_bridge():
 
 
 # =====================================================================
+# DIES-event harness substrate — test-fixture surface mirror of
+# `register_and_inject_object`.
+#
+# `kill_object_and_dispatch_dies(obj_id)` is the DIES-event sibling of
+# Slice 2's ENTERS-injection helper. It pops a battlefield object,
+# moves it to its controller's graveyard with the same per-object
+# state reset as the SBA destroy path, and fans out Event::Dies (+
+# Event::LeavesBattlefield for non-creatures) via the deferred-dispatch
+# queues. Used by the cross-engine smoke harness to exercise DIES
+# triggers without needing actual lethal damage on the victim.
+#
+# Why this helper exists: pre-harness, every DIES probe had to route
+# through SBA's lethal-damage path (deal damage equal to toughness,
+# then `apply_sbas`), which couples the test to the toughness / damage
+# subsystems. Routing through the helper lets a probe kill a victim
+# of any printing directly.
+# =====================================================================
+
+
+def _dies_creature_observer_dict_2lifegain():
+    """`subject_is_creature` DIES observer that gains 1 life on each
+    creature death — a simpler effect shape than draw-a-card for
+    multi-fire scenarios where the library size would underflow.
+    """
+    return {
+        "name": "Test DIES Creature Observer (1 life)",
+        "card_types": ["Creature"],
+        "mana_cost": {},
+        "effects": [],
+        "power": 2,
+        "toughness": 3,
+        "triggered_abilities": [
+            {
+                "event": "dies",
+                "predicate": {"kind": "subject_is_creature"},
+                "effect": {"kind": "gain_life", "amount": 1},
+            }
+        ],
+    }
+
+
+def _victim_creature_dict():
+    """A vanilla 1/1 creature victim. No triggered abilities — exists
+    only to be killed so an observer's DIES trigger fires.
+    """
+    return {
+        "name": "Test DIES Harness Victim",
+        "card_types": ["Creature"],
+        "mana_cost": {},
+        "effects": [],
+        "power": 1,
+        "toughness": 1,
+    }
+
+
+def test_kill_object_and_dispatch_dies_fires_observer(synthetic_state):
+    """Harness substrate: inject a `subject_is_creature` DIES observer
+    on p0's bf + a vanilla victim creature on p0's bf. Call
+    `kill_object_and_dispatch_dies(victim_id)`. Assert:
+
+    1. Victim is in p0's graveyard.
+    2. Observer's DIES trigger is on the stack (source = observer).
+    3. Resolving the trigger draws 1 card for observer's controller.
+    """
+    observer_id = synthetic_state.register_and_inject_object(
+        _dies_creature_observer_dict(), 0, ZONE_BATTLEFIELD
+    )
+    victim_id = synthetic_state.register_and_inject_object(
+        _victim_creature_dict(), 0, ZONE_BATTLEFIELD
+    )
+    # No ETB triggers on either — stack should be empty pre-kill.
+    assert synthetic_state.stack_size() == 0
+
+    library_before = synthetic_state.library_sizes[0]
+    hand_before = synthetic_state.hand_sizes[0]
+
+    returned_id = synthetic_state.kill_object_and_dispatch_dies(victim_id)
+    assert returned_id == victim_id, (
+        f"helper should return the dispatched id; got {returned_id}"
+    )
+
+    # Victim is in p0's graveyard (controller-of-effect convention).
+    assert synthetic_state.find_object_zone(victim_id) == ZONE_GRAVEYARD
+
+    # Observer's DIES trigger is on the stack.
+    assert synthetic_state.stack_size() == 1, (
+        "expected the subject_is_creature observer to fire on the "
+        f"harness-killed victim; got stack_size={synthetic_state.stack_size()}"
+    )
+    top = synthetic_state.peek_top_of_stack()
+    assert top["source_obj_id"] == observer_id
+
+    # Resolve: observer's controller draws 1.
+    synthetic_state.resolve_top_of_stack()
+    assert synthetic_state.hand_sizes[0] == hand_before + 1
+    assert synthetic_state.library_sizes[0] == library_before - 1
+
+
+def test_kill_object_and_dispatch_dies_self_trigger_fires(synthetic_state):
+    """SourceIsSelf-shape DIES trigger: kill a creature that carries
+    its own "when this dies, draw" trigger. The harness pymethod
+    moves the object to graveyard first, then dispatches DIES with
+    the dying object as an extra observer — matching the SBA-destroy
+    + Slice 5 dispatch_event(Event::Dies) shape.
+    """
+    crt_id = synthetic_state.register_and_inject_object(
+        _dies_self_draw_dict(), 0, ZONE_BATTLEFIELD
+    )
+    library_before = synthetic_state.library_sizes[0]
+    hand_before = synthetic_state.hand_sizes[0]
+
+    synthetic_state.kill_object_and_dispatch_dies(crt_id)
+    assert synthetic_state.find_object_zone(crt_id) == ZONE_GRAVEYARD
+
+    # The DIES self-trigger landed on the stack — dispatcher walks the
+    # bf-observer-set PLUS the dying object (extra_observers) so a
+    # SourceIsSelf trigger can match against the now-dead subject.
+    assert synthetic_state.stack_size() == 1, (
+        "expected the source_is_self DIES trigger to fire on harness "
+        "kill; the dispatcher must include the dying object as an "
+        "extra observer"
+    )
+    top = synthetic_state.peek_top_of_stack()
+    assert top["source_obj_id"] == crt_id
+
+    # Resolving draws 1 for the source's controller.
+    synthetic_state.resolve_top_of_stack()
+    assert synthetic_state.hand_sizes[0] == hand_before + 1
+    assert synthetic_state.library_sizes[0] == library_before - 1
+
+
+def test_kill_object_and_dispatch_dies_raises_on_missing_id(synthetic_state):
+    """Loud-not-quiet: calling the harness pymethod with an id that
+    isn't on either player's battlefield raises ValueError. Mirrors
+    `register_and_inject_object`'s controller-out-of-range raise
+    shape — harness misuse surfaces immediately rather than silently
+    no-oping.
+    """
+    with pytest.raises(ValueError, match="no battlefield object"):
+        synthetic_state.kill_object_and_dispatch_dies(9999)
+
+
+def test_kill_object_and_dispatch_dies_controlled_by_you_negative(
+    synthetic_state,
+):
+    """`controlled_by_you` negative-arm coverage on the harness path.
+    Observer on p0's bf, victim on p1's bf. The dispatcher walks bf
+    observers and the dying victim; the observer's predicate is
+    `subject_is_creature AND controlled_by_you`, so the p1 victim
+    is rejected (subject_controller=1 != source_controller=0). Stack
+    stays empty.
+    """
+    synthetic_state.register_and_inject_object(
+        _dies_under_your_control_observer_dict(), 0, ZONE_BATTLEFIELD
+    )
+    victim_id = synthetic_state.register_and_inject_object(
+        _victim_creature_dict(), 1, ZONE_BATTLEFIELD
+    )
+    synthetic_state.kill_object_and_dispatch_dies(victim_id)
+    # Victim is in p1's graveyard (controller convention preserved).
+    assert synthetic_state.find_object_zone(victim_id) == ZONE_GRAVEYARD
+    # Observer rejected because subject_controller=1 != observer
+    # controller=0.
+    assert synthetic_state.is_stack_empty(), (
+        "expected `controlled_by_you` to reject p1's creature death "
+        "under p0's observer"
+    )
+
+
+# =====================================================================
 # Slice 6 — Event::Cast dispatch on cast_creature site.
 #
 # Adds the third wired event family. After mana payment commits in

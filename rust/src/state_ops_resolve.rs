@@ -6621,6 +6621,115 @@ impl GameState {
         Ok(next_id)
     }
 
+    /// **Test-fixture surface — DIES-event harness sibling of
+    /// `register_and_inject_object`.**
+    ///
+    /// Move the battlefield object identified by `obj_id` into its
+    /// controller's graveyard and fan out `Event::Dies` for it via
+    /// the deferred-dispatch queue. Mirrors the destroy-shape inlined
+    /// in `state_ops_sba.rs::apply_sbas` — the SBA destroy path
+    /// minus the lethal-damage / 0-toughness gate. Used by the
+    /// cross-engine smoke harness to exercise DIES triggers without
+    /// having to set up actual lethal damage on the victim first.
+    ///
+    /// Why this exists: `register_and_inject_object` provides an
+    /// ENTERS-event injection surface (Slice 2 / RS8), but until now
+    /// there was no symmetric DIES-event injection surface. Every
+    /// dies-trigger cross-engine probe had to route through SBA's
+    /// lethal-damage path (deal damage equal to toughness, then
+    /// `apply_sbas`) which couples the test to the toughness /
+    /// damage subsystems and breaks down for 0-toughness victims,
+    /// indestructible victims, or non-lethal-damage death paths
+    /// (sacrifice, "destroy" effects). Routing through this primitive
+    /// lets a probe inject a victim with arbitrary printing and
+    /// kill it directly.
+    ///
+    /// Semantics (mirroring `apply_sbas`'s per-victim block):
+    ///
+    /// 1. Search both players' battlefields for an object with id
+    ///    `obj_id`. Raise `PyValueError` if not found (loud-not-quiet
+    ///    so harness misuse surfaces immediately).
+    /// 2. Pop it from the battlefield via `Arc::make_mut`. Reset
+    ///    per-object state per CR 400.7 / Python's
+    ///    `move_off_battlefield`: zero damage, untap, clear
+    ///    `attached_to`. (Counters are preserved, matching Python's
+    ///    `move_off_battlefield` and Rust's SBA destroy.)
+    /// 3. Push onto its controller's graveyard. `obj.zone =
+    ///    ZONE_GRAVEYARD`, `obj.controller` is preserved (which is
+    ///    also the destination — controller-of-effect convention).
+    /// 4. Call `mark_left_battlefield_if_nonland` so Void state
+    ///    flips the same way the SBA path does.
+    /// 5. Gate on creature-typing for `pending_dies_dispatches` (CR
+    ///    700.4 — only creatures "die"; a walker dying via 704.5i
+    ///    fires only LEAVES, not DIES). Non-creatures still push to
+    ///    `pending_leaves_dispatches` since LEAVES_BATTLEFIELD
+    ///    fires for any permanent.
+    /// 6. Drain BOTH queues — DIES first, then LEAVES — matching
+    ///    the order in `apply_sbas`. The drain happens AFTER the
+    ///    bf-pop so cascade triggers (a DIES trigger that injects
+    ///    another permanent) don't compete with mid-iteration
+    ///    state.
+    ///
+    /// Returns the dispatched id (== `obj_id`) on success so the
+    /// caller can chain (`let dead = state.kill_object_and_dispatch_dies(...)?`).
+    fn kill_object_and_dispatch_dies(&mut self, obj_id: u32) -> PyResult<u32> {
+        // Pop the victim from whichever battlefield it lives on.
+        let mut taken: Option<GameObject> = None;
+        for player in self.players.iter_mut() {
+            let pos = player.battlefield.iter().position(|o| o.id == obj_id);
+            if let Some(idx) = pos {
+                let bf = Arc::make_mut(&mut player.battlefield);
+                taken = Some(bf.remove(idx));
+                break;
+            }
+        }
+        let Some(mut obj) = taken else {
+            return Err(PyValueError::new_err(format!(
+                "kill_object_and_dispatch_dies: no battlefield object \
+                 with id {obj_id} (must be on the battlefield to be \
+                 killed; mirror the SBA destroy convention)"
+            )));
+        };
+        let controller = obj.controller;
+        let printing_id = obj.printing_id;
+        let dying_obj_id = obj.id;
+        // Per-object state reset on zone-change (CR 400.7), matching
+        // the SBA destroy block in state_ops_sba.rs.
+        obj.zone = ZONE_GRAVEYARD;
+        obj.damage = 0;
+        obj.tapped = false;
+        obj.attached_to = None;
+        // Push onto the controller's graveyard.
+        let target = &mut self.players[controller as usize];
+        Arc::make_mut(&mut target.graveyard).push(obj);
+        // Round-29 Void LTB gate (creature-only filter inside the
+        // helper); route through the gate-in-one-place helper so
+        // future printing-type extensions stay consistent.
+        mark_left_battlefield_if_nonland(self, printing_id);
+        // CR 700.4 + the SBA walker-gate parallel: DIES fires only
+        // for creatures. Non-creature permanents (artifacts, lands,
+        // enchantments, planeswalkers) fire ONLY LEAVES_BATTLEFIELD.
+        // Mirror state_ops_sba.rs's creature-typing gate.
+        let victim_is_creature = self
+            .registry
+            .lookup(printing_id)
+            .map(|p| p.card_types.iter().any(|t| t == "Creature"))
+            .unwrap_or(false);
+        if victim_is_creature {
+            self.pending_dies_dispatches.push(dying_obj_id);
+        }
+        // LEAVES fires unconditionally — every bf-exit is a leave
+        // event regardless of the victim's typing.
+        self.pending_leaves_dispatches.push(dying_obj_id);
+        // Drain DIES first, then LEAVES — matching state_ops_sba's
+        // SBA-destroy drain order (push order: DIES then LEAVES;
+        // LIFO resolution surfaces LEAVES first, matching Python's
+        // `move_off_battlefield` sequence at turn.py:280-289).
+        drain_pending_dies_dispatches(self)?;
+        drain_pending_leaves_dispatches(self)?;
+        Ok(dying_obj_id)
+    }
+
     // -------------------------------------------------------------
     // Round-11 exile read helpers.
     //
