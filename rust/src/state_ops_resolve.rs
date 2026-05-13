@@ -6659,11 +6659,18 @@ impl GameState {
     ///    also the destination — controller-of-effect convention).
     /// 4. Call `mark_left_battlefield_if_nonland` so Void state
     ///    flips the same way the SBA path does.
-    /// 5. Gate on creature-typing for `pending_dies_dispatches` (CR
-    ///    700.4 — only creatures "die"; a walker dying via 704.5i
-    ///    fires only LEAVES, not DIES). Non-creatures still push to
-    ///    `pending_leaves_dispatches` since LEAVES_BATTLEFIELD
-    ///    fires for any permanent.
+    /// 5. Gate on creature-or-artifact typing for
+    ///    `pending_dies_dispatches`. CR 700.4 technically restricts
+    ///    "dies" to creatures, but Python's
+    ///    `turn.move_off_battlefield` (src/mtg_bot/turn.py:273)
+    ///    intentionally widens the DIES dispatch path to ALSO cover
+    ///    artifact deaths so the `your_creature_or_artifact_dies`
+    ///    predicate family (Susurian Voidborn shape) keeps firing
+    ///    on artifact deaths. Mirror that widening here so the
+    ///    harness's DIES dispatch surface matches Python's
+    ///    observable behavior cross-engine. Lands / enchantments /
+    ///    planeswalkers fire ONLY LEAVES_BATTLEFIELD; they push to
+    ///    `pending_leaves_dispatches` unconditionally below.
     /// 6. Drain BOTH queues — DIES first, then LEAVES — matching
     ///    the order in `apply_sbas`. The drain happens AFTER the
     ///    bf-pop so cascade triggers (a DIES trigger that injects
@@ -6706,16 +6713,24 @@ impl GameState {
         // helper); route through the gate-in-one-place helper so
         // future printing-type extensions stay consistent.
         mark_left_battlefield_if_nonland(self, printing_id);
-        // CR 700.4 + the SBA walker-gate parallel: DIES fires only
-        // for creatures. Non-creature permanents (artifacts, lands,
-        // enchantments, planeswalkers) fire ONLY LEAVES_BATTLEFIELD.
-        // Mirror state_ops_sba.rs's creature-typing gate.
-        let victim_is_creature = self
+        // CR 700.4 says only creatures "die", but Python's
+        // `turn.move_off_battlefield` (src/mtg_bot/turn.py:273)
+        // intentionally widens DIES dispatch to ALSO cover artifact
+        // deaths so the `your_creature_or_artifact_dies` predicate
+        // family (Susurian Voidborn shape) fires when an artifact
+        // goes to the graveyard. Mirror that widening here so the
+        // harness's DIES dispatch surface matches Python's
+        // observable behavior cross-engine. Lands / enchantments /
+        // planeswalkers stay LEAVES-only.
+        let victim_card_types = self
             .registry
             .lookup(printing_id)
-            .map(|p| p.card_types.iter().any(|t| t == "Creature"))
-            .unwrap_or(false);
-        if victim_is_creature {
+            .map(|p| p.card_types.clone())
+            .unwrap_or_default();
+        let victim_fires_dies = victim_card_types.iter().any(|t| {
+            t == "Creature" || t == "Artifact"
+        });
+        if victim_fires_dies {
             self.pending_dies_dispatches.push(dying_obj_id);
         }
         // LEAVES fires unconditionally — every bf-exit is a leave

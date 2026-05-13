@@ -12173,3 +12173,455 @@ def test_cross_engine_real_eoe_haliya_guided_by_light_or_predicate_self_inclusiv
     assert py_state.players[1].life == 20
     assert rust_state.get_life(0) == py_state.players[0].life
     assert rust_state.get_life(1) == py_state.players[1].life
+
+
+def test_cross_engine_real_eoe_susurian_voidborn_dies_event_self_inclusive_parity(
+    parity_smoke,
+):
+    """Probe J: Susurian Voidborn (EoE) — FIRST cross-engine probe to
+    exercise the ``Event::Dies`` event family end-to-end on a real EoE
+    card. Unblocked by the new ``kill_object_and_dispatch_dies``
+    harness pymethod (the Rust-side DIES-injection surface; sibling
+    of Slice 2's ``register_and_inject_object`` ENTERS-injection).
+
+    Oracle text in ``data/edge_of_eternities.json``:
+
+        "Whenever this creature or another creature or artifact you
+         control dies, target opponent loses 1 life and you gain 1
+         life."
+
+    Real-EoE predicate (per the parser's collapsed-arm
+    decomposition at
+    ``tests/test_parser_creature_batch20.py``::``test_susurian_voidborn_trigger_line_end_to_end``):
+
+        Subject(None, IsCreature() | IsArtifact()) & Controlled(YOU)
+
+    Note: SELF-INCLUSIVE (no ``Not(IsSelf)``). The leading "this
+    creature" arm explicitly includes Susurian itself, so a Susurian
+    death also fires its own trigger -- a real Slimefoot-of-the-
+    Stowaway-shape.
+
+    Effect simplification: the printed effect is a ``Sequence`` of
+    ``TargetOpponentLosesLife(1)`` + ``GainLife(1)``. The first half
+    requires target selection (``TargetOpponentLosesLife.requires_target
+    == True``), which is outside the inject-and-fan-out probe scope --
+    the cross-engine smoke harness doesn't do mid-probe target-choice
+    decisions. We strip the target-requiring half and keep only
+    ``GainLife(1)`` (already on the substrate-bridged effect surface
+    per every prior Probe B/D/E/H/I). Same effect-strip pattern as
+    Kav Landseeker (Probe H, ``create_token`` half stripped) and Weft-
+    stalker Ardent (Probe G, ``damage_each_opponent`` shape kept). The
+    real-EoE-printed PREDICATE is the load-bearing slice this probe
+    pins -- the effect is wallpaper.
+
+    Probe shape (kill-and-fan-out, the DIES-event analog of every
+    prior inject-and-fan-out probe):
+
+      1. Pre-place Susurian on p0's bf. No fire on its own arrival
+         (event=Dies, not Enters; ENTERS dispatch sees an empty
+         observer set for DIES triggers).
+
+      2. Pre-place a vanilla creature victim on p0's bf + kill it
+         via the harness. Susurian's predicate matches:
+         IsCreature TRUE -> Or-left TRUE; Controlled(YOU) TRUE
+         (victim_controller=0 == observer_controller=0). Trigger
+         fires -> drain -> p0 life 20 -> 21.
+
+      3. Pre-place a vanilla artifact victim on p0's bf + kill it.
+         IsCreature FALSE, IsArtifact TRUE -> Or-right TRUE;
+         Controlled(YOU) TRUE. Trigger fires -> drain -> p0 life
+         21 -> 22.
+
+      4. Pre-place a vanilla creature victim on p1's bf + kill it.
+         IsCreature TRUE; Controlled(YOU) FALSE
+         (victim_controller=1 != observer_controller=0). Trigger
+         is REJECTED -> drain -> p0 life unchanged at 22. Pins
+         ControlledByYou's negative arm on the DIES-event path
+         (analog of Probe I's ENTERS-event negative arm).
+
+      5. Pre-place a vanilla LAND victim on p0's bf + kill it.
+         IsCreature FALSE, IsArtifact FALSE -> Or REJECTS the
+         subject -> drain -> p0 life unchanged at 22. Pins
+         Or's negative-arm rejection on the DIES path. (Land
+         doesn't normally die, but the harness pymethod doesn't
+         filter by typing -- any battlefield permanent can be
+         killed by the harness, which is the right primitive
+         shape; in real MTG a Crucible-of-Worlds-style "destroy
+         target land" effect drives this.)
+
+      6. Kill SUSURIAN itself. Self-inclusive: IsCreature TRUE,
+         Controlled(YOU) TRUE (Susurian's controller is its own
+         controller -- the dispatcher routes Susurian as an extra
+         observer per Slice 5's ``extra_observers=[obj]`` shape so
+         the now-dead subject can still match against its own
+         predicate). Trigger fires -> drain -> p0 life 22 -> 23.
+
+      7. Cross-engine assert: BOTH engines end with p0 life 23
+         (creature death + artifact death + self death = +3); p1's
+         creature death was rejected, the land death was rejected.
+
+    This is the **first** cross-engine probe to exercise:
+      - the new ``kill_object_and_dispatch_dies`` harness pymethod;
+      - ``Event::Dies`` dispatch end-to-end on a real EoE card;
+      - the ``extra_observers=[obj]`` self-inclusive DIES path on
+        a real EoE card (the dispatcher must include the dying
+        object as an observer so SourceIsSelf-shape DIES triggers
+        match against the now-graveyard subject; via And(Or(...),
+        Controlled(YOU)) here too, mirroring Probe I's self-arrival
+        path on ENTERS).
+
+    Out of scope (out-of-bridge gaps that the strip preserves):
+
+      * ``TargetOpponentLosesLife`` half of the printed Sequence
+        effect -- requires mid-probe target selection. Follow-up
+        probe once the target-bearing-DIES-effect bridge lands.
+      * Warp cast-from-exile path -- alt cast pipeline; pre-place
+        skips it.
+      * Multi-victim cascading deaths -- the harness primitive
+        kills one victim at a time. Multi-death scenarios (board
+        wipe -> two Susurians fire each other twice -> ...) are
+        out of probe scope; Slice 5's
+        ``test_dies_multiple_simultaneous_deaths_each_fire`` pins
+        the multi-death shape via SBA in isolation.
+    """
+    from mtg_bot.parity.cross_engine import (
+        CardDef, DeckSpec, build_python_state, build_rust_state,
+    )
+
+    susurian_predicate = {
+        "kind": "and",
+        "left": {
+            "kind": "or",
+            "left": {"kind": "subject_is_creature"},
+            "right": {"kind": "subject_is_artifact"},
+        },
+        "right": {"kind": "controlled_by_you"},
+    }
+    susurian = CardDef(
+        name="Susurian Voidborn",
+        card_type="Creature",
+        mana_cost_generic=2,
+        mana_cost_colored=(("B", 1),),
+        power=2,
+        toughness=2,
+        triggered_abilities=(
+            {
+                "event": "dies",
+                "predicate": susurian_predicate,
+                "effect": {"kind": "gain_life", "amount": 1},
+            },
+        ),
+    )
+    bait_creature = CardDef(
+        name="Bait DIES Creature",
+        card_type="Creature",
+        mana_cost_generic=1,
+        power=1,
+        toughness=1,
+    )
+    bait_artifact = CardDef(
+        name="Bait DIES Artifact",
+        card_type="Artifact",
+        mana_cost_generic=1,
+    )
+    bait_land = CardDef(
+        name="Bait DIES Land",
+        card_type="Land",
+    )
+    spec = DeckSpec(
+        card_defs=(susurian, bait_creature, bait_artifact, bait_land),
+        p0_library=(),
+        p1_library=(),
+    )
+    py_state = build_python_state(spec)
+    rust_state = build_rust_state(spec)
+
+    # ---- Rust side ----
+    ZONE_BATTLEFIELD = 2
+    rust_susurian_dict = {
+        "name": "Susurian Voidborn",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 2, "B": 1},
+        "effects": [],
+        "power": 2,
+        "toughness": 2,
+        "triggered_abilities": [
+            {
+                "event": "dies",
+                "predicate": susurian_predicate,
+                "effect": {"kind": "gain_life", "amount": 1},
+            }
+        ],
+    }
+    rust_susurian_id = rust_state.register_and_inject_object(
+        rust_susurian_dict, 0, ZONE_BATTLEFIELD
+    )
+    # No fire on enter (the trigger is DIES, not ENTERS).
+    assert rust_state.stack_size() == 0, (
+        "Rust: Susurian's ENTERS shouldn't fire a DIES trigger. "
+        f"Got stack_size={rust_state.stack_size()}"
+    )
+    assert rust_state.get_life(0) == 20
+
+    rust_creature_dict = {
+        "name": "Bait DIES Creature",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "effects": [],
+        "power": 1,
+        "toughness": 1,
+    }
+    rust_artifact_dict = {
+        "name": "Bait DIES Artifact",
+        "card_types": ["Artifact"],
+        "mana_cost": {"generic": 1},
+        "effects": [],
+    }
+    rust_land_dict = {
+        "name": "Bait DIES Land",
+        "card_types": ["Land"],
+        "effects": [],
+    }
+
+    # Kill 1: p0 creature -> fires (Or-left, ControlledByYou TRUE).
+    rust_p0_creature_id = rust_state.register_and_inject_object(
+        rust_creature_dict, 0, ZONE_BATTLEFIELD
+    )
+    rust_state.kill_object_and_dispatch_dies(rust_p0_creature_id)
+    assert rust_state.stack_size() == 1, (
+        "Rust: Susurian should fire on p0-controlled creature death "
+        f"(Or-left + ControlledByYou). Got stack_size={rust_state.stack_size()}"
+    )
+    while rust_state.stack_size() > 0:
+        rust_state.resolve_top_of_stack()
+    assert rust_state.get_life(0) == 21, (
+        f"Rust: p0 life should be 21 after creature DIES; got {rust_state.get_life(0)}"
+    )
+
+    # Kill 2: p0 artifact -> fires (Or-right, ControlledByYou TRUE).
+    rust_p0_artifact_id = rust_state.register_and_inject_object(
+        rust_artifact_dict, 0, ZONE_BATTLEFIELD
+    )
+    rust_state.kill_object_and_dispatch_dies(rust_p0_artifact_id)
+    assert rust_state.stack_size() == 1, (
+        "Rust: Susurian should fire on p0-controlled artifact death "
+        f"(Or-right + ControlledByYou). Got stack_size={rust_state.stack_size()}"
+    )
+    while rust_state.stack_size() > 0:
+        rust_state.resolve_top_of_stack()
+    assert rust_state.get_life(0) == 22
+
+    # Kill 3: p1 creature -> NO fire (Or-left TRUE but
+    # ControlledByYou FALSE).
+    rust_p1_creature_id = rust_state.register_and_inject_object(
+        rust_creature_dict, 1, ZONE_BATTLEFIELD
+    )
+    rust_state.kill_object_and_dispatch_dies(rust_p1_creature_id)
+    assert rust_state.stack_size() == 0, (
+        "Rust: ControlledByYou should reject an opponent-controlled "
+        f"creature dying. Got stack_size={rust_state.stack_size()}"
+    )
+    assert rust_state.get_life(0) == 22
+
+    # Kill 4: p0 LAND -> NO fire (neither Or arm matches).
+    rust_p0_land_id = rust_state.register_and_inject_object(
+        rust_land_dict, 0, ZONE_BATTLEFIELD
+    )
+    rust_state.kill_object_and_dispatch_dies(rust_p0_land_id)
+    assert rust_state.stack_size() == 0, (
+        "Rust: Or(creature, artifact) should reject a land subject. "
+        f"Got stack_size={rust_state.stack_size()}"
+    )
+    assert rust_state.get_life(0) == 22
+
+    # Kill 5: SUSURIAN ITSELF -> fires (self-inclusive predicate;
+    # IsSelf isn't excluded). Dispatcher must include the dying
+    # subject as an extra observer so Susurian's own predicate
+    # matches against the now-graveyard subject.
+    rust_state.kill_object_and_dispatch_dies(rust_susurian_id)
+    assert rust_state.stack_size() == 1, (
+        "Rust: Susurian should fire on its own death (self-inclusive "
+        "predicate). dispatcher must include dying object as extra "
+        f"observer. Got stack_size={rust_state.stack_size()}"
+    )
+    while rust_state.stack_size() > 0:
+        rust_state.resolve_top_of_stack()
+    assert rust_state.get_life(0) == 23
+
+    # ---- Python side ----
+    from mtg_bot.actions import resolve_top_of_stack
+    from mtg_bot.cards.base import CardPrinting, ManaCost
+    from mtg_bot.effects.base import TriggeredAbility
+    from mtg_bot.effects.generic.life import GainLife
+    from mtg_bot.effects.object_predicates import IsArtifact, IsCreature
+    from mtg_bot.effects.predicates import (
+        And, Controlled, Event, Or, Subject, YOU,
+    )
+    from mtg_bot.game import Zone
+    from mtg_bot.turn import move_off_battlefield
+
+    py_predicate = And(
+        left=Or(
+            left=Subject(slot=None, inner=IsCreature()),
+            right=Subject(slot=None, inner=IsArtifact()),
+        ),
+        right=Controlled(by=YOU, subject=None),
+    )
+    susurian_printing = CardPrinting(
+        name="Susurian Voidborn",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=2, colored=(("B", 1),)),
+        type_line="Creature -- Vampire Soldier",
+        supertypes=(),
+        card_types=("Creature",),
+        subtypes=(),
+        power=2,
+        toughness=2,
+        produces=frozenset(),
+        triggered_abilities=(
+            TriggeredAbility(
+                event=Event.DIES,
+                predicate=py_predicate,
+                effect=GainLife(amount=1),
+            ),
+        ),
+    )
+    creature_printing = CardPrinting(
+        name="Bait DIES Creature",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=1),
+        type_line="Creature",
+        supertypes=(),
+        card_types=("Creature",),
+        subtypes=(),
+        power=1,
+        toughness=1,
+        produces=frozenset(),
+        triggered_abilities=(),
+    )
+    artifact_printing = CardPrinting(
+        name="Bait DIES Artifact",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=1),
+        type_line="Artifact",
+        supertypes=(),
+        card_types=("Artifact",),
+        subtypes=(),
+        power=None,
+        toughness=None,
+        produces=frozenset(),
+        triggered_abilities=(),
+    )
+    land_printing = CardPrinting(
+        name="Bait DIES Land",
+        mana_cost_str="",
+        mana_cost=ManaCost(),
+        type_line="Land",
+        supertypes=(),
+        card_types=("Land",),
+        subtypes=(),
+        power=None,
+        toughness=None,
+        produces=frozenset(),
+        triggered_abilities=(),
+    )
+
+    # Place Susurian on p0's bf.
+    py_susurian = py_state.new_object(
+        susurian_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_susurian.summoning_sick = False
+    py_susurian.tapped = False
+    py_susurian.damage = 0
+    py_susurian.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_susurian)
+    # No ENTERS firing of DIES trigger; stack stays empty.
+    assert len(py_state.stack) == 0
+    assert py_state.players[0].life == 20
+
+    # Kill 1: p0 creature -> fires.
+    py_p0_creature = py_state.new_object(
+        creature_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_p0_creature.summoning_sick = True
+    py_p0_creature.tapped = False
+    py_p0_creature.damage = 0
+    py_p0_creature.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_p0_creature)
+    move_off_battlefield(py_state, py_p0_creature, destination="graveyard")
+    assert len(py_state.stack) == 1, (
+        "Python: Susurian should fire on p0-controlled creature death"
+    )
+    while py_state.stack:
+        resolve_top_of_stack(py_state)
+    assert py_state.players[0].life == 21
+
+    # Kill 2: p0 artifact -> fires.
+    py_p0_artifact = py_state.new_object(
+        artifact_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_p0_artifact.summoning_sick = False
+    py_p0_artifact.tapped = False
+    py_p0_artifact.damage = 0
+    py_p0_artifact.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_p0_artifact)
+    move_off_battlefield(py_state, py_p0_artifact, destination="graveyard")
+    assert len(py_state.stack) == 1, (
+        "Python: Susurian should fire on p0-controlled artifact death"
+    )
+    while py_state.stack:
+        resolve_top_of_stack(py_state)
+    assert py_state.players[0].life == 22
+
+    # Kill 3: p1 creature -> NO fire.
+    py_p1_creature = py_state.new_object(
+        creature_printing, owner_id=1, zone=Zone.BATTLEFIELD,
+    )
+    py_p1_creature.summoning_sick = True
+    py_p1_creature.tapped = False
+    py_p1_creature.damage = 0
+    py_p1_creature.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_p1_creature)
+    move_off_battlefield(py_state, py_p1_creature, destination="graveyard")
+    assert len(py_state.stack) == 0, (
+        "Python: ControlledByYou should reject p1's creature dying"
+    )
+    assert py_state.players[0].life == 22
+
+    # Kill 4: p0 LAND -> NO fire.
+    py_p0_land = py_state.new_object(
+        land_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_p0_land.summoning_sick = False
+    py_p0_land.tapped = False
+    py_p0_land.damage = 0
+    py_p0_land.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_p0_land)
+    move_off_battlefield(py_state, py_p0_land, destination="graveyard")
+    assert len(py_state.stack) == 0, (
+        "Python: Or(creature, artifact) should reject a land subject"
+    )
+    assert py_state.players[0].life == 22
+
+    # Kill 5: Susurian itself -> fires (self-inclusive).
+    move_off_battlefield(py_state, py_susurian, destination="graveyard")
+    assert len(py_state.stack) == 1, (
+        "Python: Susurian should fire on its own death (self-inclusive)"
+    )
+    while py_state.stack:
+        resolve_top_of_stack(py_state)
+    assert py_state.players[0].life == 23
+
+    # ---- Cross-engine parity ----
+    _drain_stack_both(py_state, rust_state)
+    assert rust_state.get_life(0) == 23
+    assert rust_state.get_life(1) == 20
+    assert py_state.players[0].life == 23
+    assert py_state.players[1].life == 20
+    assert rust_state.get_life(0) == py_state.players[0].life
+    assert rust_state.get_life(1) == py_state.players[1].life
