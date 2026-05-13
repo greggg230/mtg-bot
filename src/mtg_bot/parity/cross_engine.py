@@ -284,6 +284,39 @@ def _ta_dict_to_python_predicate(pred_dict: dict | None):
             _ta_dict_to_python_predicate(pred_dict["left"]),
             _ta_dict_to_python_predicate(pred_dict["right"]),
         )
+    if kind == "subject":
+        # Subject-substrate slice — Python's `Subject(slot, inner)`
+        # at `src/mtg_bot/effects/predicates.py:354` for the
+        # named-slot case. The Rust `Predicate::Subject(slot, inner)`
+        # carries an inner trigger-predicate; Python's `Subject`
+        # expects an `ObjectPredicate` as inner. Every inner kind
+        # the substrate wires here is itself one of the
+        # slot-agnostic object-tier checks, so the cross-engine
+        # mapping is direct.
+        #
+        # Slot strings ("source", "target") match Python's
+        # `EVENT_SUBJECTS` keys for `Event.DEALS_COMBAT_DAMAGE`
+        # directly — no translation needed.
+        slot = pred_dict["slot"]
+        inner_dict = pred_dict["inner"]
+        inner_kind = inner_dict["kind"]
+        if inner_kind == "subject_is_creature":
+            inner_py = IsCreature()
+        elif inner_kind == "subject_is_land":
+            inner_py = IsLand()
+        elif inner_kind == "subject_is_artifact":
+            inner_py = IsArtifact()
+        elif inner_kind == "subject_has_subtype":
+            inner_py = HasSubtype(name=inner_dict["subtype"])
+        else:
+            raise ValueError(
+                f"cross_engine triggered_abilities bridge: "
+                f"predicate.subject inner-kind {inner_kind!r} is not "
+                f"yet wired (must be an object-tier predicate — "
+                f"add a bridge arm in `_ta_dict_to_python_predicate` "
+                f"alongside its Rust `Predicate::Subject` counterpart)"
+            )
+        return Subject(slot=slot, inner=inner_py)
     raise ValueError(
         f"cross_engine triggered_abilities bridge: unsupported "
         f"predicate kind {kind!r}"

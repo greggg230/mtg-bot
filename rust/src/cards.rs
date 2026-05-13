@@ -1925,6 +1925,47 @@ pub enum Event {
     LeavesBattlefield,
 }
 
+/// Named subject slot for multi-subject events. Mirrors the named
+/// keys in Python's `EVENT_SUBJECTS` mapping at
+/// `src/mtg_bot/effects/predicates.py:205`.
+///
+/// **Scope (ETB Subject-substrate slice).** The minimum surface
+/// needed to unblock multi-subject events. Today's variants:
+///
+/// - `Source` — the object DEALING / ORIGINATING the event. For
+///   `Event::DealsCombatDamage` this is the attacking/blocking
+///   creature dealing damage; for `Event::Blocks` (when wired
+///   multi-subject) it's the blocker. Mirrors Python's
+///   ``"source"`` string slot.
+/// - `Target` — the object/player RECEIVING / TARGETED by the event.
+///   For `Event::DealsCombatDamage` this is the player or creature
+///   being damaged. Mirrors Python's ``"target"`` string slot.
+///
+/// **Future extension.** Adding a new named slot (e.g. ``Blocker``,
+/// ``Attacker`` for multi-subject `Event::Blocks`) requires both an
+/// enum variant here AND a matching parser arm in
+/// `parse_subject_slot`. Cross-engine bridge translates each variant
+/// to its Python string slot name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubjectSlot {
+    /// The dealing / originating object. Maps to Python's ``"source"``.
+    Source,
+    /// The receiving / targeted object. Maps to Python's ``"target"``.
+    Target,
+}
+
+impl SubjectSlot {
+    /// The canonical lowercase string name for this slot. Matches the
+    /// dict-key the parser consumes and the Python slot-name strings
+    /// in `EVENT_SUBJECTS`.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            SubjectSlot::Source => "source",
+            SubjectSlot::Target => "target",
+        }
+    }
+}
+
 /// Predicate algebra over the trigger subject (the GameObject the
 /// event happened to) and source (the GameObject carrying the
 /// ability). First-slice closed-enum minimal surface; mirrors a
@@ -2003,6 +2044,33 @@ pub enum Predicate {
     /// AND NOT SourceIsSelf`), where Slice 4's `And`-only algebra
     /// couldn't express the disjunction.
     Or(Box<Predicate>, Box<Predicate>),
+    /// Pulls a named subject slot out of a multi-subject event and
+    /// evaluates `inner` against THAT subject (rather than the
+    /// default `subject_id` the dispatch site passed in). Mirrors
+    /// Python's `Subject(slot, inner)` at
+    /// `src/mtg_bot/effects/predicates.py:354` for the named-slot
+    /// case (Rust's existing implicit-subject predicates already
+    /// cover the `Subject(None, ...)` default-slot case).
+    ///
+    /// **Single-subject events.** ENTERS / DIES / CAST / ATTACKS /
+    /// BLOCKS / LEAVES dispatch today with an empty slot map; a
+    /// `Predicate::Subject(slot, inner)` on one of those events
+    /// evaluates `false` because the slot isn't bound. The existing
+    /// implicit-subject predicates (`SubjectIsCreature`,
+    /// `ControlledByYou`, etc.) continue to work unchanged on
+    /// single-subject events — `Predicate::Subject` only fires on
+    /// the future multi-subject dispatch path
+    /// (`Event::DealsCombatDamage` and friends) where the dispatch
+    /// site supplies the slot map.
+    ///
+    /// **Use case.** A DealsCombatDamage "whenever this creature
+    /// deals combat damage to a player" gates on the `Target`
+    /// slot's recipient via `Subject(Target, ...)`. Similarly a
+    /// Skystinger-shape BLOCKS trigger `"whenever ~ blocks a
+    /// creature with flying"` would predicate on the attacker
+    /// subject via `Subject(Attacker, ...)` once the multi-subject
+    /// BLOCKS dispatch lands.
+    Subject(SubjectSlot, Box<Predicate>),
 }
 
 impl Predicate {
@@ -2012,11 +2080,46 @@ impl Predicate {
     /// `subject_id` is the GameObject the event happened to (the
     /// creature that just entered the battlefield, for Enters).
     /// Both ids are u32-keyed object ids resolved at dispatch time.
+    ///
+    /// This is the single-subject entry point — it delegates to
+    /// `matches_with_slots` with an empty slot map. A predicate that
+    /// uses `Predicate::Subject(slot, inner)` on a single-subject
+    /// event evaluates `false` (the named slot isn't bound). All
+    /// pre-Subject-substrate predicates ignore the slot map and
+    /// continue to evaluate against `subject_id` directly, so this
+    /// call is bit-identical to the pre-substrate behavior for
+    /// every existing call site.
     pub(crate) fn matches(
         &self,
         state: &crate::state::GameState,
         source_id: u32,
         subject_id: u32,
+    ) -> bool {
+        self.matches_with_slots(state, source_id, subject_id, &[])
+    }
+
+    /// Multi-subject-aware evaluation entry point. `subjects_by_slot`
+    /// supplies the named-slot map for multi-subject events
+    /// (`Event::DealsCombatDamage` and friends — see `SubjectSlot`).
+    /// On single-subject events, callers pass `&[]` (via the thin
+    /// `matches` wrapper).
+    ///
+    /// `subject_id` remains the implicit-default subject (the
+    /// pre-substrate single-subject id). Every existing predicate
+    /// arm reads it unchanged; only `Predicate::Subject(slot, inner)`
+    /// overrides it (replacing `subject_id` for the recursive
+    /// `inner` evaluation with the id bound to `slot` in
+    /// `subjects_by_slot`). When the slot isn't present, the
+    /// predicate evaluates `false` — matching Python's
+    /// `_resolve_subject` "missing slot → predicate is false"
+    /// short-circuit at
+    /// `src/mtg_bot/effects/predicates.py:340`.
+    pub(crate) fn matches_with_slots(
+        &self,
+        state: &crate::state::GameState,
+        source_id: u32,
+        subject_id: u32,
+        subjects_by_slot: &[(SubjectSlot, u32)],
     ) -> bool {
         match self {
             Predicate::Always => true,
@@ -2056,14 +2159,38 @@ impl Predicate {
             Predicate::SubjectHasSubtype(subtype) => {
                 subject_has_subtype(state, subject_id, subtype)
             }
-            Predicate::Not(inner) => !inner.matches(state, source_id, subject_id),
+            Predicate::Not(inner) => {
+                !inner.matches_with_slots(state, source_id, subject_id, subjects_by_slot)
+            }
             Predicate::And(a, b) => {
-                a.matches(state, source_id, subject_id)
-                    && b.matches(state, source_id, subject_id)
+                a.matches_with_slots(state, source_id, subject_id, subjects_by_slot)
+                    && b.matches_with_slots(state, source_id, subject_id, subjects_by_slot)
             }
             Predicate::Or(a, b) => {
-                a.matches(state, source_id, subject_id)
-                    || b.matches(state, source_id, subject_id)
+                a.matches_with_slots(state, source_id, subject_id, subjects_by_slot)
+                    || b.matches_with_slots(state, source_id, subject_id, subjects_by_slot)
+            }
+            Predicate::Subject(slot, inner) => {
+                // Look up the named slot; if absent, the predicate
+                // is false (mirrors Python's `_resolve_subject`
+                // short-circuit). When present, evaluate `inner`
+                // with `subject_id = slot_id` — this swaps the
+                // implicit subject for the duration of the
+                // recursive evaluation. The slot map stays intact so
+                // a nested `Subject(other_slot, ...)` (theoretical
+                // future shape) still resolves correctly.
+                let slot_id = subjects_by_slot
+                    .iter()
+                    .find_map(|(s, id)| if *s == *slot { Some(*id) } else { None });
+                match slot_id {
+                    Some(id) => inner.matches_with_slots(
+                        state,
+                        source_id,
+                        id,
+                        subjects_by_slot,
+                    ),
+                    None => false,
+                }
             }
         }
     }
@@ -4672,11 +4799,54 @@ fn parse_predicate(dict: &Bound<'_, PyDict>) -> PyResult<Predicate> {
                 Box::new(parse_predicate(right_dict)?),
             ))
         }
+        // Subject-substrate slice — pull a named subject slot out of
+        // a multi-subject event and evaluate `inner` against THAT
+        // subject. Dict shape:
+        //   {"kind": "subject", "slot": "source"|"target",
+        //    "inner": {...}}
+        // The slot string maps to a `SubjectSlot` enum variant via
+        // `parse_subject_slot`. On single-subject events the slot map
+        // is empty so this predicate evaluates `false` — only the
+        // multi-subject dispatch path (Event::DealsCombatDamage etc.)
+        // supplies the bindings.
+        "subject" => {
+            let slot_any = require(dict, "slot")?;
+            let slot_str: String = slot_any.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "predicate.subject.slot must be a string",
+                )
+            })?;
+            let slot = parse_subject_slot(&slot_str)?;
+            let inner_any = require(dict, "inner")?;
+            let inner_dict = inner_any.downcast::<PyDict>().map_err(|_| {
+                PyValueError::new_err("predicate.subject.inner must be a dict")
+            })?;
+            Ok(Predicate::Subject(
+                slot,
+                Box::new(parse_predicate(inner_dict)?),
+            ))
+        }
         other => Err(PyValueError::new_err(format!(
             "unknown predicate kind {other:?}; \
              valid: always, source_is_self, source_is_creature, \
              subject_is_land, subject_is_artifact, subject_is_creature, \
-             controlled_by_you, subject_has_subtype, not, and, or"
+             controlled_by_you, subject_has_subtype, not, and, or, \
+             subject"
+        ))),
+    }
+}
+
+/// Parse a `SubjectSlot` string from the predicate-dict `slot` key.
+/// Mirrors the inverse of `SubjectSlot::as_str`. Unknown slot names
+/// raise loudly so a typo (e.g. `"src"` instead of `"source"`) fails
+/// at parse time rather than silently never-matching at dispatch.
+fn parse_subject_slot(slot: &str) -> PyResult<SubjectSlot> {
+    match slot {
+        "source" => Ok(SubjectSlot::Source),
+        "target" => Ok(SubjectSlot::Target),
+        other => Err(PyValueError::new_err(format!(
+            "unknown predicate.subject.slot {other:?}; \
+             valid: source, target"
         ))),
     }
 }

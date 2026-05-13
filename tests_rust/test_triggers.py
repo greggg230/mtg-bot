@@ -4532,3 +4532,405 @@ def test_or_composes_under_and_for_weftstalker_shape(synthetic_state):
         "expected `controlled_by_you` outer guard to reject opponent's "
         "creature subject"
     )
+
+
+# ====================================================================
+# Subject substrate — Predicate::Subject(slot, inner)
+# ====================================================================
+#
+# Adds the `Predicate::Subject(SubjectSlot, Box<Predicate>)` variant
+# which pulls a named subject slot out of a multi-subject event's
+# slot map and evaluates `inner` against that subject. Slot strings:
+# `"source"` / `"target"` mirror Python's `EVENT_SUBJECTS` keys for
+# `Event.DEALS_COMBAT_DAMAGE`.
+#
+# **Scope.** This slice ships the substrate ONLY — parser arm,
+# evaluation arm, cross-engine bridge. No consumer event yet supplies
+# the slot bindings (that lands with `Event::DealsCombatDamage` in a
+# follow-up slice). Therefore: on every existing single-subject event
+# (ENTERS / DIES / CAST / ATTACKS / BLOCKS / LEAVES), a predicate of
+# the form `Subject(slot, inner)` evaluates `false` because the slot
+# isn't bound. The tests below pin that contract — the new variant
+# parses, registers, and silently no-ops on today's single-subject
+# events. The multi-subject dispatch path will exercise the firing
+# arm in lockstep with the consumer slice.
+
+
+def _subject_creature_observer_dict():
+    """An observer with `Predicate::Subject(Source, IsCreature)` —
+    parses + registers, but on single-subject events the `source`
+    slot isn't bound so the predicate evaluates false. Used as the
+    smoke fixture for the "named slot is unbound on single-subject
+    events" contract.
+    """
+    return {
+        "name": "Test Subject(Source, IsCreature) Observer",
+        "card_types": ["Creature"],
+        "mana_cost": {},
+        "effects": [],
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "source",
+                    "inner": {"kind": "subject_is_creature"},
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+
+
+def _subject_target_creature_observer_dict():
+    """An observer with `Predicate::Subject(Target, IsCreature)` —
+    the `target`-slot sibling of `_subject_creature_observer_dict`.
+    """
+    return {
+        "name": "Test Subject(Target, IsCreature) Observer",
+        "card_types": ["Creature"],
+        "mana_cost": {},
+        "effects": [],
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "target",
+                    "inner": {"kind": "subject_is_creature"},
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+
+
+# --- parser surface --------------------------------------------------
+
+
+def test_subject_predicate_with_source_slot_parses(empty_registry):
+    """`{"kind": "subject", "slot": "source", "inner": {...}}` parses
+    and registers without raising.
+    """
+    pid = empty_registry.register_printing(
+        _subject_creature_observer_dict()
+    )
+    assert pid == 0
+
+
+def test_subject_predicate_with_target_slot_parses(empty_registry):
+    """The sibling `slot="target"` form also parses + registers."""
+    pid = empty_registry.register_printing(
+        _subject_target_creature_observer_dict()
+    )
+    assert pid == 0
+
+
+def test_subject_predicate_unknown_slot_raises(empty_registry):
+    """An unknown slot string (e.g. `"src"` typo) raises at register
+    time so a misspelled slot never silently no-ops at dispatch.
+    """
+    d = {
+        "name": "Bad Subject Slot Card",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "src",
+                    "inner": {"kind": "subject_is_creature"},
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    with pytest.raises(
+        ValueError, match="unknown predicate.subject.slot"
+    ):
+        empty_registry.register_printing(d)
+
+
+def test_subject_predicate_missing_inner_raises(empty_registry):
+    """Missing the required `inner` field raises. `require` raises
+    `KeyError` (PyO3-side) for missing dict keys, mirroring every
+    other parser-arm's missing-key contract.
+    """
+    d = {
+        "name": "No-Inner Subject Card",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "source",
+                    # No "inner" key.
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    with pytest.raises(KeyError, match="inner"):
+        empty_registry.register_printing(d)
+
+
+def test_subject_predicate_inner_must_be_dict(empty_registry):
+    """Non-dict `inner` raises with the canonical message."""
+    d = {
+        "name": "Non-Dict Inner Subject Card",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "source",
+                    "inner": "not a dict",
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    with pytest.raises(
+        ValueError, match="predicate.subject.inner must be a dict"
+    ):
+        empty_registry.register_printing(d)
+
+
+# --- single-subject dispatch: Subject(slot, inner) silently no-ops --
+
+
+def test_subject_predicate_no_ops_on_single_subject_enters(synthetic_state):
+    """On the single-subject ENTERS event, today's dispatch passes no
+    slot bindings — `Predicate::Subject(slot, inner)` evaluates false
+    and the trigger doesn't fire. Pins the substrate's
+    back-compat-on-single-subject-events contract.
+    """
+    synthetic_state.register_and_inject_object(
+        _subject_creature_observer_dict(), 0, ZONE_BATTLEFIELD
+    )
+    # Cast a vanilla creature — would fire if the slot were bound.
+    bait_id = synthetic_state.register_and_inject_object(
+        _vanilla_creature_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(bait_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    assert synthetic_state.find_object_zone(bait_id) == ZONE_BATTLEFIELD
+    assert synthetic_state.is_stack_empty(), (
+        "expected `Subject(Source, IsCreature)` to evaluate false on "
+        "single-subject ENTERS dispatch (slot map is empty); the "
+        "trigger should NOT push onto the stack"
+    )
+
+
+def test_subject_target_predicate_no_ops_on_single_subject_enters(
+    synthetic_state,
+):
+    """Same shape with `Subject(Target, ...)` — also no-ops on
+    single-subject ENTERS dispatch (no slot binding for "target").
+    """
+    synthetic_state.register_and_inject_object(
+        _subject_target_creature_observer_dict(), 0, ZONE_BATTLEFIELD
+    )
+    bait_id = synthetic_state.register_and_inject_object(
+        _vanilla_creature_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(bait_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    assert synthetic_state.find_object_zone(bait_id) == ZONE_BATTLEFIELD
+    assert synthetic_state.is_stack_empty(), (
+        "expected `Subject(Target, IsCreature)` to no-op on "
+        "single-subject ENTERS dispatch (target slot is unbound)"
+    )
+
+
+# --- compositional shape: Not + And + Subject -----------------------
+
+
+def test_subject_predicate_composes_with_and(synthetic_state):
+    """`AND(Subject(Source, IsCreature), SubjectIsCreature)` — the
+    Subject half evaluates false on single-subject ENTERS, so the AND
+    is false regardless of the right operand. Pins the recursive
+    evaluation: `Subject` returning false in a compound predicate
+    short-circuits the AND correctly.
+    """
+    d = {
+        "name": "Test Compound Subject AND Card",
+        "card_types": ["Creature"],
+        "mana_cost": {},
+        "effects": [],
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "and",
+                    "left": {
+                        "kind": "subject",
+                        "slot": "source",
+                        "inner": {"kind": "subject_is_creature"},
+                    },
+                    "right": {"kind": "subject_is_creature"},
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    synthetic_state.register_and_inject_object(d, 0, ZONE_BATTLEFIELD)
+    bait_id = synthetic_state.register_and_inject_object(
+        _vanilla_creature_dict(), 0, ZONE_HAND
+    )
+    synthetic_state.push_to_stack(bait_id, 0)
+    synthetic_state.resolve_top_of_stack()
+
+    assert synthetic_state.is_stack_empty(), (
+        "expected AND(Subject(Source,...), SubjectIsCreature) to short-"
+        "circuit false on single-subject ENTERS (Subject half is false)"
+    )
+
+
+def test_not_subject_predicate_evaluates_true_on_single_subject_enters(
+    synthetic_state,
+):
+    """`Not(Subject(Source, IsCreature))` — Subject evaluates false on
+    single-subject events, so NOT(...) is true. This is observable: a
+    trigger with that predicate FIRES on every single-subject ENTERS.
+    Pins the recursive evaluation: `Subject` returning false flows
+    through NOT correctly.
+    """
+    d = {
+        "name": "Test NOT Subject Observer",
+        "card_types": ["Creature"],
+        "mana_cost": {},
+        "effects": [],
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "not",
+                    "inner": {
+                        "kind": "subject",
+                        "slot": "source",
+                        "inner": {"kind": "subject_is_creature"},
+                    },
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    observer_id = synthetic_state.register_and_inject_object(
+        d, 0, ZONE_BATTLEFIELD
+    )
+    # Drain observer's own self-firing (NOT(Subject(...)) is true on
+    # the observer's own ETB too).
+    assert synthetic_state.stack_size() == 1
+    top = synthetic_state.peek_top_of_stack()
+    assert top["source_obj_id"] == observer_id
+    synthetic_state.resolve_top_of_stack()
+
+
+# --- inner Subject variants: every supported object-tier kind -------
+
+
+def test_subject_predicate_with_subject_is_land_inner_parses(
+    empty_registry,
+):
+    """The inner predicate can be any object-tier check the substrate
+    supports. Pin `subject_is_land`.
+    """
+    d = {
+        "name": "Test Subject(Source, IsLand) Observer",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "source",
+                    "inner": {"kind": "subject_is_land"},
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    pid = empty_registry.register_printing(d)
+    assert pid == 0
+
+
+def test_subject_predicate_with_subject_is_artifact_inner_parses(
+    empty_registry,
+):
+    """And the `subject_is_artifact` sibling."""
+    d = {
+        "name": "Test Subject(Source, IsArtifact) Observer",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "target",
+                    "inner": {"kind": "subject_is_artifact"},
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    pid = empty_registry.register_printing(d)
+    assert pid == 0
+
+
+def test_subject_predicate_with_subject_has_subtype_inner_parses(
+    empty_registry,
+):
+    """The `subject_has_subtype` inner — the Kavu-shape from
+    `cards/parser/triggers.py:1198`, now slot-bindable.
+    """
+    d = {
+        "name": "Test Subject(Source, HasSubtype Kavu) Observer",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 1},
+        "power": 1,
+        "toughness": 1,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {
+                    "kind": "subject",
+                    "slot": "source",
+                    "inner": {
+                        "kind": "subject_has_subtype",
+                        "subtype": "Kavu",
+                    },
+                },
+                "effect": {"kind": "draw_cards", "count": 1},
+            }
+        ],
+    }
+    pid = empty_registry.register_printing(d)
+    assert pid == 0

@@ -1682,3 +1682,64 @@ the back-compat default and restores parity smoke to 150/150.
 **Rust gate**: 2122/2122 (substrate baseline 2112 + 10 new
 HasSubtype tests). **Parity smoke**: 150/150 (restored from the
 Slice 1 regression).
+
+---
+
+## ETB Subject substrate — Predicate::Subject(slot, inner) (landed — feature/etb-subject-substrate)
+
+The Slice-12 deferred substrate. Closes the multi-subject predicate
+dependency that's been blocking `Event::DealsCombatDamage` and the
+multi-subject `Event::Blocks` predicate shape (Skystinger
+"whenever ~ blocks a creature with flying").
+
+**Shape**:
+- New `SubjectSlot { Source, Target }` enum (start minimal — two
+  variants is the minimum to unblock `DealsCombatDamage`'s
+  `("source", "target")` slot pair from Python's `EVENT_SUBJECTS`).
+  Adding a future slot (e.g. `Attacker` for multi-subject `Blocks`)
+  requires one variant + a `parse_subject_slot` arm.
+- New `Predicate::Subject(SubjectSlot, Box<Predicate>)` variant —
+  pulls the named slot's id out of the dispatch-supplied slot map
+  and evaluates `inner` against THAT subject, replacing the
+  implicit `subject_id` for the recursive evaluation.
+- New `Predicate::matches_with_slots(state, source_id, subject_id,
+  subjects_by_slot)` evaluation entry point. Old `matches` is a thin
+  wrapper that calls it with an empty slot map — every existing
+  single-subject dispatch site continues to work unchanged
+  (back-compat).
+- Parser: `parse_predicate` accepts
+  `{"kind": "subject", "slot": "source"|"target", "inner": {...}}`.
+  Unknown slot strings raise loudly (`parse_subject_slot`).
+  Missing `inner` raises `KeyError` via `require`. Non-dict `inner`
+  raises a typed `ValueError`.
+- `cross_engine.py::_ta_dict_to_python_predicate` translates to
+  Python's `Subject(slot=<str>, inner=<ObjectPredicate>)` shape at
+  `src/mtg_bot/effects/predicates.py:354`. Slot strings pass through
+  directly (they match Python's `EVENT_SUBJECTS` keys). Supported
+  inner kinds: `subject_is_creature`, `subject_is_land`,
+  `subject_is_artifact`, `subject_has_subtype` — each maps to its
+  Python `ObjectPredicate` counterpart.
+
+**Single-subject events**: today's dispatch sites pass no slot
+bindings (`matches_with_slots` is called via the back-compat
+wrapper with `&[]`). A `Predicate::Subject(slot, inner)` on an
+ENTERS / DIES / CAST / ATTACKS / BLOCKS / LEAVES trigger evaluates
+`false` because the named slot isn't bound — mirrors Python's
+`_resolve_subject` "missing slot → predicate is false" short-circuit
+at `src/mtg_bot/effects/predicates.py:340`. The 12 substrate tests
+pin this back-compat contract.
+
+**Unblocks** (deferred to follow-up consumer slices):
+- `Event::DealsCombatDamage` — multi-subject dispatch where
+  Source = dealer, Target = recipient. Fan-out from
+  `state_ops_combat.rs::apply_damage_pass` per damage event.
+- Multi-subject `Event::Blocks` predicates (Skystinger-shape) —
+  requires an `Attacker` slot variant + multi-subject BLOCKS
+  dispatch in `state_ops_combat.rs::declare_blocker`.
+- Susurian Voidborn target-bearing arm (TargetOpponentLosesLife)
+  is a SEPARATE issue (agent-driven target selection); not solved
+  by this substrate.
+
+**Rust gate**: 2216/2216 (substrate baseline 2204 + 12 new Subject
+tests covering parser surface, error paths, no-op-on-single-subject
+contract, NOT/AND composition, and inner-variant coverage).
