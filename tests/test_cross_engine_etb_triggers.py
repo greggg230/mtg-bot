@@ -333,3 +333,272 @@ def test_rust_parser_accepts_damage_each_opponent_in_triggered_ability():
     }
     pid = reg.register_printing(d)
     assert pid == 0
+
+
+# =====================================================================
+# Probe-I bridge extension: ``create_token`` effect arm.
+# Pins the new arm of ``_ta_dict_to_python_effect`` that translates
+# Rust ``{"kind": "create_token", "count": N, "token_printing_id": pid}``
+# into Python's ``CreateToken(token_printing=..., count=N)``. Unblocks
+# Mechan Assembler's real oracle (Robot token on the
+# ``another artifact you control`` predicate branch), Auxiliary Boosters
+# (Equipment-shape token+attach ETB), and every future EoE Robot-token
+# ETB consumer.
+# =====================================================================
+
+
+def _robot_token_card_def():
+    """A 2/2 colorless Robot artifact-creature token CardDef. Same
+    printing shape Mechan Assembler / Auxiliary Boosters / etc.
+    create at oracle resolution. Carries no triggered_abilities of
+    its own (the token is the OBJECT of the create_token effect, not
+    a source of further triggers in this probe lane).
+
+    ``card_type="Creature"`` is the simplest shape the cross-engine
+    CardDef supports; Probe D's Mechan Assembler / Drone fixture uses
+    the same single-card_type shape (real card is Artifact Creature
+    but the CardDef carries Creature only and the Rust-side dict
+    override adds Artifact). The cross-engine tests that need
+    Artifact in card_types build a probe-specific rust dict.
+    """
+    from mtg_bot.parity.cross_engine import CardDef
+    return CardDef(
+        name="Robot_2_2",
+        card_type="Creature",
+        power=2,
+        toughness=2,
+    )
+
+
+def test_bridge_create_token_translates_to_python():
+    """Probe-I bridge extension: Rust
+    ``{"kind": "create_token", "count": N, "token_printing_id": pid}``
+    translates to Python ``CreateToken(token_printing=<Printing>,
+    count=N)`` when a ``printings_by_pid`` map carrying the printing
+    is threaded through.
+
+    Unblocks Mechan Assembler's real oracle (Robot artifact-creature
+    token on the ``another artifact you control`` predicate) +
+    Auxiliary Boosters (Equipment-shape token+attach ETB) + every
+    future "ETB: create a token" consumer in the EoE pool.
+
+    The Rust effect arm already exists at
+    ``state_ops_resolve.rs:1744`` (``Effect::CreateToken``); Python's
+    class already exists at ``effects/generic/tokens.py:168``
+    (``CreateToken``). This pins the bridge translation that wires
+    them up.
+    """
+    from mtg_bot.cards.base import CardPrinting, ManaCost
+    from mtg_bot.effects.generic.tokens import CreateToken
+    from mtg_bot.parity.cross_engine import _ta_dict_to_python_effect
+
+    robot_printing = CardPrinting(
+        name="Robot_2_2",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=0, colored=()),
+        type_line="Creature",
+        supertypes=("Token",),
+        card_types=("Creature",),
+        subtypes=("Robot",),
+        power=2,
+        toughness=2,
+        produces=frozenset(),
+    )
+    e = _ta_dict_to_python_effect(
+        {"kind": "create_token", "count": 1, "token_printing_id": 0},
+        printings_by_pid={0: robot_printing},
+    )
+    assert isinstance(e, CreateToken)
+    assert e.token_printing is robot_printing
+    assert e.count == 1
+
+
+def test_bridge_create_token_count_default_one():
+    """Missing ``count`` defaults to 1. Rust's ``parse_effect``
+    actually requires the ``count`` key (cards.rs:2833), so the
+    Python default is academic for round-trip dict shapes — but the
+    bridge translator stays defensive on the common-case count.
+    """
+    from mtg_bot.cards.base import CardPrinting, ManaCost
+    from mtg_bot.effects.generic.tokens import CreateToken
+    from mtg_bot.parity.cross_engine import _ta_dict_to_python_effect
+
+    robot_printing = CardPrinting(
+        name="Robot_2_2",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=0, colored=()),
+        type_line="Creature",
+        supertypes=("Token",),
+        card_types=("Creature",),
+        subtypes=("Robot",),
+        power=2,
+        toughness=2,
+        produces=frozenset(),
+    )
+    e = _ta_dict_to_python_effect(
+        {"kind": "create_token", "token_printing_id": 0},
+        printings_by_pid={0: robot_printing},
+    )
+    assert isinstance(e, CreateToken)
+    assert e.count == 1
+
+
+def test_bridge_create_token_raises_without_printings_map():
+    """Calling the create_token arm without a ``printings_by_pid``
+    map raises ValueError — there's no silent fallback. Bridge
+    consumers (build_python_state, ad-hoc probe construction) must
+    pass the map explicitly. Pre-create_token unit tests that don't
+    exercise this arm aren't affected.
+    """
+    import pytest
+    from mtg_bot.parity.cross_engine import _ta_dict_to_python_effect
+
+    with pytest.raises(ValueError, match="printings_by_pid"):
+        _ta_dict_to_python_effect(
+            {"kind": "create_token", "count": 1, "token_printing_id": 0}
+        )
+
+
+def test_bridge_create_token_raises_on_unknown_pid():
+    """An unknown ``token_printing_id`` (not present in the threaded
+    ``printings_by_pid`` map) raises ValueError. Mirrors Rust's
+    registry-bounds check in ``Effect::CreateToken`` resolve
+    (state_ops_resolve.rs:1757): the printing must exist before a
+    create_token effect can construct tokens of it.
+    """
+    import pytest
+    from mtg_bot.cards.base import CardPrinting, ManaCost
+    from mtg_bot.parity.cross_engine import _ta_dict_to_python_effect
+
+    robot_printing = CardPrinting(
+        name="Robot_2_2",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=0, colored=()),
+        type_line="Creature",
+        supertypes=("Token",),
+        card_types=("Creature",),
+        subtypes=("Robot",),
+        power=2,
+        toughness=2,
+        produces=frozenset(),
+    )
+    with pytest.raises(ValueError, match="not present in printings_by_pid"):
+        _ta_dict_to_python_effect(
+            {"kind": "create_token", "count": 1, "token_printing_id": 7},
+            printings_by_pid={0: robot_printing},
+        )
+
+
+def test_rust_parser_accepts_create_token_in_triggered_ability():
+    """Pin the Rust parser surface for the matched effect kind. The
+    bridge's dict shape must register cleanly on the Rust side too;
+    this lockstep gate keeps the Python bridge from drifting away
+    from Rust's ``parse_effect`` coverage (cards.rs:2833).
+
+    Two-printing registration shape: register the token printing
+    first (pid=0), then register the source printing with a
+    triggered ability referencing token_printing_id=0. Mirrors the
+    real-card setup the cross-engine probes use.
+    """
+    import mtg_bot_engine
+
+    reg = mtg_bot_engine.Registry()
+    # First, register the token printing — pid 0 reserved.
+    token_d = {
+        "name": "Robot_2_2",
+        "card_types": ["Artifact", "Creature"],
+        "mana_cost": {"generic": 0},
+        "power": 2,
+        "toughness": 2,
+        "subtypes": ["Robot"],
+        "supertypes": ["Token"],
+    }
+    token_pid = reg.register_printing(token_d)
+    assert token_pid == 0
+
+    # Now register a source printing whose ETB trigger creates a
+    # Robot token using token_printing_id=0.
+    source_d = {
+        "name": "Probe I Bridge Pin",
+        "card_types": ["Artifact", "Creature"],
+        "mana_cost": {"generic": 4, "U": 1},
+        "power": 4,
+        "toughness": 4,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {"kind": "source_is_self"},
+                "effect": {
+                    "kind": "create_token",
+                    "count": 1,
+                    "token_printing_id": token_pid,
+                },
+            }
+        ],
+    }
+    source_pid = reg.register_printing(source_d)
+    assert source_pid == 1
+
+
+def test_build_python_state_wires_create_token_via_printings_by_pid():
+    """``build_python_state`` populates a ``printings_by_pid`` map
+    from ``card_defs`` positional order and threads it through the
+    triggered_abilities translator so a CardDef with a
+    ``create_token`` ETB arm builds a working Python
+    ``CreateToken`` effect referencing the matching CardPrinting.
+
+    End-to-end substrate proof: a two-card DeckSpec (token printing
+    at pid 0, source printing at pid 1 with a create_token ETB
+    referencing pid 0) materializes a Python printing whose ETB
+    trigger's effect IS a CreateToken pointing AT the token
+    printing.
+    """
+    from mtg_bot.effects.generic.tokens import CreateToken
+    from mtg_bot.parity.cross_engine import (
+        CardDef, DeckSpec, build_python_state,
+    )
+
+    token_def = CardDef(
+        name="Robot_2_2",
+        card_type="Creature",
+        power=2,
+        toughness=2,
+    )
+    source_def = CardDef(
+        name="Probe I Source",
+        card_type="Creature",
+        mana_cost_generic=4,
+        mana_cost_colored=(("U", 1),),
+        power=4,
+        toughness=4,
+        triggered_abilities=(
+            {
+                "event": "enters",
+                "predicate": {"kind": "source_is_self"},
+                "effect": {
+                    "kind": "create_token",
+                    "count": 1,
+                    "token_printing_id": 0,  # token registered at pid 0
+                },
+            },
+        ),
+    )
+    spec = DeckSpec(
+        card_defs=(token_def, source_def),
+        p0_library=("Probe I Source",),
+        p1_library=("Probe I Source",),
+    )
+    state = build_python_state(spec)
+    source_obj = state.players[0].library[0]
+    printing = source_obj.printing
+    assert len(printing.triggered_abilities) == 1
+    eff = printing.triggered_abilities[0].effect
+    assert isinstance(eff, CreateToken)
+    assert eff.count == 1
+    # The token_printing field MUST be the Python CardPrinting at
+    # pid=0 (the Robot_2_2 def). This is the load-bearing
+    # cross-engine identity contract — both engines reference the
+    # SAME printing the SAME way (positional index).
+    assert eff.token_printing.name == "Robot_2_2"
+    assert eff.token_printing.power == 2
+    assert eff.token_printing.toughness == 2

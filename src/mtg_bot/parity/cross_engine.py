@@ -144,7 +144,10 @@ class CardDef:
 # ---------------------------------------------------------------------------
 
 
-def _ta_dict_to_python_effect(eff_dict: dict):
+def _ta_dict_to_python_effect(
+    eff_dict: dict,
+    printings_by_pid: "dict[int, Any] | None" = None,
+):
     """Translate one effect-dict (the same dict shape Rust's
     ``parse_effect`` consumes) into a Python ``Effect`` instance.
 
@@ -152,6 +155,15 @@ def _ta_dict_to_python_effect(eff_dict: dict):
     by today's CE19-shape probes. Each new effect kind a probe wants
     to drive cross-engine adds one arm here in lockstep with its
     Rust ``parse_effect`` arm.
+
+    ``printings_by_pid`` (optional, default ``None``) is the
+    name_to_pid-inverse map produced by ``build_python_state`` so
+    effect arms that need a Python ``CardPrinting`` keyed by Rust
+    ``token_printing_id`` (today: ``create_token``) can resolve it.
+    Bridge-translation unit tests that don't exercise the
+    ``create_token`` arm pass ``None``; arms that DO need a printings
+    map raise a clear error when called without one (no silent
+    default).
     """
     kind = eff_dict["kind"]
     if kind == "draw_cards":
@@ -163,6 +175,63 @@ def _ta_dict_to_python_effect(eff_dict: dict):
     if kind == "gain_life":
         from mtg_bot.effects.generic.life import GainLife
         return GainLife(amount=eff_dict.get("amount", 0))
+    if kind == "create_token":
+        # Probe-I bridge extension — "create N tokens of the printing
+        # registered as ``token_printing_id``". Rust's
+        # ``Effect::CreateToken { count, token_printing_id }`` is
+        # parsed at ``rust/src/cards.rs:2833`` and resolved at
+        # ``rust/src/state_ops_resolve.rs:1744``: the active player
+        # gets ``count`` fresh GameObjects on bf, each referencing
+        # the registered printing. Python's analog is
+        # ``effects.generic.tokens.CreateToken(token_printing=...,
+        # count=N)`` (``effects/generic/tokens.py:168``), which
+        # walks ``put_into_battlefield`` once per token and routes
+        # through the existing token-creation replacement machinery
+        # (Anointed-Procession-style doubling, Moonlit Meditation,
+        # CR 614 ``WOULD_CREATE_TOKEN`` event), all of which is
+        # latent on synthetic CE-bridge probes that don't register
+        # such replacement effects — observably equivalent for the
+        # probes this slice unblocks.
+        #
+        # Cross-engine identity contract: the same ``CardDef`` tuple
+        # backs both the Rust registry (positional ``printing_id`` =
+        # index in ``card_defs``) and the Python printings dict
+        # keyed by name. ``build_python_state`` materializes a
+        # ``printings_by_pid: dict[int, CardPrinting]`` keyed by
+        # the same positional id and threads it through this
+        # translator so the Python ``CreateToken.token_printing``
+        # references the SAME CardPrinting the Rust side looks up
+        # via ``token_printing_id``. Outside ``build_python_state``
+        # (bridge-translation unit tests, ad-hoc construction) the
+        # caller passes ``printings_by_pid`` explicitly or the arm
+        # raises.
+        #
+        # ``count`` defaults to 1 (mirrors the dominant case in the
+        # EoE pool; Rust's ``parse_effect`` actually requires the
+        # ``count`` key, so the Python default is academic — the
+        # bridge dict that round-trips through Rust will always
+        # carry it). The arm raises if ``token_printing_id`` is
+        # missing or absent from the threaded ``printings_by_pid``.
+        if printings_by_pid is None:
+            raise ValueError(
+                "cross_engine triggered_abilities bridge: the "
+                "create_token arm needs a printings_by_pid map "
+                "threaded through the call site (build_python_state "
+                "provides it; ad-hoc callers must pass it explicitly)"
+            )
+        token_pid = eff_dict["token_printing_id"]
+        if token_pid not in printings_by_pid:
+            raise ValueError(
+                f"cross_engine triggered_abilities bridge: "
+                f"token_printing_id {token_pid!r} not present in "
+                f"printings_by_pid (known ids: "
+                f"{sorted(printings_by_pid.keys())!r})"
+            )
+        from mtg_bot.effects.generic.tokens import CreateToken
+        return CreateToken(
+            token_printing=printings_by_pid[token_pid],
+            count=eff_dict.get("count", 1),
+        )
     if kind == "damage_each_opponent":
         # Untargeted "deals N damage to each opponent". Rust's
         # ``Effect::DamageEachOpponent`` resolves to a single
@@ -290,13 +359,22 @@ def _ta_dict_to_python_predicate(pred_dict: dict | None):
     )
 
 
-def _ta_dict_to_python_triggered_ability(ta_dict: dict):
+def _ta_dict_to_python_triggered_ability(
+    ta_dict: dict,
+    printings_by_pid: "dict[int, Any] | None" = None,
+):
     """Translate one triggered-ability-dict into a Python
     ``TriggeredAbility`` instance carrying the matching Event,
     predicate, and Effect.
 
     Slice 3 only wires ``event="enters"`` — same coverage gate as
     Rust's parser. Future events follow in lockstep.
+
+    ``printings_by_pid`` (optional, default ``None``) is threaded
+    through to ``_ta_dict_to_python_effect`` so the ``create_token``
+    arm can resolve a Python ``CardPrinting`` from a Rust
+    ``token_printing_id``. ``build_python_state`` provides it; bridge
+    unit tests that don't exercise create_token can pass ``None``.
     """
     from mtg_bot.effects.base import TriggeredAbility
     from mtg_bot.effects.predicates import Event
@@ -323,7 +401,9 @@ def _ta_dict_to_python_triggered_ability(ta_dict: dict):
             f"{event_str!r} is not yet wired"
         )
     predicate = _ta_dict_to_python_predicate(ta_dict.get("predicate"))
-    effect = _ta_dict_to_python_effect(ta_dict["effect"])
+    effect = _ta_dict_to_python_effect(
+        ta_dict["effect"], printings_by_pid=printings_by_pid,
+    )
     once_per_turn = ta_dict.get("once_per_turn", False)
     return TriggeredAbility(
         event=event,
@@ -666,9 +746,35 @@ def build_python_state(spec: DeckSpec):
     from mtg_bot.game import GameState, Player, Zone
     from mtg_bot.turn import Step
 
-    # Materialize Python CardPrintings from CardDefs.
+    # Materialize Python CardPrintings from CardDefs. We build the
+    # printings dict in TWO passes:
+    #
+    #   1. First pass materializes each ``CardPrinting`` WITHOUT
+    #      ``triggered_abilities`` wired up. The triggered_abilities
+    #      bridge translator (``_ta_dict_to_python_triggered_ability``)
+    #      may need to look up OTHER printings by Rust's positional
+    #      ``token_printing_id`` (Probe-I create_token arm), so the
+    #      printings map has to exist in full before any single
+    #      printing's triggers can be translated.
+    #   2. Second pass walks each CardDef, translates its
+    #      ``triggered_abilities`` dicts (with the now-populated
+    #      ``printings_by_pid`` in hand), and dataclass-replaces the
+    #      first-pass printing in place.
+    #
+    # Pre-Probe-I fixtures (no ``create_token`` arm in any TA dict)
+    # don't actually need the two-pass shape — the bridge translator
+    # only consults ``printings_by_pid`` when the
+    # ``create_token`` arm runs. But the two-pass shape is the
+    # minimal invasive change: any TA dict that DOESN'T reference a
+    # token_printing_id behaves identically to the pre-Probe-I single-
+    # pass path.
     printings: dict[str, CardPrinting] = {}
-    for card in spec.card_defs:
+    # The Rust registry assigns ``printing_id`` by position in
+    # ``spec.card_defs`` (see ``build_rust_state`` above). Mirror that
+    # contract by keying ``printings_by_pid`` off the same positional
+    # index. Both engines look the token printing up by that integer.
+    printings_by_pid: dict[int, CardPrinting] = {}
+    for pid_idx, card in enumerate(spec.card_defs):
         cost = ManaCost(
             generic=card.mana_cost_generic,
             colored=tuple(sorted(card.mana_cost_colored)),
@@ -711,17 +817,14 @@ def build_python_state(spec: DeckSpec):
                 )
                 for color in card.mana_produced
             )
-        # ETB-trigger Slice 3: bridge the harness-side
-        # ``triggered_abilities`` dict-list into Python's
-        # ``TriggeredAbility`` shape so the Python engine wires the
-        # same predicate-path triggers Rust does. Each dict matches
-        # both `parse_triggered_ability` (Rust) and
-        # `_ta_dict_to_python_triggered_ability` (this module).
-        triggered_abilities = tuple(
-            _ta_dict_to_python_triggered_ability(ta)
-            for ta in card.triggered_abilities
-        )
-        printings[card.name] = CardPrinting(
+        # ETB-trigger Slice 3: build the printing WITHOUT
+        # ``triggered_abilities`` first — the dict-to-Python
+        # translator may need ``printings_by_pid`` to be fully
+        # populated (Probe-I create_token arm looks up the token
+        # printing by Rust positional id). Second pass below
+        # dataclass-replaces with the materialized
+        # ``triggered_abilities`` tuple.
+        printing = CardPrinting(
             name=card.name,
             mana_cost_str="",
             mana_cost=cost,
@@ -733,8 +836,32 @@ def build_python_state(spec: DeckSpec):
             toughness=card.toughness,
             produces=frozenset(card.mana_produced),
             activated_abilities=activated_abilities,
+            triggered_abilities=(),
+        )
+        printings[card.name] = printing
+        printings_by_pid[pid_idx] = printing
+
+    # Second pass: now that ``printings_by_pid`` is fully populated,
+    # walk each CardDef's triggered_abilities and dataclass-replace
+    # the printing in place. The bridge translator receives
+    # ``printings_by_pid`` so any ``create_token`` arm can resolve
+    # its ``token_printing_id`` to the matching CardPrinting.
+    import dataclasses as _dc
+    for pid_idx, card in enumerate(spec.card_defs):
+        if not card.triggered_abilities:
+            continue
+        triggered_abilities = tuple(
+            _ta_dict_to_python_triggered_ability(
+                ta, printings_by_pid=printings_by_pid,
+            )
+            for ta in card.triggered_abilities
+        )
+        new_printing = _dc.replace(
+            printings[card.name],
             triggered_abilities=triggered_abilities,
         )
+        printings[card.name] = new_printing
+        printings_by_pid[pid_idx] = new_printing
 
     state = GameState()
     p0 = Player(id=0)
