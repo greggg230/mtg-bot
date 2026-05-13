@@ -343,41 +343,26 @@ def test_puct_cache_reuses_policy_no_second_forward_pass():
     logits. A repeated leaf evaluation at the same cache key must NOT
     trigger a second ``evaluate_with_policy`` call.
 
-    Cache-key shape (post-cache-drift fix, 2026-05-06): the key is
-    ``(canonical_state_key, slot_mapping_fingerprint)`` rather than
-    just the canonical key. The slot fingerprint pins the
-    raw-card.id positional ordering of the viewer's hand / graveyard
-    / exile / library-top, which determines how
-    ``training.action_encoding`` maps decisions to policy slots.
-    Two canonically-equivalent states with permuted card.id orderings
-    have different slot fingerprints (and therefore different cache
-    entries) so cached ``policy_logits`` aren't reused at a
-    wrong-slot mapping. See ``tests/search/test_cache_drift_root_cause.py``
-    for the regression that surfaced this.
+    Cache-key shape (post-Step-1 Slice D, 2026-05-12): the key is
+    just ``canonical_state_key(state)`` — the 32-byte blake2b digest.
+    The pre-Step-1 ``(canonical, slot_fp)`` 2-tuple was dropped
+    because canonical_v2 action encoding canonicalizes zone positions
+    BEFORE slot assignment, making the slot fingerprint redundant.
+    Two canonically-equivalent states now share a cache entry; under
+    canonical_v2 they also share their slot mappings, so the cached
+    ``policy_logits`` are positionally correct for both.
 
-    The strict invariant we test here: each distinct cache key — the
-    pair ``(canonical_state_key, slot_fp)`` — is presented to the
-    evaluator at most once. Two evaluations at the SAME canonical key
-    but DIFFERENT slot mappings are independent cache entries and
-    BOTH go through the network; that's the correctness-preserving
-    cost of the tighter key.
+    The strict invariant we test here: total policy calls strictly
+    less than the number of inner nodes — i.e., the cache saves
+    real work. With a single canonical-state key and a
+    transposition-rich search, hit rates run 30-50%.
     """
     a = _adapter_at_real_decision(seed=6)
     ev = _CountingPolicyEvaluator()
     mcts = _make_mcts_puct(ev, nodes=200, seed=13)
     mcts.choose_with_visits(a, 0)
-    # The post-fix invariant: distinct (canonical, slot_fp) pairs are
-    # each evaluated at most once. We don't have direct access to the
-    # slot fingerprint inside the test evaluator, but we can simulate
-    # what the cache actually keys on by re-deriving the same shape.
-    # The base counter only tracks the canonical key — under the new
-    # cache shape, repeats at the same canonical key are EXPECTED if
-    # slot fingerprints differ across visits. So we relax to the
-    # weaker invariant: total policy calls <= distinct cache keys
-    # the production cache would have generated, which we can't
-    # fully reconstruct here. As a proxy, check that the policy
-    # call rate is below "every leaf eval" — the cache must save
-    # SOME work even with the tighter key.
+    # Cache must save real work — policy calls strictly below the
+    # iteration count.
     assert ev.policy_calls < 200, (
         f"cache provided no perf savings: policy_calls={ev.policy_calls} "
         f"approaches the 200-iteration ceiling, indicating the cache "
@@ -580,9 +565,10 @@ def test_cache_key_for_node_memoizes():
     a = _adapter_at_real_decision(seed=12)
     ev = _CountingValueEvaluator()
     mcts = _make_mcts_ucb1(ev)
-    # Drift-fix: _cache_key needs the viewer to compute the slot
-    # fingerprint. choose_with_* sets this; for a unit test that
-    # calls _cache_key_for_node directly we set it explicitly.
+    # _cache_root_player is set by choose_with_* in production; the
+    # cache key itself no longer reads it (canonical_v2 retired the
+    # slot fingerprint suffix), but we still set it here to mirror
+    # the production lifecycle.
     mcts._cache_root_player = 0
     node = _Node(state=a)
     assert node._canonical_key is None
@@ -609,10 +595,11 @@ def test_cache_key_for_node_memoizes():
 
     assert k1 == k2 == k3
     assert k1 is not None
-    # Drift-fix: _cache_key returns a 2-tuple of (canonical-state hash,
-    # slot fingerprint). The hash itself is still 32 bytes.
-    assert isinstance(k1, tuple) and len(k1) == 2
-    assert isinstance(k1[0], bytes) and len(k1[0]) == 32
+    # Post-Step-1 (Slice D): the cache key is just the 32-byte
+    # canonical_state_key blake2b digest. The pre-Step-1 (canonical,
+    # slot_fp) 2-tuple was dropped because canonical_v2 makes the
+    # slot fingerprint redundant.
+    assert isinstance(k1, bytes) and len(k1) == 32
     assert n_calls[0] == 1, (
         f"expected canonical_state_key called exactly once across "
         f"three _cache_key_for_node calls, got {n_calls[0]}"
@@ -668,7 +655,8 @@ def test_cache_key_for_node_respects_monkey_patched_cache_key():
     a = _adapter_at_real_decision(seed=13)
     ev = _CountingValueEvaluator()
     mcts = _make_mcts_ucb1(ev)
-    # Drift-fix: _cache_key needs the viewer set. See sibling test.
+    # See sibling test: _cache_root_player no longer feeds the cache
+    # key, but we mirror the production setup.
     mcts._cache_root_player = 0
     node = _Node(state=a)
 

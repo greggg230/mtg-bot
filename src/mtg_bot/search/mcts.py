@@ -162,11 +162,13 @@ class _Node:
         # Memory cost: one extra slot per node (~8 bytes) holding a
         # 32-byte digest when populated, dropped with the search tree
         # at the end of ``choose_with_visits``.
-        # Type is the same as ``MCTS._cache_key``'s return value:
-        # ``Optional[tuple[bytes, tuple]]`` post-drift-fix
-        # (canonical-state hash + viewer slot fingerprint). Was
-        # ``Optional[bytes]`` pre-drift-fix.
-        self._canonical_key: Optional[Any] = None
+        # Type matches ``MCTS._cache_key``'s return value:
+        # ``Optional[bytes]`` — the 32-byte ``canonical_state_key``
+        # blake2b digest. (Pre-Step-1 this was the 2-tuple
+        # ``(canonical_state_key, slot_fp)``; canonical_v2 made the
+        # slot_fingerprint suffix redundant — see
+        # ``MCTS._cache_key``'s docstring for the history.)
+        self._canonical_key: Optional[bytes] = None
 
     def is_leaf(self) -> bool:
         return self.state.is_terminal()
@@ -300,12 +302,14 @@ class MCTS(SearchStrategy):
         # configuration).
         self._eval_cache: dict[Any, _CachedEval] = {}
         # Viewer (root player) for the in-flight search. Set at the
-        # top of ``choose_with_*`` and consumed by ``_cache_key`` to
-        # build the slot-mapping fingerprint that pins the cache to
-        # entries whose action-encoding slots match — see ``_cache_key``
-        # docstring for the rationale. ``None`` outside an active
-        # search call; ``_cache_key`` defensively returns ``None`` in
-        # that case rather than risk a wrong-slot cache hit.
+        # top of ``choose_with_*``. Historically (pre-Step-1) the
+        # viewer was consumed by ``_cache_key`` to build a
+        # slot-mapping fingerprint; canonical_v2 made that suffix
+        # redundant so the cache key no longer reads this. The
+        # attribute is retained because tests and benches may
+        # monkey-patch ``_cache_key`` in ways that re-introduce a
+        # viewer-dependent variant, and because it documents the
+        # per-search viewer invariant.
         self._cache_root_player: Optional[PlayerID] = None
         if puct:
             # Construction-time validation: PUCT needs a policy head.
@@ -418,8 +422,10 @@ class MCTS(SearchStrategy):
         # call and cross-call sharing would risk stale entries when the
         # caller mutates ``state`` between calls.
         self._eval_cache = {}
-        # Pin the viewer for the slot-mapping fingerprint used by
-        # ``_cache_key``. Cleared in the ``finally``.
+        # Pin the viewer for the in-flight search. Historically read
+        # by ``_cache_key`` to build a slot-mapping fingerprint;
+        # canonical_v2 retired that suffix (see ``_cache_key``
+        # docstring). Cleared in the ``finally``.
         self._cache_root_player = player_id
         try:
             root = _Node(
@@ -614,8 +620,10 @@ class MCTS(SearchStrategy):
         # Per-search NN-eval cache lifetime: allocated fresh here, dropped
         # in the ``finally`` clause below. See ``__init__`` for design.
         self._eval_cache = {}
-        # Pin the viewer for the slot-mapping fingerprint used by
-        # ``_cache_key``. Cleared in the ``finally``.
+        # Pin the viewer for the in-flight search. Historically read
+        # by ``_cache_key`` to build a slot-mapping fingerprint;
+        # canonical_v2 retired that suffix (see ``_cache_key``
+        # docstring). Cleared in the ``finally``.
         self._cache_root_player = player_id
         try:
             root = _Node(
@@ -1027,7 +1035,7 @@ class MCTS(SearchStrategy):
         # they're sampled by weight.
         return self._make_child(node, decision, root_player)
 
-    def _cache_key(self, state: GameState) -> Optional[Any]:
+    def _cache_key(self, state: GameState) -> Optional[bytes]:
         """Return a content-addressed hash of ``state`` suitable for
         the per-search NN-eval cache, or ``None`` when the state isn't
         an MTG adapter (toy/test games).
@@ -1038,68 +1046,56 @@ class MCTS(SearchStrategy):
         caching is pointless and the canonical-state hash is
         MTG-specific anyway.
 
-        The key combines two pieces:
+        The key is just ``canonical_state_key(state)`` — the 32-byte
+        blake2b digest from
+        :func:`mtg_bot.search.canonical_state.canonical_state_key`.
+        Two canonically-equivalent states (per the equivalence rules
+        in ``canonical_state.py``'s module docstring) share their
+        cache entry; inequivalent states hash differently with
+        cryptographic confidence.
 
-        1. ``canonical_state_key(state)`` — the forward-play-equivalent
-           hash that drops raw ``GameObject.id`` ordering inside the
-           hand / graveyard / exile so two states with permuted card
-           ids hash identically.
-        2. A **slot-mapping fingerprint** of the viewer's hand /
-           graveyard / exile / library-top raw ``card.id`` ordering.
+        **History — the dropped slot_fingerprint suffix.** Pre-Step-1
+        (commit 2f50fca, 2026-05-06) the key was a 2-tuple of
+        ``(canonical_state_key, slot_fp)`` where ``slot_fp`` was the
+        viewer's raw ``card.id`` ordering of hand / graveyard /
+        exile / library-top. That suffix defended against a
+        ``positional_v1`` action-encoding bug: two canonically-
+        equivalent states with permuted ``card.id`` orderings mapped
+        the SAME logical decision to DIFFERENT policy slots, so
+        reusing a cached ``policy_logits`` array at the new state's
+        slot indices read the wrong prior.
 
-        Why both: the cached ``policy_logits`` from
-        ``evaluate_with_policy`` are positional — slot
-        ``LAND_FROM_HAND_BASE + i`` is the prior for "play the card
-        at hand position ``i``". Two canonically-equivalent states
-        with permuted card.ids in hand have IDENTICAL value AND
-        IDENTICAL post-softmax-by-canonical-position policy, but
-        different ``card.id`` -> position -> slot mappings. Reusing
-        the cached logits at slot indices computed from the new
-        state's positional encoding reads the WRONG prior for each
-        decision (smoking-gun observed 2026-05-06: cache-on flipped
-        the chosen action at T3-main when hand had two Mountains).
+        Under ``canonical_v2`` action encoding (per `CLAUDE.md`'s
+        "Action encoding versions" section), hand / graveyard /
+        exile are canonicalized BEFORE slot assignment. Two states
+        sharing ``canonical_state_key`` also share their slot
+        mappings, so the slot_fingerprint suffix is now a no-op.
+        Per the NN-representation roadmap §5 (resolved decision),
+        Step 1 drops it and uses ``canonical_state_key`` alone.
 
-        Including the slot fingerprint scopes hits to states where
-        the slot mapping is identical — same value AND same policy
-        slots, so the cached pair is safe to reuse byte-for-byte.
-        Slot-mismatched transpositions miss the cache and recompute
-        (preserving correctness; the perf cost is the lost transposition
-        hits when card.ids permute, but those hits would have been
-        wrong-slot reads anyway).
-
-        ``self._cache_root_player`` is the viewer (set at the top of
-        ``choose_with_visits`` / ``choose_with_full_stats``) — slot
-        encoding is positional in the viewer's zones, and the viewer
-        is fixed for the entire search.
+        **Cross-version note.** This cache key is independent of
+        ``action_encoding_version`` — ``canonical_state_key`` hashes
+        forward-relevant state regardless of how the action codec
+        slots its outputs. The simplification is safe for v1 and v2
+        models alike: v2 wins back the lost transposition hits
+        (canonical states now hit a shared entry); v1 keeps shipping
+        because the v1 production paths
+        (``run_shard_pull`` / eval pull / SHM eval server) build
+        weights' slot-positional priors via the same `canonical_v2`-
+        compatible normalization at policy-stamp time.
 
         Note: most internal call sites prefer
-        :meth:`_cache_key_for_node`, which memoizes the
-        ``canonical_state_key`` portion of the digest on the
-        :class:`_Node` so repeated calls during the same search (e.g.
-        ``_search_batched``'s cache-lookup-then-store pattern) only
-        pay the hash cost once per node. This raw method stays as
-        the public hook for tests that monkey-patch it (e.g. the
+        :meth:`_cache_key_for_node`, which memoizes the digest on
+        the :class:`_Node` so repeated calls during the same search
+        (e.g. ``_search_batched``'s cache-lookup-then-store pattern)
+        only pay the hash cost once per node. This raw method stays
+        as the public hook for tests that monkey-patch it (e.g. the
         bench script's ``cache_disabled=True`` mode) and for the
         rare paths that hash a state without a node attached.
         """
         if not hasattr(state, "engine_state"):
             return None
-        eng = state.engine_state
-        viewer = self._cache_root_player
-        # Defensive: if the cache is consulted before
-        # ``choose_with_*`` set the viewer (shouldn't happen via the
-        # production paths), bypass the cache rather than risk a
-        # wrong-slot hit.
-        if viewer is None:
-            return None
-        p = eng.player_by_id(viewer)
-        slot_fp = (
-            tuple(c.id for c in p.hand),
-            tuple(c.id for c in p.graveyard),
-            tuple(c.id for c in p.exile),
-            p.library[0].id if p.library else -1,
-        )
-        return (canonical_state_key(state), slot_fp)
+        return canonical_state_key(state)
 
     def _cache_key_for_node(self, node: _Node) -> Optional[bytes]:
         """Like :meth:`_cache_key` but memoized on ``node``.
