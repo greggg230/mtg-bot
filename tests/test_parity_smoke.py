@@ -12149,3 +12149,200 @@ def test_cross_engine_real_eoe_mechan_assembler_real_oracle_create_token_parity(
     assert len(rust_p1_bf) == 0
     assert sum(1 for o in py_state.battlefield if o.controller_id == 1) == 0
     assert rust_state.get_life(1) == py_state.players[1].life
+
+
+def test_cross_engine_real_eoe_kav_landseeker_real_oracle_create_lander_token_parity(
+    parity_smoke,
+):
+    """Probe J: Kav Landseeker (EoE 138) FULL real ETB — the
+    create-Lander-token half that Probe H deferred ("bridge doesn't
+    carry create_token; strip it"). Now the bridge does carry it.
+
+    Oracle text in `data/edge_of_eternities.json`:
+
+        "Menace ...
+         When this creature enters, create a Lander token. At the
+         beginning of the end step on your next turn, sacrifice that
+         token. (...)"
+
+    Substrate paid for:
+      * Predicate algebra: ``source_is_self`` (Slice 1, every prior
+        Phase-5 ETB probe). Kav's own arrival is the trigger.
+      * create_token effect (this branch's substrate slice).
+
+    Out of scope:
+      * Menace keyword (combat-side; Kav doesn't attack in this
+        probe).
+      * "Sacrifice that token at the beginning of the end step on
+        your next turn" — needs a delayed-trigger bridge arm that
+        carries the source-token id forward across turn boundaries.
+        Same shape as Tannuk's "second-time-this-turn -> draw"
+        deferral: substrate-blocked, not probe-blocked. Future
+        bridge widening.
+      * Lander's own activated ability ("{2}, {T}, Sacrifice this
+        token: Search your library for a basic land card, put it
+        onto the battlefield tapped, then shuffle.") — the token
+        carries it on production printings, but the probe-side
+        synthetic Lander is a vanilla Artifact (the activated
+        ability isn't exercised by this probe's flow, so omitting
+        it is observably equivalent).
+
+    Probe shape (cast-and-resolve, not inject-and-fan-out, because
+    Kav's trigger fires on its OWN arrival via ``source_is_self`` —
+    same shape as the Germinating Wurm Probe B):
+
+      1. Cast Kav Landseeker from p0's hand. Spell resolves: Kav
+         arrives on p0 bf, ETB trigger lands on top of stack.
+      2. Drain stack: CreateToken resolves -> Lander token on p0 bf.
+      3. Cross-engine assert: BOTH engines have:
+         * 2 GameObjects on p0 bf (Kav + Lander), exactly one of
+           which is named ``Lander``.
+         * Stack empty on both.
+
+    Different token shape from Probe I (Mechan Assembler / Robot
+    artifact-creature): Lander is a pure Artifact token (no
+    Creature card_type). Exercises the create_token bridge arm's
+    artifact-only-token path.
+
+    Outcome (a): clean pass on both engines pins the bridge arm
+    on TWO distinct token shapes (Robot artifact-creature in Probe
+    I, Lander artifact-only here). The arm's coverage is now wide
+    enough to handle the dominant EoE ETB-token shapes —
+    Mechan Assembler (Robot), Auxiliary Boosters (Robot + attach
+    rider), Gravpack Monoist (Robot, tapped), every Landfall-Lander
+    creator in the set. Each future consumer adds a probe specific
+    to its own predicate + effect-rider mix.
+    """
+    from mtg_bot.parity.cross_engine import (
+        CardDef, DeckSpec, build_python_state, build_rust_state,
+    )
+
+    # The Lander token CardDef — pid 0. Pure Artifact (no Creature
+    # card_type; no power/toughness). Real EoE Lander prints with a
+    # tap-sac-search activated ability not exercised here.
+    lander_token_def = CardDef(
+        name="Lander",
+        card_type="Artifact",
+        supertypes=("Token",),
+        # No subtypes printed on the real Lander token (the EoE
+        # rules text describes the activated ability but the printed
+        # token shape carries no creature subtype).
+    )
+
+    # Kav Landseeker — pid 1. Real EoE printing: Creature - Kavu
+    # Soldier, 3/2, {3}{R}, Menace. ETB trigger creates one Lander
+    # token (the only bridge-substrate-supported part of the oracle
+    # — the delayed sac rider is out of scope per the docstring).
+    kav_def = CardDef(
+        name="Kav Landseeker",
+        card_type="Creature",
+        mana_cost_generic=3,
+        mana_cost_colored=(("R", 1),),
+        power=3,
+        toughness=2,
+        subtypes=("Kavu", "Soldier"),
+        triggered_abilities=(
+            {
+                "event": "enters",
+                "predicate": {"kind": "source_is_self"},
+                "effect": {
+                    "kind": "create_token",
+                    "count": 1,
+                    "token_printing_id": 0,  # Lander pid
+                },
+            },
+        ),
+    )
+    spec = DeckSpec(
+        card_defs=(lander_token_def, kav_def),
+        # Kav goes in p0's library so we can cast it normally.
+        p0_library=("Kav Landseeker",),
+        p1_library=("Kav Landseeker",),
+    )
+    py_state = build_python_state(spec)
+    rust_state = build_rust_state(spec)
+
+    # ---- Rust side ----
+    ZONE_HAND = 0
+    ZONE_BATTLEFIELD = 2
+    rust_kav_dict = {
+        "name": "Kav Landseeker",
+        "card_types": ["Creature"],
+        "mana_cost": {"generic": 3, "R": 1},
+        "effects": [],
+        "power": 3,
+        "toughness": 2,
+        "subtypes": ["Kavu", "Soldier"],
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": {"kind": "source_is_self"},
+                "effect": {
+                    "kind": "create_token",
+                    "count": 1,
+                    "token_printing_id": 0,
+                },
+            }
+        ],
+    }
+    rust_kav_id = rust_state.register_and_inject_object(
+        rust_kav_dict, 0, ZONE_HAND
+    )
+    rust_state.push_to_stack(rust_kav_id, 0)
+    rust_state.resolve_top_of_stack()
+    # Spell resolved -> Kav on bf, ETB trigger now on stack.
+    assert rust_state.find_object_zone(rust_kav_id) == ZONE_BATTLEFIELD
+    assert rust_state.stack_size() == 1, (
+        "Rust: Kav Landseeker's own ETB trigger should be on the "
+        "stack after the spell resolves"
+    )
+
+    # ---- Python side ----
+    from mtg_bot.actions import resolve_top_of_stack
+    from mtg_bot.game import StackItem, Zone
+
+    py_kav = py_state.players[0].library[0]
+    assert py_kav.printing.name == "Kav Landseeker"
+    py_state.players[0].library.remove(py_kav)
+    py_kav.zone = Zone.STACK
+    py_state.stack.append(StackItem(source=py_kav, controller_id=0))
+    resolve_top_of_stack(py_state)
+    assert any(
+        o.printing.name == "Kav Landseeker"
+        for o in py_state.battlefield
+    ), "Python: Kav should be on p0's battlefield post-resolve"
+    assert len(py_state.stack) == 1, (
+        "Python: Kav Landseeker's ETB trigger should be on the stack "
+        "after the spell resolves"
+    )
+
+    # ---- Drain both stacks, then compare ----
+    _drain_stack_both(py_state, rust_state)
+
+    rust_bf_final = [
+        d for d in rust_state.battlefield_snapshot()
+        if d["controller_id"] == 0
+    ]
+    rust_bf_names_final = sorted([d["printing_name"] for d in rust_bf_final])
+    py_bf_names_final = sorted([
+        o.printing.name for o in py_state.battlefield
+        if o.controller_id == 0
+    ])
+    # Both engines: Kav + Lander on p0 bf, exactly 2 objects.
+    assert rust_bf_names_final == ["Kav Landseeker", "Lander"], (
+        f"Rust: expected ['Kav Landseeker', 'Lander']; "
+        f"got {rust_bf_names_final!r}"
+    )
+    assert py_bf_names_final == ["Kav Landseeker", "Lander"], (
+        f"Python: expected ['Kav Landseeker', 'Lander']; "
+        f"got {py_bf_names_final!r}"
+    )
+    # Cross-engine: BOTH engines have the same p0 bf signature.
+    assert rust_bf_names_final == py_bf_names_final
+    # Sanity: p1 bf empty on both, no Lander tokens for p1.
+    rust_p1_bf = [
+        d for d in rust_state.battlefield_snapshot()
+        if d["controller_id"] == 1
+    ]
+    assert len(rust_p1_bf) == 0
+    assert sum(1 for o in py_state.battlefield if o.controller_id == 1) == 0
