@@ -11760,4 +11760,392 @@ def test_cross_engine_real_eoe_kav_landseeker_has_subtype_kavu_probe_parity(
     assert py_state.players[0].life == 21
     assert py_state.players[1].life == 20
     assert rust_state.get_life(0) == py_state.players[0].life
+
+
+def test_cross_engine_real_eoe_mechan_assembler_real_oracle_create_token_parity(
+    parity_smoke,
+):
+    """Probe I: Mechan Assembler (EoE) FULL real oracle — first
+    cross-engine probe to exercise the new ``create_token`` bridge
+    arm. Pins the Robot artifact-creature token on the
+    ``another artifact you control`` predicate branch end-to-end.
+
+    Oracle text (`data/edge_of_eternities.json`):
+
+        "Whenever another artifact you control enters, create a 2/2
+         colorless Robot artifact creature token. This ability
+         triggers only once each turn."
+
+    Probes D + E pinned the predicate algebra (NOT-branch) and the
+    ``once_per_turn`` flag with a GainLife(1) effect stand-in. This
+    probe replaces the stand-in with the REAL oracle effect:
+    ``create_token`` of a 2/2 colorless Robot artifact-creature
+    token. All three substrate features — Predicate::Not,
+    once_per_turn ledger, AND CreateToken — exercise together on
+    real-EoE-printed text.
+
+    Substrate paid for:
+      * Predicate algebra: ``Subject(IsArtifact) AND ControlledByYou
+        AND NOT(IsSelf)`` (Probe D).
+      * ``once_per_turn`` ledger (Probe E).
+      * **NEW**: ``create_token`` effect arm + Python's
+        ``printings_by_pid`` threading. The Rust effect resolves at
+        ``state_ops_resolve.rs:1744``; the Python class at
+        ``effects/generic/tokens.py:168``; the bridge translator
+        at ``cross_engine.py::_ta_dict_to_python_effect``.
+
+    Probe shape (same inject-and-fan-out frame as Probes D + E,
+    swapping the GainLife pin for a battlefield-zone-count pin):
+
+      1. Pre-place Mechan Assembler on p0 bf. Its OWN arrival
+         doesn't fire (NOT(IsSelf) suppresses).
+      2. Inject Mechan Drone #1 on p0 bf. ENTERS dispatch:
+         predicate matches all three arms. ``once_per_turn``
+         ledger empty -> trigger fires. Drain stack: CreateToken
+         resolves -> Robot token appears on p0 bf. Ledger stamped.
+      3. Inject Mechan Drone #2 on p0 bf. Predicate matches but
+         ``once_per_turn`` gate suppresses (ledger has the key).
+         No second token created.
+      4. Cross-engine assert: BOTH engines have:
+         * 4 GameObjects on p0 bf (Assembler + Drone #1 + Robot
+           token + Drone #2), exactly one of which is named
+           ``Robot_2_2`` and has Token supertype.
+         * Stack empty on both.
+
+    This is the FIRST cross-engine probe whose effect actually
+    materializes a new permanent on the battlefield rather than
+    just bumping a counter / life total. The post-drain battlefield
+    signature (set of (printing.name, controller) pairs) is the
+    parity assertion's primary load-bearing surface.
+    """
+    from mtg_bot.parity.cross_engine import (
+        CardDef, DeckSpec, build_python_state, build_rust_state,
+    )
+
+    another_artifact_predicate = {
+        "kind": "and",
+        "left": {
+            "kind": "and",
+            "left": {"kind": "subject_is_artifact"},
+            "right": {"kind": "controlled_by_you"},
+        },
+        "right": {
+            "kind": "not",
+            "inner": {"kind": "source_is_self"},
+        },
+    }
+
+    # The Robot token CardDef. Registered FIRST in ``card_defs`` so
+    # its positional pid is 0 — Mechan Assembler's create_token
+    # trigger references ``token_printing_id=0``. The Rust registry
+    # in ``build_rust_state`` assigns pids by position; Python's
+    # ``printings_by_pid`` mirrors the same mapping. The Robot
+    # carries ``["Artifact", "Creature"]`` card_types (via
+    # ``extra_card_types``), ``["Token"]`` supertypes, and
+    # ``["Robot"]`` subtypes — faithful to the real EoE Robot
+    # printing's shape.
+    robot_token_def = CardDef(
+        name="Robot_2_2",
+        card_type="Artifact",
+        extra_card_types=("Creature",),
+        supertypes=("Token",),
+        subtypes=("Robot",),
+        power=2,
+        toughness=2,
+    )
+
+    # Mechan Assembler CardDef — pid 1. The trigger's effect dict
+    # references ``token_printing_id=0`` (the Robot just above).
+    # NOTE: the Rust-side ``register_and_inject_object`` path below
+    # registers Mechan Assembler AGAIN (creating a separate
+    # printing at pid 2 or later), and that new printing carries
+    # its OWN TA dict still referencing pid 0 — the Robot stays
+    # at pid 0 throughout.
+    mechan_assembler_def = CardDef(
+        name="Mechan Assembler",
+        card_type="Artifact",
+        extra_card_types=("Creature",),
+        mana_cost_generic=4,
+        mana_cost_colored=(("U", 1),),
+        power=4,
+        toughness=4,
+        triggered_abilities=(
+            {
+                "event": "enters",
+                "predicate": another_artifact_predicate,
+                "effect": {
+                    "kind": "create_token",
+                    "count": 1,
+                    "token_printing_id": 0,  # Robot_2_2 pid
+                },
+                "once_per_turn": True,
+            },
+        ),
+    )
+    mechan_drone_def = CardDef(
+        name="Mechan Drone",
+        card_type="Artifact",
+        extra_card_types=("Creature",),
+        mana_cost_generic=2,
+        power=2,
+        toughness=2,
+    )
+    spec = DeckSpec(
+        card_defs=(robot_token_def, mechan_assembler_def, mechan_drone_def),
+        p0_library=(),
+        p1_library=(),
+    )
+    py_state = build_python_state(spec)
+    rust_state = build_rust_state(spec)
+
+    # ---- Rust side ----
+    ZONE_BATTLEFIELD = 2
+    rust_assembler_dict = {
+        "name": "Mechan Assembler",
+        "card_types": ["Artifact", "Creature"],
+        "mana_cost": {"generic": 4, "U": 1},
+        "effects": [],
+        "power": 4,
+        "toughness": 4,
+        "triggered_abilities": [
+            {
+                "event": "enters",
+                "predicate": another_artifact_predicate,
+                "effect": {
+                    "kind": "create_token",
+                    "count": 1,
+                    "token_printing_id": 0,
+                },
+                "once_per_turn": True,
+            }
+        ],
+    }
+    rust_assembler_id = rust_state.register_and_inject_object(
+        rust_assembler_dict, 0, ZONE_BATTLEFIELD
+    )
+    # Assembler's own arrival: NOT(IsSelf) suppresses; stack empty.
+    assert rust_state.stack_size() == 0
+    rust_drone_dict = {
+        "name": "Mechan Drone",
+        "card_types": ["Artifact", "Creature"],
+        "mana_cost": {"generic": 2},
+        "effects": [],
+        "power": 2,
+        "toughness": 2,
+    }
+
+    # Drone #1: first qualifying arrival. Trigger fires; ledger stamps.
+    rust_drone1_id = rust_state.register_and_inject_object(
+        rust_drone_dict, 0, ZONE_BATTLEFIELD
+    )
+    assert rust_state.stack_size() == 1, (
+        "Rust: Drone #1 arrival should push Mechan Assembler's trigger "
+        "onto the stack (first fire of the turn)"
+    )
+    # Drain the trigger now: CreateToken resolves -> Robot on bf.
+    while rust_state.stack_size() > 0:
+        rust_state.resolve_top_of_stack()
+    # Inspect p0 bf: should now contain Assembler + Drone #1 + Robot
+    # token. Read battlefield via parity_smoke's zone signature.
+    rust_bf_after_first = [
+        d for d in rust_state.battlefield_snapshot()
+        if d["controller_id"] == 0
+    ]
+    rust_bf_names_after_first = [d["printing_name"] for d in rust_bf_after_first]
+    assert "Robot_2_2" in rust_bf_names_after_first, (
+        f"Rust: Robot token should be on p0 bf after first trigger; "
+        f"got {rust_bf_names_after_first!r}"
+    )
+    assert rust_bf_names_after_first.count("Robot_2_2") == 1
+    rust_bf_size_after_first = len(rust_bf_after_first)
+    assert rust_bf_size_after_first == 3, (
+        f"Rust: p0 bf size should be 3 (Assembler+Drone1+Robot); "
+        f"got {rust_bf_size_after_first}"
+    )
+
+    # Drone #2: second arrival same turn. once_per_turn gate
+    # suppresses; no second Robot token created.
+    rust_drone2_id = rust_state.register_and_inject_object(
+        rust_drone_dict, 0, ZONE_BATTLEFIELD
+    )
+    assert rust_state.stack_size() == 0, (
+        "Rust: Drone #2 arrival should NOT push a trigger -- "
+        "once_per_turn gate suppresses the second fire. "
+        f"Got stack_size={rust_state.stack_size()}"
+    )
+    rust_bf_after_second = [
+        d for d in rust_state.battlefield_snapshot()
+        if d["controller_id"] == 0
+    ]
+    rust_bf_names_after_second = [d["printing_name"] for d in rust_bf_after_second]
+    assert rust_bf_names_after_second.count("Robot_2_2") == 1, (
+        f"Rust: still exactly ONE Robot token on p0 bf after Drone #2 "
+        f"(once_per_turn gates the second token creation); "
+        f"got {rust_bf_names_after_second!r}"
+    )
+    # p0 bf: Assembler + Drone #1 + Robot + Drone #2 = 4 objects.
+    assert len(rust_bf_after_second) == 4
+
+    # ---- Python side ----
+    from mtg_bot.actions import _trigger_etb_abilities, resolve_top_of_stack
+    from mtg_bot.cards.base import CardPrinting, ManaCost
+    from mtg_bot.effects.base import TriggeredAbility
+    from mtg_bot.effects.generic.tokens import CreateToken
+    from mtg_bot.effects.object_predicates import IsArtifact
+    from mtg_bot.effects.predicates import (
+        And, Controlled, Event, Not, Subject, IsSelf, YOU,
+    )
+    from mtg_bot.game import Zone
+
+    # The Python Robot token printing — same fields as the
+    # Rust-side registered printing. We pull it from the printings
+    # dict so the Mechan Assembler's CreateToken effect references
+    # the SAME instance Python's CreateToken expects (effective
+    # type-checks at resolve time read .printing.name).
+    py_predicate = And(
+        left=And(
+            left=Subject(slot=None, inner=IsArtifact()),
+            right=Controlled(by=YOU, subject=None),
+        ),
+        right=Not(inner=IsSelf()),
+    )
+    # The Python Robot printing — built locally so the CreateToken
+    # effect can reference it. Matches the Rust dict shape (Token
+    # supertype, Robot subtype, 2/2 Artifact Creature).
+    robot_printing = CardPrinting(
+        name="Robot_2_2",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=0, colored=()),
+        type_line="Artifact Creature -- Robot",
+        supertypes=("Token",),
+        card_types=("Artifact", "Creature"),
+        subtypes=("Robot",),
+        power=2,
+        toughness=2,
+        produces=frozenset(),
+        triggered_abilities=(),
+    )
+    assembler_printing = CardPrinting(
+        name="Mechan Assembler",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=4, colored=(("U", 1),)),
+        type_line="Artifact Creature",
+        supertypes=(),
+        card_types=("Artifact", "Creature"),
+        subtypes=(),
+        power=4,
+        toughness=4,
+        produces=frozenset(),
+        triggered_abilities=(
+            TriggeredAbility(
+                event=Event.ENTERS,
+                predicate=py_predicate,
+                effect=CreateToken(
+                    token_printing=robot_printing, count=1,
+                ),
+                once_per_turn=True,
+            ),
+        ),
+    )
+    py_assembler = py_state.new_object(
+        assembler_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_assembler.summoning_sick = False
+    py_assembler.tapped = False
+    py_assembler.damage = 0
+    py_assembler.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_assembler)
+    _trigger_etb_abilities(py_state, py_assembler)
+    assert len(py_state.stack) == 0  # NOT(IsSelf) suppressed
+
+    drone_printing = CardPrinting(
+        name="Mechan Drone",
+        mana_cost_str="",
+        mana_cost=ManaCost(generic=2),
+        type_line="Artifact Creature",
+        supertypes=(),
+        card_types=("Artifact", "Creature"),
+        subtypes=(),
+        power=2,
+        toughness=2,
+        produces=frozenset(),
+        triggered_abilities=(),
+    )
+    # Drone #1 -> trigger fires -> Robot token created.
+    py_drone1 = py_state.new_object(
+        drone_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_drone1.summoning_sick = True
+    py_drone1.tapped = False
+    py_drone1.damage = 0
+    py_drone1.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_drone1)
+    _trigger_etb_abilities(py_state, py_drone1)
+    assert len(py_state.stack) == 1
+    while py_state.stack:
+        resolve_top_of_stack(py_state)
+    py_bf_names_after_first = [
+        o.printing.name for o in py_state.battlefield
+        if o.controller_id == 0
+    ]
+    assert "Robot_2_2" in py_bf_names_after_first, (
+        f"Python: Robot token should be on p0 bf after first trigger; "
+        f"got {py_bf_names_after_first!r}"
+    )
+    assert py_bf_names_after_first.count("Robot_2_2") == 1
+    assert len(py_bf_names_after_first) == 3
+
+    # Drone #2 -> once_per_turn suppresses; no second Robot.
+    py_drone2 = py_state.new_object(
+        drone_printing, owner_id=0, zone=Zone.BATTLEFIELD,
+    )
+    py_drone2.summoning_sick = True
+    py_drone2.tapped = False
+    py_drone2.damage = 0
+    py_drone2.etb_timestamp = py_state.next_timestamp
+    py_state.next_timestamp += 1
+    py_state.battlefield.append(py_drone2)
+    _trigger_etb_abilities(py_state, py_drone2)
+    assert len(py_state.stack) == 0
+    py_bf_names_after_second = [
+        o.printing.name for o in py_state.battlefield
+        if o.controller_id == 0
+    ]
+    assert py_bf_names_after_second.count("Robot_2_2") == 1, (
+        f"Python: still exactly ONE Robot token on p0 bf after Drone #2; "
+        f"got {py_bf_names_after_second!r}"
+    )
+    assert len(py_bf_names_after_second) == 4
+
+    # ---- Cross-engine parity ----
+    _drain_stack_both(py_state, rust_state)
+    # BOTH engines: exactly ONE Robot token created across two
+    # qualifying ENTERS in the same turn (once_per_turn gate).
+    # p0 bf size matches: 4 objects (Assembler + Drone1 + Robot +
+    # Drone2).
+    rust_bf_final = [
+        d for d in rust_state.battlefield_snapshot()
+        if d["controller_id"] == 0
+    ]
+    rust_bf_names_final = sorted([d["printing_name"] for d in rust_bf_final])
+    py_bf_names_final = sorted([
+        o.printing.name for o in py_state.battlefield
+        if o.controller_id == 0
+    ])
+    assert rust_bf_names_final == py_bf_names_final, (
+        f"Cross-engine p0 bf signatures must match: "
+        f"rust={rust_bf_names_final!r} vs py={py_bf_names_final!r}"
+    )
+    assert rust_bf_names_final.count("Robot_2_2") == 1
+    assert len(rust_bf_names_final) == 4
+    # Sanity: p1 bf unchanged on both engines (no Robot tokens for
+    # p1 — controller-immune to the trigger's create_token).
+    rust_p1_bf = [
+        d for d in rust_state.battlefield_snapshot()
+        if d["controller_id"] == 1
+    ]
+    assert len(rust_p1_bf) == 0
+    assert sum(1 for o in py_state.battlefield if o.controller_id == 1) == 0
     assert rust_state.get_life(1) == py_state.players[1].life

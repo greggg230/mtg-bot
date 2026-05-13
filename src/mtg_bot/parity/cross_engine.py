@@ -137,6 +137,16 @@ class CardDef:
     # Rust's `CardPrinting.subtypes` storage). Empty tuple is the
     # back-compat default; pre-substrate fixtures don't need to set it.
     subtypes: tuple[str, ...] = ()
+    # Probe-I create_token substrate — token printings need
+    # ``card_types=("Artifact", "Creature")`` and
+    # ``supertypes=("Token",)`` to faithfully reproduce the EoE Robot
+    # token shape. The single-string ``card_type`` field can't
+    # express either. ``extra_card_types`` (when non-empty)
+    # APPENDS additional entries after ``card_type``; ``supertypes``
+    # (when non-empty) is set wholesale. Both default to empty for
+    # pre-Probe-I back-compat.
+    extra_card_types: tuple[str, ...] = ()
+    supertypes: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -652,9 +662,17 @@ def build_rust_state(spec: DeckSpec):
         # schema. The keys we use here are validated by the round-22
         # bridge code; unknown keys are silently ignored, so any future
         # CardDef field that Rust doesn't yet understand stays inert.
+        # Probe-I create_token substrate: ``card_types`` is now
+        # ``[card.card_type, *card.extra_card_types]`` — the
+        # single-string ``card_type`` field can't express "Artifact
+        # Creature" / etc. ``extra_card_types`` (default empty)
+        # appends additional entries; pre-Probe-I CardDefs (no
+        # ``extra_card_types``) take the same single-entry list path
+        # as before.
+        card_types_list = [card.card_type, *card.extra_card_types]
         printing_dict = {
             "name": card.name,
-            "card_types": [card.card_type],
+            "card_types": card_types_list,
             "mana_cost": dict(
                 (("generic", card.mana_cost_generic),) if card.mana_cost_generic else ()
             ) | {color: n for color, n in card.mana_cost_colored},
@@ -673,6 +691,12 @@ def build_rust_state(spec: DeckSpec):
         # parser maps a missing ``subtypes`` key to an empty Vec.
         if card.subtypes:
             printing_dict["subtypes"] = list(card.subtypes)
+        # Probe-I create_token substrate: pass supertypes through to
+        # Rust. Token printings need ``["Token"]`` so the printing's
+        # ``is_token`` reader (and any token-aware engine path) sees
+        # the supertype. Default empty.
+        if card.supertypes:
+            printing_dict["supertypes"] = list(card.supertypes)
         # ETB-trigger Slice 3: pass triggered_abilities through to the
         # Rust registry so CE19-shape probes (predicate-path ENTERS
         # triggers) can drive both engines from the same DeckSpec.
@@ -790,6 +814,16 @@ def build_python_state(spec: DeckSpec):
             type_line = card.card_type
             supertypes = ()
             subtypes = ()
+        # Probe-I create_token substrate: ``extra_card_types`` /
+        # ``supertypes`` overrides. When non-empty, ``subtypes`` from
+        # the CardDef field replaces the land-name auto-derived
+        # entry (probe-time tokens carry "Robot" / etc.). The Rust
+        # side has parallel wiring in ``build_rust_state``.
+        card_types = (card.card_type, *card.extra_card_types)
+        if card.supertypes:
+            supertypes = card.supertypes
+        if card.subtypes:
+            subtypes = card.subtypes
         # Lands with ``mana_produced`` get an explicit ``{T}: Add {C}``
         # activated ability so ``ActivateAbility(land_id, 0)`` works on
         # the Python side. Rust's ``ActivateAbility`` dispatch reads the
@@ -830,7 +864,7 @@ def build_python_state(spec: DeckSpec):
             mana_cost=cost,
             type_line=type_line,
             supertypes=supertypes,
-            card_types=(card.card_type,),
+            card_types=card_types,
             subtypes=subtypes,
             power=card.power,
             toughness=card.toughness,
