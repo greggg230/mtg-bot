@@ -1428,6 +1428,54 @@ gameplay surface. Perf neutral.
 
 ---
 
+## N. Rust DealsCombatDamage trigger dispatch skips player-target damage
+
+**Location**: `rust/src/state_ops_combat.rs::apply_damage_pass` (around the
+`creature_target_id` match) + `rust/src/state_ops_resolve.rs::
+dispatch_event_multi_subject`.
+
+**What we do today**: when a damage entry is created during combat
+damage resolution, the engine dispatches `Event::DealsCombatDamage`
+ONLY for entries whose target is a `DamageTarget::Creature(id)`.
+Entries with `DamageTarget::Player(player_id)` skip the dispatch
+entirely — the player takes life loss + lifelink fires, but no
+trigger fan-out happens.
+
+**Why this is wrong under current CR**: CR 119.5 / triggered-ability
+fan-out: a creature dealing combat damage to a player is a valid
+"deals combat damage" event. Triggers like Illvoi Infiltrator
+(`IsSelf(subject="source") & IsPlayer(subject="target")`) should
+fire on player-target damage but don't in Rust today.
+
+**Failure mode**: cards with "whenever ~ deals combat damage to a
+player" triggered abilities silently never fire when their dealer
+hits the defender unblocked. The substrate (`Predicate::Subject(slot,
+inner)`) supports the necessary slot lookup; the gap is purely the
+dispatch wiring in `apply_damage_pass`.
+
+**When it matters**: any EoE card with a player-target combat
+damage trigger. Illvoi Infiltrator, Starwinder-family
+(`IsCreature(subject="source") & Controlled(YOU, subject="source") &
+IsPlayer(subject="target")`), Haliya Ascendant Cadet aggregated
+"creatures with +1/+1 counters deal combat damage to a player" — all
+present in Python via `combat.py:729-742` but skipped by Rust.
+
+**Fix scope when prioritized**: introduce a tagged-id design for
+the Target slot so the predicate evaluator can distinguish "subject
+is a GameObject" (look up printing → card types) from "subject is a
+Player" (look up by player.id → never matches IsCreature etc.,
+matches a future `IsPlayer` predicate). One approach: switch the
+slot map to `(SubjectSlot, SubjectId)` where `SubjectId` is an enum
+`Object(u32) | Player(u8)`. Touches the `Predicate::matches_with_slots`
+signature and every predicate-arm body. Estimated <200 LOC change
+plus tests.
+
+**Impact estimate**: enables a handful of EoE cards' DCD-to-player
+triggers in Rust. No strength impact for cards already covered by
+the creature-target path.
+
+---
+
 ## Tracked but not in this doc
 
 Things tracked elsewhere that you might also want to know about:

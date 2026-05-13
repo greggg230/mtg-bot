@@ -552,6 +552,114 @@ pub(crate) fn dispatch_event(
     Ok(())
 }
 
+/// **ETB-Subject-substrate consumer slice — dispatch a multi-subject
+/// event to every triggered ability on the battlefield.** Sibling of
+/// `dispatch_event` for events whose firings carry more than one
+/// named subject (today: `Event::DealsCombatDamage` only).
+///
+/// `default_subject_id` is the "default" subject the dispatcher uses
+/// for the existing implicit-subject predicates (SourceIsSelf,
+/// SubjectIsCreature, ControlledByYou, SubjectHasSubtype). For
+/// `Event::DealsCombatDamage` this is the dealing creature
+/// (Source slot's id) — matching Python's convention that
+/// `Subject(None, ...)` on a multi-subject event reads the
+/// caller-defined "primary" subject. The `subjects_by_slot` map
+/// carries the full named-slot bindings; the new
+/// `Predicate::Subject(slot, inner)` arm reads from it.
+///
+/// **Scope** (consumer Slice 2 of the ETB-Subject substrate):
+/// - `Event::DealsCombatDamage` is the only event wired here today.
+///   Other multi-subject events (multi-subject `Event::Blocks` for
+///   Skystinger, etc.) land alongside their own dispatch fan-out.
+/// - **Player-target damage**: today's call sites only invoke this
+///   for creature-target damage entries (where `Target` slot's id is
+///   a real GameObject id). Player-target damage doesn't dispatch
+///   via this path yet — see `state_ops_combat.rs::apply_damage_pass`
+///   for the gating logic. The substrate supports the player-target
+///   case (the slot map carries u32 ids; predicates that read a
+///   GameObject's printing return false on a non-GameObject id), but
+///   wiring it requires a tagged-id design or a "player vs object"
+///   target predicate which is out of scope for this slice. See
+///   `docs/SEARCH_LIMITATIONS.md` for the gap.
+///
+/// **No extra-observer expansion**: unlike DIES/CAST/LEAVES, both
+/// subjects in a combat-damage event are already on the battlefield
+/// (the dealer and the creature-target). The bf observer-set
+/// covers them without synthesis.
+pub(crate) fn dispatch_event_multi_subject(
+    state: &mut GameState,
+    event: Event,
+    default_subject_id: u32,
+    subjects_by_slot: &[(crate::cards::SubjectSlot, u32)],
+) -> PyResult<()> {
+    // Defensive: only DealsCombatDamage is multi-subject-wired today.
+    // Other events should still flow through `dispatch_event`.
+    if event != Event::DealsCombatDamage {
+        return Err(PyValueError::new_err(format!(
+            "dispatch_event_multi_subject: event {event:?} is not yet \
+             wired in this consumer slice; only Event::DealsCombatDamage \
+             dispatches via the multi-subject path today"
+        )));
+    }
+
+    let firings: Vec<(u32, u8, u32, Effect, bool)> = {
+        let bf = bf_iter_etb_sorted(state);
+        let observer_entries: Vec<(u32, u8, u32)> = bf
+            .iter()
+            .map(|o| (o.id, o.controller, o.printing_id))
+            .collect();
+        let mut firings = Vec::new();
+        for (source_id, source_controller, printing_id) in &observer_entries {
+            let printing = match state.registry.lookup(*printing_id) {
+                Some(p) => p,
+                None => continue,
+            };
+            for (ability_index, ability) in
+                printing.triggered_abilities.iter().enumerate()
+            {
+                if ability.event != event {
+                    continue;
+                }
+                if !ability.predicate.matches_with_slots(
+                    state,
+                    *source_id,
+                    default_subject_id,
+                    subjects_by_slot,
+                ) {
+                    continue;
+                }
+                if ability.once_per_turn
+                    && state
+                        .triggered_this_turn
+                        .contains(&(*source_id, ability_index as u32))
+                {
+                    continue;
+                }
+                firings.push((
+                    *source_id,
+                    *source_controller,
+                    ability_index as u32,
+                    ability.effect.clone(),
+                    ability.once_per_turn,
+                ));
+            }
+        }
+        firings
+    };
+
+    for (source_id, controller, ability_index, effect, once_per_turn) in firings {
+        push_triggered_ability(
+            state,
+            source_id,
+            controller,
+            ability_index,
+            effect,
+            once_per_turn,
+        )?;
+    }
+    Ok(())
+}
+
 /// **Slice 1 — push one triggered ability onto the stack.** Adds a
 /// `StackItem::new_trigger` carrying the source object's id, the
 /// trigger's controller, and the payload effect. Bumps the

@@ -350,6 +350,12 @@ def _ta_dict_to_python_triggered_ability(ta_dict: dict):
         event = Event.BLOCKS
     elif event_str == "leaves_battlefield":
         event = Event.LEAVES_BATTLEFIELD
+    elif event_str == "deals_combat_damage":
+        # ETB-Subject substrate consumer slice — multi-subject
+        # event fired from Rust's `apply_damage_pass` per
+        # creature-target damage entry. Python's
+        # `Event.DEALS_COMBAT_DAMAGE` is the canonical mirror.
+        event = Event.DEALS_COMBAT_DAMAGE
     else:
         raise ValueError(
             f"cross_engine triggered_abilities bridge: event "

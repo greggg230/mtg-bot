@@ -1743,3 +1743,68 @@ pin this back-compat contract.
 **Rust gate**: 2216/2216 (substrate baseline 2204 + 12 new Subject
 tests covering parser surface, error paths, no-op-on-single-subject
 contract, NOT/AND composition, and inner-variant coverage).
+
+---
+
+## ETB Subject substrate Slice 2 — Event::DealsCombatDamage consumer (landed — same branch as substrate)
+
+First multi-subject event wired into the new substrate. Mirrors
+Python's `Event.DEALS_COMBAT_DAMAGE` (`src/mtg_bot/effects/predicates.py:63`)
+with the `("source", "target")` slot pair.
+
+**Shape**:
+- `Event::DealsCombatDamage` variant added to `Event` enum next to
+  the existing `DealsDamage` stub. Doc note distinguishes "combat
+  damage" (this variant) from "any damage" (the `DealsDamage` stub —
+  not yet wired).
+- New `dispatch_event_multi_subject(state, event,
+  default_subject_id, subjects_by_slot)` function in
+  `state_ops_resolve.rs`. Same bf-observer-snapshot pattern as
+  `dispatch_event`, but evaluates each predicate via
+  `Predicate::matches_with_slots` so `Predicate::Subject(slot, inner)`
+  resolves correctly.
+- Parser: `parse_triggered_ability` accepts the new event string
+  `"deals_combat_damage"`. The error message in the
+  `"deals_damage"` arm + the `unknown event` arm updated to list
+  the new entry.
+- Dispatch site: `state_ops_combat.rs::apply_damage_pass` now
+  returns `PyResult<()>` (signature widened from `()`). After the
+  per-entry damage mutations + lifelink fire, the function
+  dispatches `Event::DealsCombatDamage` with
+  `subjects_by_slot = [(Source, entry.source_id), (Target,
+  target_id)]` when the entry's target is a creature. All three
+  call sites in `deal_combat_damage` propagate the `?`.
+
+**Default subject** (`default_subject_id`): set to the dealing
+creature's id (`entry.source_id`). This is the subject seen by every
+existing implicit-subject predicate (`SourceIsSelf`,
+`SubjectIsCreature`, `ControlledByYou`, `SubjectHasSubtype`) when a
+DCD trigger uses them — matching the canonical "whenever ~ deals
+combat damage" self-trigger shape (SourceIsSelf matches when the
+ability's source is the dealing creature).
+
+**Cross-engine bridge** (`cross_engine.py`): `_ta_dict_to_python_
+triggered_ability` adds a `"deals_combat_damage"` arm mapping to
+`Event.DEALS_COMBAT_DAMAGE`. Combined with the Slice 1 Subject
+predicate bridge, this lets cross-engine smoke probes drive a real
+DCD card on both engines simultaneously.
+
+**Scope** (gap — `docs/SEARCH_LIMITATIONS.md` entry §N):
+- **Player-target damage**: only creature-target entries dispatch
+  the multi-subject event today. Player-target entries (unblocked
+  attacker hits the defender) skip the dispatch. Cards like Illvoi
+  Infiltrator that fire on "deals combat damage to a player" don't
+  fire in Rust yet. Fix requires a tagged-id design for the Target
+  slot (distinguishing GameObject ids from Player ids). Out of scope
+  for this slice.
+- **Aggregated observer pattern**: Python's combat.py also runs an
+  aggregated `(controller, target_player)` walk for the Haliya
+  Ascendant Cadet "creatures with +1/+1 counters deal combat damage
+  to a player" pattern. That's a separate dispatch path, gated by
+  the player-target wiring above.
+
+**Rust gate**: 2225/2225 (substrate baseline 2216 + 9 new
+DealsCombatDamage tests: parser surface, SourceIsSelf shape,
+Subject(Target, IsCreature), Subject(Source, IsCreature),
+once_per_turn, player-target no-op, plus a guard test confirming
+single-subject `dispatch_event` doesn't fan-out DCD).

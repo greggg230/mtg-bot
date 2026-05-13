@@ -1199,7 +1199,7 @@ impl GameState {
             let (pass_1, pass_2_all): (Vec<PlanEntry>, Vec<PlanEntry>) =
                 plan.into_iter().partition(|e| e.pass == Pass::FirstStrike);
             // Apply pass 1.
-            self.apply_damage_pass(pass_1);
+            self.apply_damage_pass(pass_1)?;
             // Filter pass 2:
             // (a) Source must be still alive after pass 1 — a creature
             //     that took lethal damage in step 1 doesn't strike
@@ -1302,9 +1302,9 @@ impl GameState {
                     DamageTarget::Player(_) => Some(e),
                 })
                 .collect();
-            self.apply_damage_pass(pass_2);
+            self.apply_damage_pass(pass_2)?;
         } else {
-            self.apply_damage_pass(plan);
+            self.apply_damage_pass(plan)?;
         }
         Ok(())
     }
@@ -1356,7 +1356,7 @@ impl GameState {
     ///      doesn't see a stale value from a prior event (the reset
     ///      is what keeps event-N's amount from leaking into event-
     ///      N+1's resolution).
-    fn apply_damage_pass(&mut self, entries: Vec<PlanEntry>) {
+    fn apply_damage_pass(&mut self, entries: Vec<PlanEntry>) -> PyResult<()> {
         for entry in entries {
             // Read the source's keywords + controller BEFORE applying
             // mutations. Deathtouch upgrades the recipient's mark to
@@ -1378,6 +1378,17 @@ impl GameState {
             // event's amount. Reset to 0 after the per-entry mutations
             // and lifelink fire so the slot is 0 between events.
             self.resolving_combat_damage_amount = entry.amount as i32;
+
+            // Capture the creature-target id (if any) BEFORE applying
+            // mutations so the post-damage DealsCombatDamage dispatch
+            // can pass it as the Target slot id even if the target
+            // would later die from this damage. Player targets are not
+            // wired through the predicate-style dispatch yet — see
+            // `dispatch_event_multi_subject` doc for the gap.
+            let creature_target_id: Option<u32> = match entry.target {
+                DamageTarget::Creature(id) => Some(id),
+                DamageTarget::Player(_) => None,
+            };
 
             match entry.target {
                 DamageTarget::Creature(obj_id) => {
@@ -1420,11 +1431,49 @@ impl GameState {
                 }
             }
 
+            // ETB-Subject substrate consumer slice: dispatch
+            // `Event::DealsCombatDamage` for every CREATURE-target
+            // damage entry. Player-target entries skip this dispatch
+            // (see `dispatch_event_multi_subject` doc for the gap).
+            // Mirrors Python's per-event invocation at
+            // `src/mtg_bot/combat.py:729-742`.
+            //
+            // Subject map: Source = dealing creature; Target =
+            // creature receiving damage. The default subject
+            // (passed as `subject_id` to existing implicit-subject
+            // predicates and SourceIsSelf) is the dealing creature —
+            // matches the canonical "whenever ~ deals combat damage"
+            // self-trigger shape.
+            //
+            // Fired AFTER damage mutations so a trigger that reads
+            // post-damage state (e.g. an SBA-survivor predicate) sees
+            // the updated values. Fired BEFORE the resolving-amount
+            // slot reset so any DrawCardsEqualToResolvingCombatDamage
+            // payload on this trigger reads the correct amount when
+            // the trigger eventually resolves (caveat: the trigger
+            // resolves from the stack, by which time the slot has
+            // been zeroed — Python uses the same shape and accepts
+            // that resolving-time-read divergence; see I32 notes for
+            // the slot lifecycle).
+            if let Some(target_id) = creature_target_id {
+                let subjects_by_slot = [
+                    (crate::cards::SubjectSlot::Source, entry.source_id),
+                    (crate::cards::SubjectSlot::Target, target_id),
+                ];
+                crate::state_ops_resolve::dispatch_event_multi_subject(
+                    self,
+                    crate::cards::Event::DealsCombatDamage,
+                    entry.source_id,
+                    &subjects_by_slot,
+                )?;
+            }
+
             // I32 reset: clear the slot between events so a future
             // Late-resolving trigger doesn't read a stale value from
             // a prior event. Matches Python's `finally: state.
             // resolving_combat_damage_amount = 0` reset shape.
             self.resolving_combat_damage_amount = 0;
         }
+        Ok(())
     }
 }

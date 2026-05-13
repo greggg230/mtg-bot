@@ -1909,6 +1909,29 @@ pub enum Event {
     /// "When X deals damage" / combat-damage triggers. Stub for
     /// Slice 12+; no dispatch site yet.
     DealsDamage,
+    /// "Whenever X deals combat damage to Y" — multi-subject event
+    /// firing from `state_ops_combat.rs::apply_damage_pass` per
+    /// damage entry. Slots: `Source` = the attacking / blocking
+    /// creature dealing damage; `Target` = the player or creature
+    /// taking damage. Mirrors Python's
+    /// `Event.DEALS_COMBAT_DAMAGE` at
+    /// `src/mtg_bot/effects/predicates.py:63` with the
+    /// `("source", "target")` slot pair from `EVENT_SUBJECTS`.
+    ///
+    /// **Subject-substrate dependency**: a `Predicate::Subject(slot,
+    /// inner)` predicate can gate on either slot. The default
+    /// `subject_id` passed to `dispatch_event` is the Source (the
+    /// dealer), so `SourceIsSelf` ("whenever ~ deals combat damage")
+    /// matches naturally when the dealing creature is the source of
+    /// the ability. Slot-anchored predicates target the recipient
+    /// via `Subject(Target, ...)`.
+    ///
+    /// **Dispatch granularity**: fires once per damage entry, so a
+    /// trample attacker that hits a blocker AND the defending player
+    /// fires twice (once with Target = blocker, once with Target =
+    /// player) — mirrors Python's per-event invocation shape at
+    /// `src/mtg_bot/combat.py:729-742`.
+    DealsCombatDamage,
     /// "When X leaves the battlefield". Fires from
     /// `dispatch_event(Event::LeavesBattlefield, leaving_id)` on
     /// every bf-exit primitive (move_object off-bf + SBA destroy).
@@ -4661,19 +4684,24 @@ fn parse_triggered_ability(
         "attacks" => Event::Attacks,
         "blocks" => Event::Blocks,
         "leaves_battlefield" => Event::LeavesBattlefield,
+        // ETB-Subject substrate consumer slice — multi-subject
+        // dispatch from state_ops_combat.rs::apply_damage_pass.
+        "deals_combat_damage" => Event::DealsCombatDamage,
         // Out-of-scope events stay raise-on-register. Each lands
         // alongside its dispatch fan-out so the parser surface stays
         // consistent with the dispatcher's coverage.
         "deals_damage" => {
             return Err(PyValueError::new_err(format!(
                 "triggered_ability.event {event_str:?} is not yet wired in Slice 9; \
-                 only \"enters\", \"dies\", \"cast\", \"attacks\", \"blocks\", and \"leaves_battlefield\" dispatch today"
+                 only \"enters\", \"dies\", \"cast\", \"attacks\", \"blocks\", \"leaves_battlefield\", \
+                 and \"deals_combat_damage\" dispatch today"
             )));
         }
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown triggered_ability.event {other:?}; \
-                 valid: enters, dies, cast, attacks, blocks, leaves_battlefield (Slice 9)"
+                 valid: enters, dies, cast, attacks, blocks, leaves_battlefield, \
+                 deals_combat_damage"
             )));
         }
     };
