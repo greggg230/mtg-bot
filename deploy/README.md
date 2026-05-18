@@ -81,6 +81,15 @@ tail -f ~/Library/Logs/mtg-bot/worker.out.log
 curl http://<tailnet-ip>:5198/v2/heartbeat
 ```
 
+The plist sets `PATH` (includes `{{HOME}}/.cargo/bin` + `/opt/homebrew/bin`)
+and `VIRTUAL_ENV` (`{{REPO_ROOT}}/.venv-py313`) in `EnvironmentVariables`
+so `POST /v2/self_update` can rebuild the Rust engine. launchd's default
+agent `PATH` excludes both the rustup toolchain and Homebrew, and
+maturin's auto-detect doesn't recognise the `.venv-py313` directory name
+— without these the rebuild step fails on any commit touching
+`rust/`/`Cargo.*`. If you install rust to a non-default prefix, edit the
+`PATH` value accordingly.
+
 ## Windows (Task Scheduler)
 
 Run from **elevated** PowerShell (Task Scheduler with SYSTEM principal

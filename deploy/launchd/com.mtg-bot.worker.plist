@@ -63,6 +63,24 @@
     <dict>
         <key>PYTHONPATH</key>
         <string>{{REPO_ROOT}}/src</string>
+
+        <!-- launchd starts agents with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+             which omits Homebrew and the rustup toolchain. self_update's Rust
+             rebuild step needs rustc/cargo (~/.cargo/bin) and the Homebrew prefix.
+             Without this, `POST /v2/self_update` fails on any commit that touches
+             rust/ or Cargo.* with "rustc, the rust compiler, is not installed
+             or not in PATH". -->
+        <key>PATH</key>
+        <string>{{HOME}}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
+        <!-- maturin auto-detects a venv via VIRTUAL_ENV / CONDA_PREFIX / a
+             .venv directory in cwd-or-parents. The mtg-bot venv is named
+             .venv-py313 (per the 3.13 segfault workaround in CLAUDE.md), so
+             auto-detection fails. Setting VIRTUAL_ENV explicitly lets
+             `maturin develop --release` find the right interpreter during
+             self_update's Rust rebuild. -->
+        <key>VIRTUAL_ENV</key>
+        <string>{{REPO_ROOT}}/.venv-py313</string>
     </dict>
 
     <!-- Run at boot AND restart on crash with a small backoff. -->
