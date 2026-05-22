@@ -1616,7 +1616,46 @@ impl GameState {
     /// pass 2 is a within-function `damage < toughness` predicate;
     /// dead creatures are NOT moved to the graveyard. Damage marks
     /// stay; lethal-damage-destroys-creature is the SBA slice's job.
+    ///
+    /// **Darkness-shape combat-damage prevention — Cycle 2
+    /// (2026-05-21).** When
+    /// `self.prevent_all_combat_damage_this_turn` is `true` (CR
+    /// 615.4 — "if a damage event would be prevented entirely, it
+    /// doesn't happen at all"), `deal_combat_damage` short-circuits
+    /// to a no-op return before the plan is built. No `PlanEntry`
+    /// is emitted, no per-creature damage marker is updated, no
+    /// `apply_damage_pass` call fires (which means no lifelink
+    /// life-gain, no `DEALT_DAMAGE` event dispatch, no
+    /// `dispatch_combat_damage_to_player` trigger push, no
+    /// `resolving_combat_damage_amount` slot write). Non-combat
+    /// damage (`deal_damage` in `state_ops_damage.rs`) is NOT
+    /// affected — the flag is combat-specific. Mirrors Python's
+    /// `combat._resolve_damage_step` early-out at `combat.py:479`
+    /// — Python filters per-event with a `combat_damage_cant_be_
+    /// prevented` printing-keyword bypass, but Rust has no
+    /// equivalent printing flag today (zero cards in the current
+    /// EoE pool carry "combat damage can't be prevented"), so the
+    /// single-point early-out is byte-equivalent at the routing
+    /// surface. If a future card with that keyword ships on the
+    /// Rust side, a sibling cycle can refine to the per-source
+    /// filter (the substrate-pin tests in
+    /// `tests/test_darkness_cycle2.py` would surface the gap).
     fn deal_combat_damage(&mut self) -> PyResult<()> {
+        // Darkness-shape combat-damage prevention — Cycle 2
+        // (2026-05-21). Single-point early-out at the combat-damage
+        // routing site. CR 615.4: a prevented damage event doesn't
+        // happen at all — no assignment, no triggers, no SBA-side
+        // effects. The flag is set by the future Cycle 3
+        // `Effect::PreventAllCombatDamageThisTurn` resolve arm
+        // (Darkness), drained at cleanup by Cycle 1's
+        // `cleanup_step_for_active_player` step (3c). Substrate-
+        // only invariant: no production trajectory mints the flag
+        // until Cycle 3 lands, so this branch is a no-op on every
+        // existing cross-engine trajectory (back-compat byte-
+        // equal on the flag-unset path).
+        if self.prevent_all_combat_damage_this_turn {
+            return Ok(());
+        }
         // Snapshot attacker/blocker plans first. Mutating the
         // battlefield (damage marks, life) is held off until after the
         // plan is built so simultaneous-damage semantics aren't

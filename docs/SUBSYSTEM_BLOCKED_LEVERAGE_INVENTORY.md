@@ -740,6 +740,39 @@ upstream of this dated paragraph).
   landings amortize against `cleanup_step_for_active_player` as
   the shared CR-514.3-aggregator.
 
+  **Darkness Cycle 2 landed (2026-05-21,
+  `feature/darkness-cycle-2-p1`).** Combat-damage routing-point
+  guard at the top of `state_ops_combat.rs::deal_combat_damage`:
+  when `self.prevent_all_combat_damage_this_turn` is `true`, the
+  function returns `Ok(())` BEFORE building the damage plan or
+  calling `apply_damage_pass`. CR 615.4 — "if a damage event
+  would be prevented entirely, it doesn't happen at all" — and
+  the guard sits at the **single bottleneck** combat-damage
+  routing site (`deal_combat_damage` is the sole combat-damage
+  entry point and calls `apply_damage_pass` 1–3× per combat
+  step), so one read covers all plan entries / triggers /
+  lifelink / I32 slot writes. Substrate-only invariant: no
+  production trajectory mints the flag today (Cycle 3's
+  `Effect::PreventAllCombatDamageThisTurn` resolve arm is the
+  production mint site), so the guard is a no-op on every
+  pre-Cycle-3 cross-engine trajectory — **back-compat byte-
+  equivalent** through the Cycle 2 landing. 13 routing-pin tests
+  in `tests/test_darkness_cycle2.py` (flag-false back-compat
+  byte-equal pin against the canonical 2/2-vs-defender combat
+  scenario; flag-true zero-out for unblocked / blocked / multi-
+  attacker / trample-spillover; flag-true no-fire pins for
+  lifelink, DealsDamage trigger, DealtDamage trigger; flag-true
+  does NOT suppress non-combat `deal_damage`; cleanup-drain
+  restores combat next turn; flag-true leaves
+  `resolving_combat_damage_amount` slot untouched; flag-true +
+  no attackers clean no-op; CoW isolation invariant). Sanity
+  gates: 16/16 Cycle 1 + 13/13 Cycle 2 + 721/721 cross-engine +
+  636/636 parity smoke + rust engine smoke + rust bridge parity
+  + control-change-ueot tests, zero new failures vs Cycle 1
+  base. Cycle 3 still needs the Effect variant / bridge round-
+  trip / admit widen / PROBED flip — see Search Limitations
+  Darkness entry.
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 

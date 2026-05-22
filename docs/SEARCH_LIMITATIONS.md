@@ -10429,15 +10429,52 @@ single read site, not a cross-module rerouting walk). Cycle list:
   through the preventer) and Cycle 3 (bridge round-trip + admit
   widen + PROBED flip).
 
-- **C2** — Combat-damage routing through the preventer. Edit
-  `state_ops_combat.rs::apply_damage_pass` so the per-entry
-  damage / deathtouch / lifelink application checks
-  `state.prevent_all_combat_damage_this_turn` and short-circuits
-  to zero damage / no triggers when set. Mirror Python's
-  `combat._resolve_damage_step` early-out at `combat.py:479`.
-  Single read site; one substrate-pin test that combat damage
-  is suppressed when the flag is set + a regression-pin that
-  the flag-unset path remains byte-identical. ~50 LoC.
+- **C2 — LANDED (2026-05-21, `feature/darkness-cycle-2-p1`).**
+  Combat-damage routing through the preventer. Single-point
+  early-out at the top of `state_ops_combat.rs::deal_combat_damage`:
+  when `self.prevent_all_combat_damage_this_turn` is `true`,
+  return `Ok(())` BEFORE the plan is built. The guard sits at the
+  combat-damage routing **bottleneck** (`deal_combat_damage` is
+  the sole entry point and calls `apply_damage_pass` 1–3× per
+  combat step depending on first-strike timing), so a single
+  read site catches every plan entry — no per-source / per-entry
+  filter. Substrate-only invariant: zero LIVE callers mint the
+  flag today (Cycle 3's `Effect::PreventAllCombatDamageThisTurn`
+  resolve arm is the production mint site), so the guard is a
+  no-op on every existing cross-engine trajectory (back-compat
+  byte-equal).
+  - Implementation: ~5 LoC of executable guard + ~25 LoC of
+    rustdoc on `deal_combat_damage`'s contract change.
+  - Mirrors Python's `combat._resolve_damage_step` early-out at
+    `combat.py:479`. Python filters event-by-event with a
+    per-source `combat_damage_cant_be_prevented` bypass; Rust has
+    no equivalent printing keyword (zero cards in the current EoE
+    pool carry it), so the single-point early-out is
+    byte-equivalent at the routing surface. If a future card
+    introduces that keyword on the Rust side, a sibling cycle
+    can refine to the per-source filter (the substrate-pin tests
+    in `tests/test_darkness_cycle2.py` would surface the gap).
+  - Tests: `tests/test_darkness_cycle2.py` (13 pins covering:
+    flag-false back-compat byte-equal; flag-true unblocked /
+    blocked / multi-attacker damage zero-out; flag-true +
+    lifelink no-life-gain; flag-true + DealsDamage trigger no-
+    fire (stack-size pin); flag-true + DealtDamage trigger no-
+    fire; flag-true + trample no-spillover; flag-true does NOT
+    suppress non-combat `deal_damage`; cleanup-drain restores
+    combat next turn; flag-true leaves
+    `resolving_combat_damage_amount` slot untouched; flag-true +
+    no attackers is clean no-op; CoW invariant — clone-set-flag
+    does NOT affect source's combat).
+  - Sanity gates passing: 16/16 Cycle 1 + 13/13 Cycle 2 tests +
+    721/721 cross-engine + 636/636 (parity_smoke +
+    rust_engine_smoke + rust_bridge_parity +
+    control_change_ueot_cycle1) — no new failures vs Cycle 1
+    base.
+  - Combat-damage routing is the **only** combat-damage hot
+    path verified via the `apply_damage_pass` grep walk
+    (`grep -rn apply_damage_pass rust/src/` returns 3 call sites,
+    all inside `deal_combat_damage`); the guard's single
+    location at `deal_combat_damage`'s top covers them all.
 
 - **C3** — `Effect::PreventAllCombatDamageThisTurn` parse arm
   + resolve arm + to_pydict / from_pydict bridge round-trip
@@ -10458,11 +10495,14 @@ routing-through-a-preventer infrastructure becomes REUSABLE for
 any future single-target prevention effect (e.g. Holy Day, Healing
 Salve mode 2, Hot Soup-style first-strike prevention).
 
-**Location**: `rust/src/state.rs:2736` (field added), `rust/src/
-state_ops_setup.rs` + `rust/src/state.rs` (Clone + construction
-sites), `rust/src/state_ops_cleanup.rs` (drain function + setter /
-getter / standalone-primitive + cleanup-step inline drain), no
-combat-damage routing read site yet (Cycle 2's scope).
+**Location**: `rust/src/state.rs:2736` (field added — Cycle 1),
+`rust/src/state_ops_setup.rs` + `rust/src/state.rs` (Clone +
+construction sites — Cycle 1), `rust/src/state_ops_cleanup.rs`
+(drain function + setter / getter / standalone-primitive +
+cleanup-step inline drain — Cycle 1), `rust/src/state_ops_combat.rs::deal_combat_damage`
+(routing-point early-out guard — Cycle 2). Cycle 3's Effect
+variant / bridge round-trip / admit widen / PROBED flip remain
+outstanding.
 
 ---
 
