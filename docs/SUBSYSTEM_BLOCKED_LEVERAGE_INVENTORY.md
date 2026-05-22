@@ -708,6 +708,38 @@ upstream of this dated paragraph).
   overrides. Full Cycle 1 entry at `docs/SEARCH_LIMITATIONS.md`
   §1 (Mutinous Massacre).
 
+  **Darkness Cycle 1 landed (2026-05-21,
+  `feature/darkness-cycle-1-p1`).** Substrate-only state-channel
+  for the combat-damage prevention shape:
+  `prevent_all_combat_damage_this_turn: bool` field on
+  `GameState` (sibling of `permanent_left_battlefield_this_turn`
+  and `spell_warped_this_turn`) +
+  `grant_prevent_all_combat_damage_this_turn` PyO3 setter
+  (idempotent set-to-true) + `prevent_all_combat_damage_this_turn`
+  PyO3 `#[getter]` over the flag +
+  `clear_prevent_all_combat_damage_this_turn` standalone drain
+  primitive + cleanup-step inline drain (CR 514.3) +
+  `prevent_all_combat_damage_drained: bool` cleanup-summary key.
+  No combat-damage routing site reads the flag yet — Cycle 2
+  reroutes `state_ops_combat.rs::apply_damage_pass` through the
+  preventer; Cycle 3 adds the `Effect::PreventAllCombatDamage
+  ThisTurn` parse / resolve / bridge arms + the admit-gate
+  positive-emit widen + the PROBED flip on the 43-deck Darkness
+  printing. Substrate landing is **back-compat byte-equivalent**
+  on every production self-play / cross-engine trajectory — the
+  flag defaults to `false` at every construction site (the
+  `Clone` impl carries it forward; `make_state` /
+  `make_synthetic_state` both default it), no read site consumes
+  it, the field is NOT in the fingerprint (transient turn-scoped
+  flag, same shape as the void flags), and the new summary key
+  reads `false` on pre-Cycle-1 trajectories. Full Cycle 1 entry
+  at `docs/SEARCH_LIMITATIONS.md` "Darkness — combat-damage
+  prevention substrate missing on Rust". Independent of the
+  control-change-UEOT lane — different state channel, different
+  cleanup-step drain key, different mint shape; the two substrate
+  landings amortize against `cleanup_step_for_active_player` as
+  the shared CR-514.3-aggregator.
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 

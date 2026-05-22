@@ -10325,6 +10325,147 @@ slices.
 
 ---
 
+## Darkness — combat-damage prevention substrate missing on Rust (multi-cycle)
+
+Oracle: `{B}` Instant (DSK special-guests reprint, in the EoE
+pool — 43 17lands decks per the sibling-agent verify-first walk on
+2026-05-21) — "Prevent all combat damage that would be dealt this
+turn." Non-combat damage (direct damage / pings / `Effect::Deal
+DamageAnyTarget`) is unaffected.
+
+Shape: `target_count_range == (0, 0)`, no `slot_kinds`, no
+`x_pips`, no kicker / impending / warp / room — the Phase-3
+`(0, 0)`-shape simple-spell admit arm at
+`trajectory.py::_printing_is_bridge_simple_spell` WOULD admit it
+auto-grow-style IF the Rust substrate were present.
+
+Python side is fully wired:
+- `PreventAllCombatDamageThisTurn(Effect)` at
+  `src/mtg_bot/effects/generic/stack_control.py:254` — bare
+  `Effect` with no targets; `resolve` flips
+  `state.prevent_combat_damage_this_turn = True` (line 266).
+- `state.prevent_combat_damage_this_turn: bool = False` field on
+  `GameState` at `src/mtg_bot/game.py:2732`.
+- `combat._resolve_damage_step` consumer at
+  `src/mtg_bot/combat.py:479` — short-circuits the per-attacker /
+  blocker damage application when the flag is set.
+- Cleanup reset at `src/mtg_bot/turn.py:1102` —
+  `state.prevent_combat_damage_this_turn = False` alongside the
+  other turn-scoped flags (CR 514.3 "all damage prevention effects
+  with duration 'this turn' end at the cleanup step").
+- Parser: `src/mtg_bot/cards/parser/effects.py:4589` — the static
+  `Effect` factory returns `PreventAllCombatDamageThisTurn()`.
+
+Gaps on Rust side (verify-first walk, 2026-05-21):
+1. **State-channel substrate.** Pre-Cycle-1 Rust had ZERO
+   support for damage prevention — `grep "PreventAllCombatDamage\|
+   prevent_all_combat_damage" rust/src/*.rs` returned nothing.
+2. **Combat-damage routing.** `state_ops_combat.rs::apply_damage_
+   pass` applies combat damage unconditionally; needs a single-
+   point read-and-skip when the prevention flag is set.
+3. **Effect variant.** No `Effect::PreventAllCombatDamageThisTurn`
+   parse / resolve / serialize arms exist; the bridge round-trip
+   from Python to Rust would drop the effect on import today.
+4. **Admit gate.** `trajectory.py::_printing_is_bridge_simple_
+   spell` doesn't admit Darkness yet — the `(0, 0)`-shape `Effect`
+   bridge-import path would need the new variant emitted by
+   `_python_spell_effect_to_dict`.
+
+**Estimated substrate cost**: a 2-3 cycle subsystem lane (lighter
+than Mutinous Massacre's because the state-channel is a single
+bool, not a per-object override; the combat-damage routing is a
+single read site, not a cross-module rerouting walk). Cycle list:
+
+- **C1 — LANDED (2026-05-21, `feature/darkness-cycle-1-p1`).**
+  Substrate-only:
+  - `prevent_all_combat_damage_this_turn: bool` field on Rust
+    `GameState` (sibling of `permanent_left_battlefield_this_turn`
+    and `spell_warped_this_turn` — `rust/src/state.rs`);
+    back-compat default `false`; NOT in the fingerprint
+    (transient turn-scoped flag, same shape as the void flags),
+    so pre-Cycle-1 pinned baselines stay byte-equal. Every
+    `GameState` construction site (`make_state` at
+    `state_ops_setup.rs`, `make_synthetic_state` at `state.rs`,
+    the `Clone` impl) defaults the slot to `false`.
+  - `fn grant_prevent_all_combat_damage_this_turn(&mut self)`
+    PyO3 method on `GameState` — idempotent set-to-true setter
+    (no args; the Darkness effect is unconditional, no target).
+  - `fn prevent_all_combat_damage_this_turn(&self) -> bool`
+    PyO3 `#[getter]` over the flag; lets the future Cycle 2
+    combat-damage routing site + the Cycle 3 bridge round-trip
+    + the cross-engine harness read the state symmetrically with
+    Python's `state.prevent_combat_damage_this_turn` attribute
+    access at `combat.py:479`.
+  - `fn clear_prevent_all_combat_damage_this_turn(&mut self) ->
+    bool` standalone drain primitive returning the pre-drain
+    value as a bool. Callable independently for tests + future
+    cycles that want the drain in isolation;
+    `cleanup_step_for_active_player` ALSO drains the flag
+    inline (single bool flip, no allocation concern).
+  - `cleanup_step_for_active_player` integration (CR 514.3 drain
+    pass that resets the flag back to `false`). The cleanup
+    summary dict gains a new `prevent_all_combat_damage_drained:
+    bool` key alongside `discarded` / `damage_cleared` /
+    `ueot_cleared` / `controller_overrides_cleared` — pre-Cycle-1
+    callers reading the old four keys keep working.
+  - Tests: `tests/test_darkness_cycle1.py` (16 tests covering
+    default + snapshot, grant + readback, idempotent
+    short-circuit, cleanup drain + warm-path + standalone
+    primitive, CoW invariant for grant + drain, clone-before-
+    grant snapshot independence, summary-key composition + back-
+    compat with the four pre-existing drain keys, multi-turn
+    drain with no cross-turn leakage).
+
+  Cycle 1 is intentionally substrate-only; no combat-damage
+  routing site reads the flag yet, so production self-play +
+  cross-engine trajectories are byte-equivalent to pre-Cycle-1
+  (back-compat baseline). The Python ↔ Rust bridge round-trip is
+  NOT wired in Cycle 1 — Python keeps using its own flag,
+  Rust's flag is the parallel storage shape that Cycle 3 will
+  bidirectionalize. The substrate is sufficient for Cycle 2 to
+  reroute the combat-damage routing and verify the prevention
+  effect in isolation; full Python-Rust agreement on a real
+  Darkness trajectory requires Cycle 2 (route combat damage
+  through the preventer) and Cycle 3 (bridge round-trip + admit
+  widen + PROBED flip).
+
+- **C2** — Combat-damage routing through the preventer. Edit
+  `state_ops_combat.rs::apply_damage_pass` so the per-entry
+  damage / deathtouch / lifelink application checks
+  `state.prevent_all_combat_damage_this_turn` and short-circuits
+  to zero damage / no triggers when set. Mirror Python's
+  `combat._resolve_damage_step` early-out at `combat.py:479`.
+  Single read site; one substrate-pin test that combat damage
+  is suppressed when the flag is set + a regression-pin that
+  the flag-unset path remains byte-identical. ~50 LoC.
+
+- **C3** — `Effect::PreventAllCombatDamageThisTurn` parse arm
+  + resolve arm + to_pydict / from_pydict bridge round-trip
+  + cross-engine harness admit widen (Phase-3 `(0, 0)`-shape
+  simple-spell admit auto-grow already supports the shape; the
+  per-spell `_python_spell_effect_to_dict` positive-emit path
+  is the only widen needed) + the PROBED flip (Darkness joins
+  the PROBED set from the BLOCKED-Effect-uncovered single-gated
+  list — `docs/SUBSYSTEM_BLOCKED_LEVERAGE_INVENTORY.md` §3 (3)
+  Effect-uncovered diffuse tail). ~150 LoC + 4 cross-engine
+  probes.
+
+Pool-flip per the cycle list: 1 card (Darkness) at 43 17lands
+decks. Lighter pool reach than the Mutinous-Massacre /
+Systems-Override pair (~10k decks each), but the substrate is
+also lighter (2-3 cycles vs 4-5) and the Cycle 2 combat-damage-
+routing-through-a-preventer infrastructure becomes REUSABLE for
+any future single-target prevention effect (e.g. Holy Day, Healing
+Salve mode 2, Hot Soup-style first-strike prevention).
+
+**Location**: `rust/src/state.rs:2736` (field added), `rust/src/
+state_ops_setup.rs` + `rust/src/state.rs` (Clone + construction
+sites), `rust/src/state_ops_cleanup.rs` (drain function + setter /
+getter / standalone-primitive + cleanup-step inline drain), no
+combat-damage routing read site yet (Cycle 2's scope).
+
+---
+
 When you take a deliberate shortcut (heuristic, approximation,
 incomplete CR conformance), add a section here with:
 - Where in the code (file:line)

@@ -517,6 +517,27 @@ impl GameState {
         // bf to filter-stamp).
         self.loyalty_activated_this_turn.clear();
 
+        // (3c) Darkness-shape combat-damage prevention substrate —
+        // Cycle 1 (2026-05-21): drain the state-level
+        // `prevent_all_combat_damage_this_turn` flag back to `false`.
+        // CR 514.3 — "all damage prevention effects with duration
+        // 'this turn' end at the cleanup step". Mirrors Python's
+        // `state.prevent_combat_damage_this_turn = False` at
+        // `src/mtg_bot/turn.py:1102`. Substrate-only in Cycle 1 —
+        // no live mint site has landed yet (no Effect arm sets the
+        // flag), but the drain is part of the substrate contract:
+        // if a future cycle stamps the flag and forgets to clear
+        // it, the prevention would silently leak across turns.
+        //
+        // Cheaper than the per-permanent UEOT-modifier drain above
+        // — this is a single bool flip, no CoW / Arc::make_mut
+        // bookkeeping. Returns true iff the flag was set before
+        // the drain (so the summary dict reports a drain-happened
+        // signal that future Cycle 2/3/4 assertions can pin).
+        let prevent_all_combat_damage_drained: bool =
+            self.prevent_all_combat_damage_this_turn;
+        self.prevent_all_combat_damage_this_turn = false;
+
         let d = PyDict::new(py);
         d.set_item("discarded", discarded)?;
         d.set_item("damage_cleared", damage_cleared)?;
@@ -529,6 +550,18 @@ impl GameState {
         // compat. Substrate-only — every value will be 0 until
         // Cycle 4 mints overrides.
         d.set_item("controller_overrides_cleared", controller_overrides_cleared)?;
+        // Darkness-shape combat-damage prevention substrate —
+        // Cycle 1 (2026-05-21): surface the drain signal alongside
+        // the other CR-514.3 drain counts. `true` iff the flag was
+        // set before the drain (Cycle 1's substrate-only landing
+        // means this is `false` on every pre-Cycle-3 trajectory —
+        // no mint site exists yet). Callers reading the dict with
+        // a default fallback (`.get("prevent_all_combat_damage_
+        // drained", False)`) stay back-compat.
+        d.set_item(
+            "prevent_all_combat_damage_drained",
+            prevent_all_combat_damage_drained,
+        )?;
         Ok(d)
     }
 
@@ -605,5 +638,111 @@ impl GameState {
         slf.call_method0("advance_phase")?;
 
         Ok(())
+    }
+}
+
+/// **Darkness-shape combat-damage prevention substrate — Cycle 1
+/// (2026-05-21).** Standalone-impl-block append for the per-state
+/// `prevent_all_combat_damage_this_turn` flag's PyO3 surface +
+/// standalone cleanup-step drain primitive. New impl block (not
+/// touching the surrounding control-change-UEOT impl block above)
+/// to keep this lane's diff append-only against concurrent agents'
+/// edits to the existing block — the crate is configured with
+/// `multiple-pymethods` so multiple `#[pymethods] impl GameState`
+/// blocks coexist by design (see the per-`state_ops_*.rs` module
+/// pattern).
+///
+/// The substrate provides:
+/// - `grant_prevent_all_combat_damage_this_turn` — idempotent
+///   set-to-true setter (no args; mirrors Python's
+///   `state.prevent_combat_damage_this_turn = True` write at
+///   `effects/generic/stack_control.py:266`).
+/// - `prevent_all_combat_damage_this_turn` — `#[getter]` over the
+///   flag; lets the future Cycle 2 combat-damage routing site +
+///   the Cycle 3 bridge round-trip + the cross-engine harness
+///   read the state symmetrically with Python's
+///   `state.prevent_combat_damage_this_turn` attribute access.
+/// - `clear_prevent_all_combat_damage_this_turn` — standalone
+///   drain primitive returning the pre-drain value as a bool so
+///   tests can assert the drain in isolation without composing
+///   the full `cleanup_step_for_active_player` summary.
+#[pymethods]
+impl GameState {
+    /// **Darkness-shape combat-damage prevention substrate — Cycle 1
+    /// (2026-05-21).** Stamp the state-level "all combat damage is
+    /// prevented this turn" flag.
+    ///
+    /// Substrate-only in Cycle 1: this method writes the flag
+    /// directly. No live caller routes through it yet — Cycle 3's
+    /// `Effect::PreventAllCombatDamageThisTurn` resolve arm
+    /// (Darkness, `{B}` Instant) will call this from Rust;
+    /// cross-engine tests / future Cycle 3 bridge round-trip can
+    /// call it directly to mirror Python's
+    /// `PreventAllCombatDamageThisTurn.resolve` write at
+    /// `src/mtg_bot/effects/generic/stack_control.py:266`.
+    ///
+    /// **Idempotent set-to-true.** Calling this on a state that
+    /// already has the flag set is a no-op (the flag stays `true`,
+    /// no observable change). Mirrors the Python write site (a
+    /// bare `state.prevent_combat_damage_this_turn = True`) which
+    /// is also idempotent.
+    ///
+    /// **No CoW concern.** The flag is a `bool` on `GameState`,
+    /// not a per-zone field, so the assignment is a single byte
+    /// write — no `Arc::make_mut` is needed. A cloned state's
+    /// flag is independent of the source's (the `Clone` impl
+    /// already carries the value forward at clone time).
+    ///
+    /// **No args.** Darkness's effect is unconditional: prevent
+    /// ALL combat damage this turn. Future variants (e.g. "prevent
+    /// combat damage this turn dealt to you / your creatures")
+    /// would need a NEW per-player or per-target flag, not a
+    /// re-parameterization of this one.
+    fn grant_prevent_all_combat_damage_this_turn(&mut self) {
+        self.prevent_all_combat_damage_this_turn = true;
+    }
+
+    /// **Darkness-shape combat-damage prevention substrate — Cycle 1
+    /// (2026-05-21).** Read-only getter for the state-level "all
+    /// combat damage is prevented this turn" flag.
+    ///
+    /// Substrate-only in Cycle 1: no Rust call site consumes the
+    /// flag yet — Cycle 2 will reroute combat-damage routing
+    /// through the preventer; Cycle 3 wires the bridge round-trip.
+    /// Cross-engine tests + the harness can read the flag via this
+    /// getter to mirror Python's attribute-access read pattern at
+    /// `combat.py:479` (`if state.prevent_combat_damage_this_turn:
+    /// ...`).
+    ///
+    /// The PyO3 `#[getter]` annotation makes the field reachable
+    /// from Python as `state.prevent_all_combat_damage_this_turn`
+    /// (no parens — attribute access matching Python's read site
+    /// shape), keeping the Rust API ergonomic for cross-engine
+    /// parity assertions.
+    #[getter]
+    fn prevent_all_combat_damage_this_turn(&self) -> bool {
+        self.prevent_all_combat_damage_this_turn
+    }
+
+    /// **Darkness-shape combat-damage prevention substrate — Cycle 1
+    /// (2026-05-21).** Standalone drain primitive — reset the
+    /// state-level "all combat damage is prevented this turn" flag
+    /// back to `false` and return the pre-drain value as a bool.
+    /// CR 514.3 — "all damage prevention effects with duration
+    /// 'this turn' end at the cleanup step".
+    ///
+    /// Returns `true` iff the flag was set before the drain.
+    /// Callable independently for tests that want to assert the
+    /// drain in isolation from the full `cleanup_step_for_active_
+    /// player` composition; `cleanup_step_for_active_player` ALSO
+    /// drains the flag inline (single bool flip, no allocation
+    /// concern — both call sites share the substrate contract).
+    ///
+    /// Mirrors Python's `state.prevent_combat_damage_this_turn =
+    /// False` at `src/mtg_bot/turn.py:1102`.
+    fn clear_prevent_all_combat_damage_this_turn(&mut self) -> bool {
+        let was_set = self.prevent_all_combat_damage_this_turn;
+        self.prevent_all_combat_damage_this_turn = false;
+        was_set
     }
 }

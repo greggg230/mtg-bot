@@ -490,5 +490,10 @@ pub fn make_state(
         // slot; None at construction; set during a modal-or-both
         // spell-cast resolution.
         current_resolve_chosen_mode_idxs: None,
+        // Darkness-shape combat-damage prevention substrate —
+        // Cycle 1 (2026-05-21): fresh games start with no active
+        // combat-damage prevention. Back-compat default; no
+        // fingerprint impact (transient turn-scoped flag).
+        prevent_all_combat_damage_this_turn: false,
     })
 }
