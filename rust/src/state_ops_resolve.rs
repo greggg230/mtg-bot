@@ -170,6 +170,7 @@ use crate::cards::{parse_printing, Effect, Event, RegistryData, TargetFilter};
 use crate::state::{
     GameObject, GameState, PendingDecision, StackItem, StackItemKind, UeotModifier,
 };
+use crate::state_ops_cleanup::effective_controller_id;
 use crate::state_ops_decisions::auto_resolve_pending;
 use crate::state_ops_zones::{
     mark_left_battlefield_if_nonland, ZONE_BATTLEFIELD, ZONE_EXILE,
@@ -578,7 +579,14 @@ fn move_aura_post_resolve(
                     if !type_ok {
                         break 'outer;
                     }
-                    if yours_only && obj.controller != controller_id {
+                    // **Cycle 2.5 reroute (gameplay-decision):**
+                    // resolve-time `yours_only` target legality must
+                    // observe the effective controller (override-aware)
+                    // so a UEOT control-stamp on the target flips legality
+                    // mid-turn per CR 608.2b. Substrate-only: identical
+                    // to the raw read when no override is set (every
+                    // pre-C4 trajectory).
+                    if yours_only && effective_controller_id(obj) != controller_id {
                         break 'outer;
                     }
                     matched = Some(obj.id);
@@ -1603,6 +1611,15 @@ pub(crate) fn drain_pending_etb_dispatches(state: &mut GameState) -> PyResult<()
 /// control this turn" counter. Returns `None` if the id isn't on a
 /// battlefield (defensive — the drainer's queue only carries
 /// just-pushed bf ids, so the lookup hits in the live path).
+///
+/// **Cycle 2.5 reroute (gameplay-decision):** the per-player
+/// "entered under your control this turn" counter is gated on the
+/// effective controller (override-aware). When Mutinous Massacre /
+/// Systems Override mints a UEOT control stamp on a freshly-ETB'd
+/// permanent (rare today since the C4/C5 mint sites target already-
+/// resident permanents, not ETBs in the same resolve), the counter
+/// flips to credit the override-controller. Substrate-only: byte-
+/// equal to the raw read on every pre-C4 trajectory.
 fn find_bf_controller_and_printing(
     state: &GameState,
     obj_id: u32,
@@ -1610,7 +1627,7 @@ fn find_bf_controller_and_printing(
     for player in state.players.iter() {
         for obj in player.battlefield.iter() {
             if obj.id == obj_id {
-                return Some((obj.controller as usize, obj.printing_id));
+                return Some((effective_controller_id(obj) as usize, obj.printing_id));
             }
         }
     }
@@ -8393,11 +8410,19 @@ fn apply_effect(
                 // by a control-changing effect (Tractor Beam's
                 // `attached_grants_control`); surfaced by the
                 // bench-loader admit follow-up — arch14/s4/step2249.
+                //
+                // **Cycle 2.5 reroute (gameplay-decision):** the
+                // controller-restricted target filter must observe the
+                // effective controller (override-aware) so a UEOT
+                // control stamp (Mutinous Massacre / Systems Override)
+                // flips legality the same way the Aura-static-grant
+                // path does. Substrate-only: byte-equal to the raw
+                // read when no override is set.
                 let target_id: Option<u32> =
                     crate::bf_iter::bf_iter_etb_sorted(state)
                         .into_iter()
                         .find_map(|obj| {
-                            if obj.controller != controller {
+                            if effective_controller_id(obj) != controller {
                                 return None;
                             }
                             let printing = state
@@ -8744,7 +8769,12 @@ fn apply_effect(
                         .find(|o| o.id == t0)
                     {
                         // Still controlled by the caster?
-                        if obj.controller == controller {
+                        // **Cycle 2.5 reroute (gameplay-decision):**
+                        // CR 608.2b re-legality is an effective-
+                        // controller question (override-aware), so a
+                        // UEOT control stamp post-cast flips the slot-0
+                        // friendly target check.
+                        if effective_controller_id(obj) == controller {
                             my_pidx = Some(pidx);
                         }
                         break 'find0;
@@ -8802,7 +8832,10 @@ fn apply_effect(
                         .iter()
                         .find(|o| o.id == t1)
                     {
-                        if obj.controller != controller {
+                        // **Cycle 2.5 reroute (gameplay-decision):**
+                        // CR 608.2b re-legality "opponent-controlled"
+                        // is an effective-controller question.
+                        if effective_controller_id(obj) != controller {
                             opp_pidx = Some(pidx);
                         }
                         break 'find1;
@@ -12303,7 +12336,12 @@ fn apply_effect(
                 {
                     // Opponent-controlled (controller of the obj is not
                     // the source's controller) AND a creature.
-                    if obj.controller == controller {
+                    // **Cycle 2.5 reroute (gameplay-decision):** CR
+                    // 608.2b "became own creature → fizzle" must read
+                    // the effective controller so a UEOT control stamp
+                    // (Mutinous Massacre flipping target to caster) is
+                    // honored as a "became your creature" fizzle.
+                    if effective_controller_id(obj) == controller {
                         return Ok(()); // became own creature → fizzle
                     }
                     let printing = match state
@@ -13939,7 +13977,17 @@ fn apply_effect(
             let target: Option<(usize, u32)> = crate::bf_iter::bf_iter_etb_sorted(state)
                 .into_iter()
                 .find_map(|obj| {
-                    if obj.controller == src_controller {
+                    // **Cycle 2.5 reroute (gameplay-decision):**
+                    // resolve-time "opponent-controls" target filter
+                    // must read effective controller so a UEOT
+                    // override is honored. NOTE: the second
+                    // `obj.controller as usize` below is a
+                    // zone-residency lookup (which player's bf Vec
+                    // holds the object) and stays raw — `obj.controller`
+                    // is never mutated by `grant_control_change_ueot`,
+                    // so it remains the original owner-pidx for the
+                    // bf-Vec key.
+                    if effective_controller_id(obj) == src_controller {
                         return None; // opponent-only filter
                     }
                     let printing = state.registry.lookup(obj.printing_id)?;
@@ -17844,8 +17892,11 @@ fn apply_effect(
             let payload_target_opt = state.current_resolve_payload_target_id;
             // Helper: object is a qualifying Spacecraft-or-Planet
             // permanent the source-controller controls.
+            // **Cycle 2.5 reroute (gameplay-decision):** "the source-
+            // controller controls" target filter is effective-
+            // controller (override-aware).
             let qualifies = |obj: &GameObject| -> bool {
-                if obj.controller != controller_id {
+                if effective_controller_id(obj) != controller_id {
                     return false;
                 }
                 let Some(printing) = state.registry.lookup(obj.printing_id) else {

@@ -9849,6 +9849,101 @@ per-card slice. Cycle list:
   grow the factor in lockstep — the literal +10 here is byte-equal
   with Python in the absence of Loading Zone. Tracked as a future
   micro-cycle when Loading Zone's broader blocker closes.
+- **C2.5 — LANDED (2026-05-22, `feature/control-change-ueot-cycle-2-5-p1`).**
+  Resolve-side scan reroutes — closes the Cycle 2 deferred work
+  inside `rust/src/state_ops_resolve.rs`. Cycle 2 explicitly
+  documented ~30+ source-controller multi-zone scans as kept-raw on
+  the grounds that no live mint site existed (substrate-equivalent);
+  with Cycle 4 (Mutinous Massacre) + Cycle 5 (Systems Override)
+  minting live `controller_override` values, resolve-side scans of
+  `obj.controller` on bf permanents MAY observe stale values. C2.5
+  audits + reroutes only the explicit gameplay-decision sites.
+  - **Sites surveyed:** ~75 multi-zone scan-shapes across the file
+    (the `'outer: for player in &state.players` / `state.players
+    .iter()` prefix). Of these:
+    - **8 sites rerouted through `effective_controller_id`** — all
+      explicit "controlled by X" / "controlled by NOT-X" / yours_only
+      target-legality predicates at resolve time:
+      * `resolve_aura_post_resolve`: Aura `yours_only` enchant-target
+        re-legality (`state_ops_resolve.rs:581`).
+      * `find_bf_controller_and_printing` helper: per-player
+        "entered under your control this turn" ETB counter
+        attribution (line 1621).
+      * `BiosynthicBurstEffect`: controller-restricted target filter
+        (the +1/+1 counter + 3-keyword grant predicate; line 8425).
+      * `InvasiveManeuversEffect`-shape arm slot-0 friendly + slot-1
+        opponent CR 608.2b re-legality (lines 8763 + 8821).
+      * `TaintedHonor`-shape "became own creature → fizzle" CR 608.2b
+        (line 12330).
+      * `TapTargetOpponentPermanentAndStunIt`: opponent-only filter
+        (line 13942).
+      * `CompletePlanetaryAssault`-shape source-controller-controls
+        target qualifier (line 17887).
+    - **~28 sites kept-raw as source-controller multi-zone scans
+      for the resolving spell.** Pattern: `src_controller =
+      Some(obj.controller)` inside a 5-zone walk to recover the
+      spell's source's controller (with a stack-fallback to
+      `item.controller`). This is **caster identity**, not
+      affected by UEOT control change — the spell's source object
+      is on the stack / in hand / in graveyard / etc., never on
+      a bf with an override stamped, and the override is a
+      bf-scoped UEOT effect. **Kept raw.**
+    - **~26 sites kept-raw as StackItem.controller reads.**
+      Companion to the source-controller class — the
+      `state.stack.iter().find(...).map(|i| i.controller)`
+      fallback. StackItem's `controller` is the cast-time
+      authoritative caster, not the override target. **Kept raw.**
+    - **~12 sites kept-raw as constructor-writes.** Pattern:
+      `obj.controller = controller_u8` on fresh GameObjects (e.g.
+      token mints, search-into-bf, reanimation). The Cycle-1
+      back-compat default sets `controller_override = None` on
+      every newly-constructed object, so writes to `controller`
+      are correct without the helper. **Kept raw.**
+    - **~30 sites kept-raw as zone-residency lookups via
+      `obj.controller as usize`.** Pattern: `(obj.controller as
+      usize, obj.id)` used downstream to index `state.players[
+      pidx].battlefield` for the bf-Vec mutation. Critical
+      invariant: `grant_control_change_ueot` writes ONLY
+      `controller_override`; `obj.controller` is never mutated.
+      So `obj.controller as usize` continues to equal the
+      original bf-owner pidx (the storage key) even when an
+      override is stamped — the bf-storage lookup remains
+      correct. **Kept raw.** (Rerouting through
+      `effective_controller_id` here would be incorrect: the
+      helper returns the override pid, which is NOT the bf-Vec
+      key for an overridden permanent.)
+    - **~3 sites kept-raw as trigger-observer reads.** Pattern:
+      `dispatch_event` building observer entries from bf + non-bf
+      zones + the stack store. Rerouting these would extend the
+      Cycle 2 work into the dispatch-side path that owns a
+      separate substrate (trigger-firing controller for `you`-
+      shape triggers). **Deferred** to a future cycle; out of
+      scope for C2.5's pure-resolve focus. Pre-C5 production
+      trajectories do not exercise override + trigger firing
+      together — the Mutinous Massacre / Systems Override resolve
+      arms inline their post-mint behavior rather than re-walking
+      via triggers — so the gap is latent today.
+  - **LoC delta:** ~120 lines added (rationale comments alongside
+    each reroute) / 8 lines materially changed (the actual
+    `obj.controller` → `effective_controller_id(obj)` substitutions
+    + one `use crate::state_ops_cleanup::effective_controller_id`
+    line in the imports header).
+  - **Tests:** `tests/test_control_change_ueot_cycle25.py` (4
+    tests): baseline-no-override-rerouted-filter-byte-equal-to-raw,
+    override-flips-opp-creature-into-controller-restricted-filter
+    (the reroute pin — pre-C2.5 this assertion would fail because
+    raw controller wouldn't agree with caster), cleanup-drain-
+    reverts (composes Cycle-1 drain + C2.5 reroutes uniformly), and
+    helper-equivalence-no-override (substrate byte-equality pin).
+    Drives the `BiosynthicBurstEffect` controller-restricted filter
+    as the live observable for the reroute behavior.
+  - **Substrate-only invariant maintained for pre-C4 trajectories.**
+    Every reroute is byte-equal to the raw read when no override is
+    set (which is every state on every pre-C4 trajectory and the
+    overwhelming majority of post-C4/C5 states — only specific
+    Mutinous Massacre / Systems Override resolve arms mint live
+    overrides). The full pytest sanity gate stays green with only
+    the pre-existing C5-base baseline failures.
 - **C6** — Threaten / Act-of-Treason / Sothera’s Requiem are
   cross-set siblings (not in EoE; deferred but the substrate
   carries the same shape) + agent-prompt extension (live agent-
