@@ -2421,11 +2421,24 @@ impl GameState {
         //     exclusion contract: this constructor leaves
         //     `chosen_mode_idx` `None`.
         //   - Default (single-pick modal OR non-modal OR additional-
-        //     cost): route to `new_spell_with_targets_mode_and_addcost`
+        //     cost): route to `new_spell_with_targets_mode_addcost_and_x`
         //     which carries the cast-time-bound target(s) PLUS the
         //     single-pick modal idx PLUS the additional-cost choice
-        //     id. The multi-pick sibling is `None` in this
-        //     constructor.
+        //     id PLUS the cast-time-bound X value (Cycle 1 substrate
+        //     — passes `None` here; Cycle 2/3 will mint X-cost
+        //     bindings for Zero Point Ballad / Devastating Onslaught).
+        //     The multi-pick sibling is `None` in this constructor.
+        //
+        // **X-value subsystem Cycle 1 (2026-05-21).** The new
+        // `x_value` constructor parameter is hard-coded to `None`
+        // at this site — Cycle 1 is substrate-only, no live mint
+        // site is wired yet (the cast-pipeline detector that reads
+        // `mc.x_pips > 0` and binds the deterministic-first X via
+        // pay-all-floating no-agent fallback is Cycle 2/3 work).
+        // Back-compat invariant: every existing cross-engine
+        // trajectory stays byte-identical because every push here
+        // sets `x_value: None`, the resolver swap is a no-op for
+        // `None`, and no Effect arm reads the transient yet.
         if let Some(idxs) = bound_mode_idxs {
             self.stack.push(crate::state::StackItem::new_spell_with_targets_and_modes(
                 obj_id,
@@ -2435,13 +2448,15 @@ impl GameState {
                 Some(idxs),
             ));
         } else {
-            self.stack.push(crate::state::StackItem::new_spell_with_targets_mode_and_addcost(
+            self.stack.push(crate::state::StackItem::new_spell_with_targets_mode_addcost_and_x(
                 obj_id,
                 player_id,
                 bound_target,
                 bound_target_2,
                 bound_mode_idx,
                 bound_additional_cost_choice_id,
+                // X-value subsystem Cycle 1: no live mint site.
+                None,
             ));
         }
         // Delta 7: priority/passes reset, verbatim from

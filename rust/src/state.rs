@@ -1251,6 +1251,49 @@ pub struct StackItem {
     /// **Default `None` everywhere** (every pre-widen StackItem
     /// constructor + back-compat synthetic test pushes).
     pub chosen_mode_idxs: Option<Vec<u8>>,
+    /// **X-value subsystem — Cycle 1 (cast-time X bind envelope,
+    /// 2026-05-21).** The cast-time-bound X value for a
+    /// `StackItemKind::Spell` whose printing carries an X-cost shape
+    /// (today: Zero Point Ballad, Devastating Onslaught — both
+    /// gate-declined pre-substrate; siblings as the lane unlocks
+    /// more X-cost cards). Mirrors Python's `StackItem.x_value:
+    /// Optional[int]` (`game.py`) — the X picked at cast time per
+    /// CR 601.2f-h (X is set when the spell is announced and the
+    /// total cost is then computed; storing it on the StackItem
+    /// lets the resolve arm replay the choice without re-deriving
+    /// it from mana paid).
+    ///
+    /// **Wire shape**: cast pipeline (Cycle 2/3) will populate
+    /// `Some(x)` for X-cost spells; the resolve arm reads it via
+    /// the `state.current_resolve_x_value` transient (the save →
+    /// set → restore swap pattern, mirroring its sibling slots like
+    /// `current_resolve_chosen_mode_idx` /
+    /// `current_resolve_additional_cost_choice_id`). `None` for
+    /// every non-X-cost spell — back-compat byte-identical to the
+    /// pre-Cycle-1 push.
+    ///
+    /// **Cycle 1 substrate-only scope.** This field stores the X
+    /// value; NO cast site mints it yet (Cycle 2/3 will add the
+    /// admit-predicate widen + cast-pipeline binding for X-cost
+    /// spells). Until that lands, every pre-substrate stack item
+    /// pushes `None` here, so the field is parity-NEUTRAL — every
+    /// cross-engine trajectory stays byte-identical. The resolve-
+    /// arm consumers (`Effect::ZeroPointBallad`,
+    /// `Effect::DevastatingOnslaught`) are also Cycle 3+ work.
+    ///
+    /// **Signed `i32`** (not `u32`): CR 107.1b allows X=0 but never
+    /// negative on a cast, yet the SoT-parity signedness matches
+    /// Python's `int` field shape and leaves room for future
+    /// `Effect::*` variants that may treat X arithmetic (e.g. "X
+    /// minus 1") natively. The cast-time bind always emits non-
+    /// negative values; downstream arms can `clamp(0, ...)` or
+    /// saturate as needed.
+    ///
+    /// **NOT in the per-StackItem fingerprint tuple** so pre-
+    /// substrate stacks stay byte-equal — same discipline as
+    /// `chosen_mode_idx` / `additional_cost_choice_id` /
+    /// `chosen_mode_idxs`.
+    pub x_value: Option<i32>,
 }
 
 impl StackItem {
@@ -1282,6 +1325,11 @@ impl StackItem {
             // The multi-pick sibling is `None` here too — same
             // back-compat reasoning.
             chosen_mode_idxs: None,
+            // **X-value subsystem Cycle 1 (2026-05-21).** The bare
+            // untargeted spell push doesn't go through the X-cost
+            // detector (Cycle 2/3 work); default `None` is back-
+            // compat-correct for every pre-cycle non-X-cost spell.
+            x_value: None,
         }
     }
 
@@ -1337,20 +1385,27 @@ impl StackItem {
             // scour-for-scrap-slice Cycle 1 widen — `None` for the
             // non-or_both target-binding pathway.
             chosen_mode_idxs: None,
+            // X-value subsystem Cycle 1: `None` for every non-X-cost
+            // pathway (every closed Phase-1 single-target / Phase-2
+            // 2-slot caller is on a non-X-cost spell, so the back-
+            // compat default holds).
+            x_value: None,
         }
     }
 
     /// **ModalChooseOne envelope — Cycle 1 (cast-time mode binding,
     /// 2026-05-21) + Close Encounter additional-cost-choice envelope
-    /// — Cycle 2 (cast-time choice binding, 2026-05-21).** Spell-
+    /// — Cycle 2 (cast-time choice binding, 2026-05-21) + X-value
+    /// subsystem — Cycle 1 (cast-time X bind, 2026-05-21).** Spell-
     /// shape constructor that carries the cast-time-picked mode
-    /// index PLUS the cast-time-bound additional-cost choice id.
-    /// Mirrors `new_spell_with_targets` for the target-carrying
-    /// superset; extends with the mode-index slot for modal spells
-    /// whose printed `spell_effect` is an
-    /// `Effect::ChooseOneMode { modes }` AND the additional-cost
-    /// choice-id slot for spells whose printing carries
-    /// `additional_cost_choose_your_creature = true`.
+    /// index PLUS the cast-time-bound additional-cost choice id PLUS
+    /// the cast-time-bound X value. Mirrors `new_spell_with_targets`
+    /// for the target-carrying superset; extends with the mode-index
+    /// slot for modal spells, the additional-cost choice-id slot for
+    /// spells whose printing carries
+    /// `additional_cost_choose_your_creature = true`, AND the X-value
+    /// slot for X-cost spells (Zero Point Ballad, Devastating
+    /// Onslaught — Cycle 2/3 wires the cast-pipeline binding).
     ///
     /// Usage: `cast_spell_noncreature` detects each shape
     /// independently:
@@ -1363,32 +1418,39 @@ impl StackItem {
     ///   caster's battlefield-creatures + warped-creature exile
     ///   cards for the deterministic-first eligible id (matching
     ///   Python's no-agent fallback at `actions.py:1737-1745`).
+    /// - X-cost detection (Cycle 2/3 — NOT wired in Cycle 1) will
+    ///   read `printing.mana_cost.x_pips > 0` and pick the
+    ///   deterministic-first X via the pay-all-floating no-agent
+    ///   fallback (mirrors Python's `actions._pick_x_cost_at_cast`).
     ///
-    /// The fields are independent — a non-modal additional-cost
-    /// spell sets `chosen_mode_idx = None,
-    /// additional_cost_choice_id = Some(id)`, and a modal non-
-    /// additional-cost spell sets the inverse. Non-modal /
-    /// non-additional-cost spells set both to `None` (back-compat
-    /// byte-equal to the pre-cycle `new_spell_with_targets` push).
+    /// The fields are independent — every combinatorial subset is
+    /// valid (a non-modal non-additional-cost non-X-cost spell sets
+    /// all four to `None`, byte-equal to the pre-cycle
+    /// `new_spell_with_targets` push).
     ///
     /// The bound mode is read at resolve time by the
     /// `Effect::ChooseOneMode` arm (already wired); the bound
     /// additional-cost choice is read by the
-    /// `Effect::CloseEncounterEffect` arm (Cycle 3 — when the
-    /// resolve arm reads
-    /// `state.current_resolve_additional_cost_choice_id` to compute
-    /// the damage amount).
+    /// `Effect::CloseEncounterEffect` arm; the bound X is read by
+    /// future `Effect::ZeroPointBallad` /
+    /// `Effect::DevastatingOnslaught` arms via the
+    /// `state.current_resolve_x_value` transient swap.
     ///
-    /// Cycles 1+2 ship this constructor + the cast-time binds + the
-    /// transient swaps; Cycle 3 wires the
-    /// `Effect::CloseEncounterEffect` consumer.
-    pub(crate) fn new_spell_with_targets_mode_and_addcost(
+    /// **Subsumption of the prior `new_spell_with_targets_mode_and_addcost`**
+    /// (commit `17dc7d02` precedent — clean replacement, not a
+    /// fallback hybrid, per the no-fallback-hybrid discipline).
+    /// Cycle 1 has only one production call site (`state_ops_cast.rs`
+    /// `cast_spell_noncreature`) and zero pre-existing test call
+    /// sites, so the parameter addition is byte-clean with a single
+    /// `None` literal at the call site.
+    pub(crate) fn new_spell_with_targets_mode_addcost_and_x(
         source_obj_id: u32,
         controller: u8,
         target_obj_id: Option<u32>,
         target_obj_id_2: Option<u32>,
         chosen_mode_idx: Option<u8>,
         additional_cost_choice_id: Option<u32>,
+        x_value: Option<i32>,
     ) -> Self {
         Self {
             source_obj_id,
@@ -1405,6 +1467,7 @@ impl StackItem {
             // inverse path (sets `chosen_mode_idxs`, leaves
             // `chosen_mode_idx` `None`).
             chosen_mode_idxs: None,
+            x_value,
         }
     }
 
@@ -1452,6 +1515,12 @@ impl StackItem {
             // choose-your-creature pathway — leave `None`.
             additional_cost_choice_id: None,
             chosen_mode_idxs,
+            // X-value subsystem Cycle 1: `or_both` modal spells
+            // are not on the X-cost pathway (different cast-time
+            // detector branch — X-cost reads `mc.x_pips > 0` and
+            // modal reads `effects[0] is ChooseOneMode`); leave
+            // `None`.
+            x_value: None,
         }
     }
 
@@ -1501,6 +1570,11 @@ impl StackItem {
             // only rationale — the multi-pick slot is `None` for
             // every trigger.
             chosen_mode_idxs: None,
+            // X-value subsystem Cycle 1: same Spell-kind-only
+            // rationale — X-cost binding happens on the spell-cast
+            // pathway per CR 601.2f-h; triggers don't carry an X
+            // value. `None` for every trigger.
+            x_value: None,
         }
     }
 
@@ -1542,6 +1616,8 @@ impl StackItem {
             additional_cost_choice_id: None,
             // scour-for-scrap-slice Cycle 1 widen: Spell-kind-only.
             chosen_mode_idxs: None,
+            // X-value subsystem Cycle 1: Spell-kind-only.
+            x_value: None,
         }
     }
 }
@@ -2733,6 +2809,43 @@ pub struct GameState {
     /// Transient like its single-pick sibling; not serialized into
     /// the fingerprint.
     pub current_resolve_chosen_mode_idxs: Option<Vec<u8>>,
+    /// **X-value subsystem — Cycle 1 (resolve-time transient mirror,
+    /// 2026-05-21).** Transient resolve-time mirror of the
+    /// resolving spell's `StackItem.x_value`. Set by the stack
+    /// resolver (`resolve_top_of_stack` / `resolve_top_of_stack_pause`)
+    /// BEFORE the per-effect `apply_effect` fan-out for a
+    /// `StackItemKind::Spell` whose pushed item carries a cast-time-
+    /// bound X value; restored to its prior value after. Future
+    /// `Effect::ZeroPointBallad` / `Effect::DevastatingOnslaught`
+    /// resolve arms (Cycle 3+) will read this field — `Some(x)` is
+    /// the cast-time chosen X; `None` means no X was bound (the
+    /// spell wasn't X-cost, so the resolve arm — if hit — should be
+    /// a no-op fallback).
+    ///
+    /// **Mirrors Python's `state.resolving_x_value` swap** at
+    /// `actions.py` (set BEFORE the resolve closure, restored to
+    /// `None` in the `finally`). Same save → set → restore
+    /// bracketing as `current_resolve_chosen_mode_idx` /
+    /// `current_resolve_additional_cost_choice_id`.
+    ///
+    /// **Why a transient field instead of threading through
+    /// apply_effect.** Same rationale as every sibling transient:
+    /// apply_effect has ~90 arms, threading an `Option<i32>` through
+    /// every signature is invasive for surfaces that don't care.
+    /// Mirror the existing payload-target / mode-index / addcost
+    /// swap pattern.
+    ///
+    /// **Not serialized into the fingerprint.** Transient like its
+    /// payload-target / source-controller / mode-index / addcost
+    /// siblings — same observable game state pre- and post-resolve
+    /// produces the same digest regardless of intermediate X-value
+    /// swaps.
+    ///
+    /// **Cycle 1 substrate-only.** NO live mint site populates this
+    /// field today; every pre-substrate stack push pushes
+    /// `x_value: None`, so the swap is a no-op and the back-compat
+    /// invariant holds byte-identical.
+    pub current_resolve_x_value: Option<i32>,
 }
 
 impl Clone for GameState {
@@ -2822,6 +2935,12 @@ impl Clone for GameState {
             // `None` outside the resolve window by construction.
             current_resolve_additional_cost_choice_id:
                 self.current_resolve_additional_cost_choice_id,
+            // X-value subsystem Cycle 1. Transient X-value slot;
+            // cloned as `Option<i32>` (Copy). Bracketed by the
+            // resolver — `None` outside the resolve window by
+            // construction, so any mid-resolve clone still sees a
+            // deterministic snapshot.
+            current_resolve_x_value: self.current_resolve_x_value,
         }
     }
 }
@@ -3616,5 +3735,11 @@ pub fn make_synthetic_state(
         // `top.chosen_mode_idxs` for the multi-pick (or_both=True)
         // dispatch window.
         current_resolve_chosen_mode_idxs: None,
+        // X-value subsystem Cycle 1: transient X-value slot. `None`
+        // until the resolver swaps in `top.x_value` for the duration
+        // of an apply_effect call (Cycle 3+ will wire the
+        // `Effect::ZeroPointBallad` / `Effect::DevastatingOnslaught`
+        // resolve arms to read it).
+        current_resolve_x_value: None,
     }
 }

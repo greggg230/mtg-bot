@@ -17817,12 +17817,30 @@ impl GameState {
         // The `clone()` is a Vec<u8> (typically 0-2 entries) — cheap.
         let saved_mode_idxs = self.current_resolve_chosen_mode_idxs.clone();
         self.current_resolve_chosen_mode_idxs = top.chosen_mode_idxs.clone();
+        // **X-value subsystem Cycle 1 (2026-05-21).** Save → set →
+        // restore bracket mirroring every sibling transient. The
+        // future `Effect::ZeroPointBallad` / `Effect::Devastating
+        // Onslaught` resolve arms will read
+        // `current_resolve_x_value` (mirroring Python's
+        // `state.resolving_x_value` swap at `actions.py:2711` /
+        // `:2795`). Cycle 1 has no Effect reader yet — every
+        // existing arm self-scans / ignores the slot; for every
+        // pre-substrate push (every existing call site)
+        // `top.x_value == None` so the swap is a no-op (None → None).
+        // The bracket is wired NOW so Cycles 2/3 can add the
+        // cast-time mint + Effect reader as additive changes with
+        // no churn at this site (mirrors the precedent set by
+        // `current_resolve_additional_cost_choice_id` Cycle 1 —
+        // bracket landed pre-Cycle-3 reader).
+        let saved_x_value = self.current_resolve_x_value;
+        self.current_resolve_x_value = top.x_value;
         let effects_result: PyResult<()> = (|| {
             for effect in &effects {
                 apply_effect(self, effect, top.source_obj_id)?;
             }
             Ok(())
         })();
+        self.current_resolve_x_value = saved_x_value;
         self.current_resolve_chosen_mode_idxs = saved_mode_idxs;
         self.current_resolve_additional_cost_choice_id =
             saved_addcost_choice_id;
@@ -18074,12 +18092,23 @@ impl GameState {
         // The `clone()` is a Vec<u8> (typically 0-2 entries) — cheap.
         let saved_mode_idxs = self.current_resolve_chosen_mode_idxs.clone();
         self.current_resolve_chosen_mode_idxs = top.chosen_mode_idxs.clone();
+        // **X-value subsystem Cycle 1 (2026-05-21, `_pause` sibling).**
+        // Save → set → restore bracket mirroring the
+        // `resolve_top_of_stack` entry point above. Mirrored across
+        // BOTH resolve entry points per the §3.4 sibling-parity
+        // requirement (same pattern every other transient slot
+        // follows). For every Cycle 1 push `top.x_value == None` so
+        // the swap is a no-op; Cycles 2/3 wire the cast-time mint
+        // + Effect reader.
+        let saved_x_value = self.current_resolve_x_value;
+        self.current_resolve_x_value = top.x_value;
         let effects_result: PyResult<()> = (|| {
             for effect in &effects {
                 apply_effect(self, effect, top.source_obj_id)?;
             }
             Ok(())
         })();
+        self.current_resolve_x_value = saved_x_value;
         self.current_resolve_chosen_mode_idxs = saved_mode_idxs;
         self.current_resolve_additional_cost_choice_id =
             saved_addcost_choice_id;
@@ -18395,6 +18424,10 @@ impl GameState {
             additional_cost_choice_id: None,
             // scour-for-scrap-slice Cycle 1 widen: same rationale.
             chosen_mode_idxs: None,
+            // X-value subsystem Cycle 1: synthetic-spell push has
+            // no printing → X-cost detection never fires → default
+            // `None` (back-compat).
+            x_value: None,
         });
         Ok(next_id)
     }

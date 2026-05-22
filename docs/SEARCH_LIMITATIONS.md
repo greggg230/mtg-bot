@@ -9718,26 +9718,99 @@ no-op)** today. No subsystem actually reads or writes any X
 value.
 
 Required substrate:
-- **C1** — `StackItem.x_value: Option<u32>` (cast-time bound) +
-  `current_resolve_x_value: Option<u32>` slot bracketed
-  save/set/restore in `resolve_top_of_stack` (mirrors the
-  ModalChooseOne `current_resolve_chosen_mode_idx` pattern from
-  Cycle 2). Auto-pick deterministic-X policy = pay-all-floating
-  (mirrors Python's no-agent fallback at
-  `actions._pick_x_cost_at_cast`); ~100 LoC.
+- **C1 — LANDED (2026-05-21, `feature/x-value-subsystem-cycle-1-p1`).**
+  Substrate-only (parallel shape to control-change-UEOT Cycle 1):
+  - `StackItem.x_value: Option<i32>` field (`rust/src/state.rs`)
+    — additive, defaults `None`, NOT in the per-StackItem
+    fingerprint tuple so pre-substrate stacks stay byte-equal.
+    Every StackItem constructor (`new_spell`,
+    `new_spell_with_targets`, `new_trigger`,
+    `new_trigger_with_target`, `new_spell_with_targets_and_modes`)
+    defaults the slot to `None`. Signed `i32` (not `u32`) — SoT
+    parity with Python's `int` field shape; the cast-time bind
+    always emits non-negative values per CR 107.1b but downstream
+    Effect arms can clamp / saturate as needed.
+  - `GameState.current_resolve_x_value: Option<i32>` transient
+    slot (`rust/src/state.rs`) — sibling of
+    `current_resolve_payload_target_id` /
+    `current_resolve_chosen_mode_idx` /
+    `current_resolve_additional_cost_choice_id` /
+    `current_resolve_chosen_mode_idxs`. Save → set → restore
+    bracketed in BOTH `resolve_top_of_stack` AND
+    `resolve_top_of_stack_pause` per the §3.4 sibling-parity
+    requirement. Not serialized into the fingerprint (transient
+    discipline, same as every sibling). Mirrors Python's
+    `state.resolving_x_value` swap shape.
+  - **Constructor subsumption** (`rust/src/state.rs`):
+    `new_spell_with_targets_mode_and_addcost` (the prior 6-arg
+    constructor) replaced by
+    `new_spell_with_targets_mode_addcost_and_x` (7-arg superset
+    — adds the new `x_value: Option<i32>` slot). Clean
+    replacement, not an additive sibling, per the no-fallback-
+    hybrid discipline established by Close Encounter Cycle 2
+    (commit `17dc7d02`). Only 1 production call site
+    (`cast_spell_noncreature` in `rust/src/state_ops_cast.rs`),
+    which passes `None` for the new parameter (Cycle 1 has no
+    live mint site).
+  - PyO3 getter `stack_top_x_value() -> Option<i32>` on
+    `GameState` (`rust/src/state_ops_stack.rs`) — mirrors the
+    `stack_top_chosen_mode_idx` / `stack_top_additional_cost_choice_id`
+    precedent. Dedicated getter (NOT extending
+    `stack_snapshot()` / `peek_top_of_stack()`'s 2-key dict
+    shape — pinned by `tests_rust/test_stack.py`).
+  - PyO3 synthetic-test setter
+    `set_stack_top_x_value(x: Option<i32>)` on `GameState`
+    (`rust/src/state_ops_stack.rs`) — mirrors
+    `set_stack_top_chosen_mode_idxs`. Accepts `Option<i32>`
+    directly so tests can drive the bracket's "restore to prior
+    None" branch as well as `Some(_) → None` transitions.
+    Production code never calls this (the cast-time bind sets it
+    once at push time; the resolver reads it during apply_effect;
+    no re-binding mid-resolve).
+  - Tests: `tests/test_x_value_subsystem_cycle1.py` (13 tests
+    covering: empty-stack getter contract, default-None
+    invariant on a fresh cast, synthetic-setter round-trip
+    including X=0 / X=i32::MAX / negative-X / unset-to-None
+    branches, setter no-op on empty stack, resolve bracket no-op
+    for default-None source, resolve bracket save → set → restore
+    against the synthetic-set value, `_pause` sibling-parity
+    bracket pin, multi-spell per-StackItem isolation, back-compat
+    byte-equal default-None invariant across multi-cast).
+
+  Cycle 1 is intentionally substrate-only; no live cast site
+  mints the X yet, so production self-play / cross-engine
+  trajectories are byte-equivalent to pre-Cycle-1 (back-compat
+  baseline). Until Cycle 2 wires the cast-pipeline detector
+  (`mc.x_pips > 0` → pay-all-floating no-agent fallback +
+  `StackItem.x_value` bind), Zero Point Ballad stays declined by
+  the bridge admit predicate (`if mc.x_pips: return False` at
+  `trajectory.py:_printing_is_bridge_simple_spell:4621` still
+  positively rejects every X-cost spell). The substrate is
+  sufficient for Cycle 3 to read the transient locally and
+  verify the bracket semantics in isolation; full Python-Rust
+  agreement on a real Zero-Point-Ballad / Devastating-Onslaught
+  trajectory requires both Cycle 2 (cast-pipeline X bind) and
+  Cycle 3 (Effect arm + admit-predicate widen).
 - **C2** — Admit-predicate widen: remove the
   `mc.x_pips: return False` reject, replace with a positive
   X-shape admit gate keyed on the bound X value being
-  round-trip-clean through the reverse serializer; ~30 LoC.
+  round-trip-clean through the reverse serializer; ~30 LoC. Add
+  the cast-pipeline detector to `cast_spell_noncreature` that
+  reads `mc.x_pips > 0` and binds the deterministic-first X via
+  pay-all-floating no-agent fallback (mirrors Python's
+  `actions._pick_x_cost_at_cast`).
 - **C3** — `Effect::ZeroPointBallad` resolve arm (destroy-with-
   toughness-≤-X filter + life-loss + optional reanimation single-
-  target). Reanimation arm needs a NEW resolve-time
+  target). Reads `state.current_resolve_x_value` via the Cycle 1
+  bracket. Reanimation arm needs a NEW resolve-time
   `PendingDecision::ChooseFromOwnedDestroyedThisResolve` (the
   candidate set is built mid-resolve, so it cannot be cast-time
   bound). ~200 LoC + 6 probes.
 - **C4** — Real-EoE byte-equal probe with X=0/X=5/X=6/X=8
   scenarios (the 4 X-tier branches: empty-filter, no-reanim,
-  reanim-trigger, reanim-with-no-candidate).
+  reanim-trigger, reanim-with-no-candidate). Composite cycle if
+  paired with `Effect::DevastatingOnslaught` (X token copies +
+  delayed-trigger end-step sac, sharing C1 substrate).
 
 Pool-flip per cycle: 1 card (Zero Point Ballad alone); other
 EoE X-cost spells (Devastating Onslaught — Sorcery, "Create X
@@ -9858,9 +9931,12 @@ Gaps on Rust side (each a multi-cycle subsystem lane):
 1. **X-value subsystem** — `StackItem.x_value: Option<i32>` field +
    `state.current_resolve_x_value` bracket around resolve +
    admit-predicate widen at `_printing_is_bridge_simple_spell` to
-   accept `mc.x_pips > 0`. Shared with Zero Point Ballad's lane
-   (already characterized in the prior "Next-wrath-substrate triad"
-   honest-stop entry above).
+   accept `mc.x_pips > 0`. **C1 LANDED 2026-05-21
+   (`feature/x-value-subsystem-cycle-1-p1`)** — substrate-only
+   (field + transient + bracket + getter/setter); shared with Zero
+   Point Ballad's lane (see §2 Zero Point Ballad C1 LANDED entry
+   above for the full Cycle 1 surface). C2 (cast-pipeline X bind +
+   admit widen) and C3+ (resolve arm) remain open.
 2. **Token-copy substrate** — Rust today carries
    `Effect::CreateToken { count, token_printing_id }` which references
    a PRE-REGISTERED printing in the Rust registry. "Copy a target's
@@ -9878,8 +9954,10 @@ Gaps on Rust side (each a multi-cycle subsystem lane):
    the variant carries an explicit `sac_timing: SacTimingShape`
    enum.
 
-**Estimated cost**: 3-4 cycles (depends on Zero Point Ballad lane
-landing first to amortize the X-value subsystem). 2,238 17lands
+**Estimated cost**: 3-4 cycles. C1 (X-value substrate) LANDED
+2026-05-21 — shared with Zero Point Ballad; remaining cycles are
+the token-copy substrate + delayed-trigger end-step sac + the
+cast-pipeline X bind / admit-predicate widen. 2,238 17lands
 decks.
 
 ### 2. Close Encounter — additional-cost runtime state-channel subsystem (CLOSED 2026-05-21, all 3 cycles landed)

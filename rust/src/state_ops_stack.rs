@@ -181,6 +181,59 @@ impl GameState {
         }
     }
 
+    /// **X-value subsystem — Cycle 1 (cast-time X bind getter,
+    /// 2026-05-21).** Read-only getter for the cast-time-bound
+    /// `x_value` field of the top stack item. Returns `Some(x)` if
+    /// the top item carries a bound X (an X-cost spell cast through
+    /// `cast_spell_noncreature`'s Cycle 2/3 X-cost detector — NOT
+    /// wired yet in Cycle 1), `None` if the top item has no X bind
+    /// OR the stack is empty.
+    ///
+    /// **Why a dedicated getter** — parallel to
+    /// [`Self::stack_top_chosen_mode_idx`] /
+    /// [`Self::stack_top_additional_cost_choice_id`] /
+    /// [`Self::stack_top_target_id`]: the existing
+    /// `peek_top_of_stack()` / `stack_snapshot()` dict surfaces are
+    /// pinned by pre-existing tests (the `{"source_obj_id",
+    /// "controller"}` 2-key shape); adding a key would break every
+    /// pin. A dedicated getter is additive — existing readers ignore
+    /// it; Cycle 1 substrate tests opt in explicitly. Mirrors
+    /// Python's `state.stack[-1].x_value` access pattern.
+    ///
+    /// **Cycle 1 baseline behavior.** Every pre-substrate push sets
+    /// `x_value: None`, so this getter returns `None` for every
+    /// current cross-engine trajectory. The first non-None
+    /// observation will come from the Cycle 2/3 cast-pipeline mint
+    /// site OR from the synthetic-test setter
+    /// `set_stack_top_x_value` below.
+    fn stack_top_x_value(&self) -> Option<i32> {
+        self.stack.last().and_then(|item| item.x_value)
+    }
+
+    /// **X-value subsystem — Cycle 1 (synthetic-test setter,
+    /// 2026-05-21).** Synthetic-test setter for the top stack item's
+    /// `x_value` slot. Mirrors `set_stack_top_chosen_mode_idxs`'s
+    /// shape: the production cast-time bind (Cycle 2/3) sets the
+    /// value once at push time; this setter exists solely so unit
+    /// tests can validate the resolver's save → set → restore
+    /// bracket semantics against a known synthetic X. No-op when
+    /// the stack is empty.
+    ///
+    /// **Production safety.** Never called from production code paths
+    /// — the cast-time bind sets it once at push time; the resolver
+    /// reads it during apply_effect; no re-binding mid-resolve. The
+    /// setter exists solely for the substrate test surface.
+    ///
+    /// Accepts `Option<i32>` directly so tests can also unset the
+    /// slot back to `None` (validate the "restore to prior None"
+    /// branch of the resolver bracket).
+    #[pyo3(signature = (x=None))]
+    fn set_stack_top_x_value(&mut self, x: Option<i32>) {
+        if let Some(item) = self.stack.last_mut() {
+            item.x_value = x;
+        }
+    }
+
     /// G7 lander-controller-mismatch closure — synthetic-test stack
     /// push that carries the cast-time-bound target. The production
     /// cast-spell path (`cast_spell_noncreature`) sets target via the

@@ -490,5 +490,10 @@ pub fn make_state(
         // slot; None at construction; set during a modal-or-both
         // spell-cast resolution.
         current_resolve_chosen_mode_idxs: None,
+        // X-value subsystem Cycle 1: transient X-value slot; None at
+        // construction (no X-cost spell on the stack yet — pre-
+        // Cycle-1 every spell pushed `x_value: None`, so the
+        // transient stays None until Cycle 2/3 mints a real X bind).
+        current_resolve_x_value: None,
     })
 }

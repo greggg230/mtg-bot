@@ -708,6 +708,36 @@ upstream of this dated paragraph).
   overrides. Full Cycle 1 entry at `docs/SEARCH_LIMITATIONS.md`
   §1 (Mutinous Massacre).
 
+  **X-value-subsystem Cycle 1 landed (2026-05-21,
+  `feature/x-value-subsystem-cycle-1-p1`).** Substrate-only
+  (parallel shape to control-change-UEOT C1):
+  `StackItem.x_value: Option<i32>` field +
+  `GameState.current_resolve_x_value: Option<i32>` transient slot
+  + save → set → restore bracket in BOTH `resolve_top_of_stack`
+  AND `resolve_top_of_stack_pause` + dedicated PyO3 getter
+  `stack_top_x_value()` + synthetic-test setter
+  `set_stack_top_x_value()`. Subsumes the prior
+  `new_spell_with_targets_mode_and_addcost` constructor →
+  `new_spell_with_targets_mode_addcost_and_x` (clean replacement,
+  1 production call site, no-fallback-hybrid discipline). No live
+  mint site yet — Cycle 2 wires the cast-pipeline X-cost detector
+  (`mc.x_pips > 0` → pay-all-floating no-agent fallback +
+  `StackItem.x_value` bind); Cycle 3 wires the
+  `Effect::ZeroPointBallad` resolve arm (reads
+  `current_resolve_x_value` to compute the toughness filter + life
+  loss + conditional reanimation); Cycle 4 wires
+  `Effect::DevastatingOnslaught` (X tokens that are copies +
+  delayed-trigger end-step sac, sharing the same C1 substrate).
+  Substrate landing is **back-compat byte-equivalent** on
+  production self-play / cross-engine trajectories — every
+  `x_value` defaults to `None`, the new transient defaults to
+  `None`, the bracket is a no-op when source is `None`, and no
+  Effect arm reads the transient yet. Both **Zero Point Ballad**
+  (6,041 17lands decks) and **Devastating Onslaught** (2,238
+  decks) share this C1 substrate per the prior next-tractable-
+  substrate hexad characterization. Full Cycle 1 entry at
+  `docs/SEARCH_LIMITATIONS.md` §2 (Zero Point Ballad).
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 
