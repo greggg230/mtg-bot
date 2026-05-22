@@ -5671,6 +5671,56 @@ def _ta_dict_to_python_effect(eff_dict: dict):
         # beyond the bare bridge-arm slice).
         from mtg_bot.effects.generic.tap import TapEnchantedPermanent
         return TapEnchantedPermanent()
+    if kind == "target_opponent_look_hand_may_discard":
+        # **Cracked Skull look-at-hand + may-discard substrate —
+        # Cycle 2 (2026-05-22) — dict→Python bridge arm.** Rust
+        # substrate ``Effect::TargetOpponentLookHandMayDiscard``
+        # (cards.rs unit variant; parse arm at the matching
+        # ``"target_opponent_look_hand_may_discard"`` key; resolve arm
+        # in ``state_ops_resolve.rs`` next to the
+        # ``SacrificeSelfUnlessTapPermanent`` arm; to_dict at
+        # cards.rs). This arm closes the cross-engine bridge gap so
+        # Cracked Skull's ENTERS trigger can round-trip through both
+        # engines.
+        #
+        # **Unit variant.** No fields beyond ``kind``. Mirrors Rust's
+        # parse_effect arm — silent-drop convention for unrecognized
+        # keys (extra dict fields are ignored).
+        #
+        # **Field shape.** Python's ``TargetOpponentLookHandMayDiscard``
+        # (effects/generic/discard.py:298-391) is a field-free
+        # ``@dataclass(frozen=True)`` ``Effect`` subclass. The bridge
+        # constructs ``TargetOpponentLookHandMayDiscard()`` with no
+        # args.
+        #
+        # **Resolve semantics (parity-relevant).** Rust's resolve at
+        # state_ops_resolve.rs walks the 5-zone source-finder, takes
+        # ``opponent_idx = 1 - controller``, filters nonland card ids
+        # from the opponent's hand, and pushes
+        # ``PendingDecision::LookAtOpponentHandMayDiscard`` onto the
+        # queue (skipping the push when candidates is empty — Python
+        # parity at discard.py:353-358). The Cycle 1 substrate's
+        # ``submit_look_at_opponent_hand_may_discard_decision``
+        # dispatcher consumes it; auto-resolve ``"default"`` declines.
+        # The look-at reveal step (Python's ``reveal_to(card,
+        # controller)``) is honest-stopped on the Rust side — no
+        # per-object ``revealed_to`` slot — but the post-resolve
+        # observable on ``target_player.hand`` /
+        # ``target_player.graveyard`` is byte-equal because neither
+        # engine reads ``revealed_to`` for any subsequent state
+        # mutation.
+        #
+        # **Real EoE consumers** unblocked: 1 EoE card via the oracle
+        # parser — Cracked Skull (DSK special-guest reprint in the EoE
+        # pool; ETB look-at-hand + may-discard half of the Aura's
+        # two-trigger composition; DEALT_DAMAGE +
+        # DestroyEnchantedPermanent half already shipped). Cross-engine
+        # end-to-end probe lands in ``test_cracked_skull_parity.py``
+        # alongside the Aura-S4 multi-trigger admit-gate widen.
+        from mtg_bot.effects.generic.discard import (
+            TargetOpponentLookHandMayDiscard,
+        )
+        return TargetOpponentLookHandMayDiscard()
     if kind == "lose_life":
         # **Round-24 BLOCKED-BRIDGE-ARM slice -- "you lose N life"
         # (LoseLife family).** Rust substrate

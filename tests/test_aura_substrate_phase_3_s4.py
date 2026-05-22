@@ -176,16 +176,25 @@ def test_phase3_safe_rejects_once_per_turn():
 
 def test_phase3_safe_rejects_unsafe_effect():
     """An Aura trigger with an effect outside the Phase-3 safe set
-    (e.g. ``DestroyEnchantedPermanent`` from Cracked Skull) is
-    rejected — the gate is the §2 positive allowlist."""
+    is rejected — the gate is the §2 positive allowlist.
+
+    **Updated 2026-05-22 — Cracked Skull C2 closure landed.**
+    ``DestroyEnchantedPermanent`` is no longer the canonical
+    rejection example — the C2 widen admits the
+    ``DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent`` shape (Cracked
+    Skull's second trigger). Use a genuinely-uncovered shape here:
+    ``Event.ENTERS + IsSelf + DestroyTargetCreature`` — DestroyTarget
+    Creature is a spell-effect primitive that has no Aura-ETB
+    carrier today and is positively declined by the gate.
+    """
     from mtg_bot.effects.base import TriggeredAbility
-    from mtg_bot.effects.predicates import Event, IsHost
-    from mtg_bot.effects.generic.destroy import DestroyEnchantedPermanent
+    from mtg_bot.effects.predicates import Event, IsSelf
+    from mtg_bot.effects.generic.destroy import DestroyTargetCreature
 
     ta = TriggeredAbility(
-        event=Event.DEALT_DAMAGE,
-        predicate=IsHost(),
-        effect=DestroyEnchantedPermanent(),
+        event=Event.ENTERS,
+        predicate=IsSelf(),
+        effect=DestroyTargetCreature(),
     )
     assert _aura_triggers_are_phase3_safe((ta,)) is False
 
@@ -565,15 +574,23 @@ def test_predicate_declines_chorale_of_the_void():
     assert _printing_is_bridge_simple_aura(p) is False
 
 
-def test_predicate_declines_cracked_skull():
-    """Cracked Skull has ENTERS + TargetOpponentLookHandMayDiscard +
-    DEALT_DAMAGE + DestroyEnchantedPermanent triggers — neither
-    effect is in the Phase-3 safe set."""
+def test_predicate_admits_cracked_skull_post_cycle2_closure():
+    """**Updated 2026-05-22 — Cracked Skull C2 closure landed.**
+    Cracked Skull is now bench-loader-ADMITTED: the two-trigger
+    composition (ENTERS + TargetOpponentLookHandMayDiscard +
+    DEALT_DAMAGE + DestroyEnchantedPermanent) is now Phase-3-safe
+    via the C2 widen of :func:`_aura_triggers_are_phase3_safe`
+    (the C2 Effect arm + cross-engine bridge arm + admit-set widen
+    landed in ``feature/cracked-skull-cycle-2-p1``). Cycle 1's
+    pin (Cracked Skull declined) is reversed here; the
+    canonical PROBED-flip test lives at
+    ``tests/test_cracked_skull_parity.py::test_predicate_admits_live_cracked_skull_printing``.
+    """
     from mtg_bot.cards.source import get_active_source
 
     p = get_active_source().get_printings()["Cracked Skull"]
     assert p.is_aura is True
-    assert _printing_is_bridge_simple_aura(p) is False
+    assert _printing_is_bridge_simple_aura(p) is True
 
 
 def test_predicate_declines_sporogenic_infection():

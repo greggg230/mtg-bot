@@ -14722,6 +14722,104 @@ fn apply_effect(
                 },
             );
         }
+        // **Cracked Skull look-at-hand + may-discard substrate — Cycle 2
+        // (2026-05-22).** Mirrors Python's
+        // `TargetOpponentLookHandMayDiscard.resolve`
+        // (`effects/generic/discard.py:330-385`) — Cracked Skull's
+        // ETB trigger half.
+        //
+        // **Resolve steps (mirror Python).**
+        // 1. Source-controller resolution: 5-zone walk + stack scan
+        //    (mirrors the round-24 EachOpponentDiscards source-finder
+        //    pattern). Source-not-found = silent fizzle.
+        // 2. 2-player "target opponent" reduces to the one opponent:
+        //    `opponent_idx = (1 - controller) as usize`.
+        // 3. Compute candidates: every nonland card id in the
+        //    opponent's hand, in hand-iteration order (matches
+        //    Python's list-comprehension at `discard.py:352`).
+        // 4. Empty candidates: silent no-op (Python parity at
+        //    `discard.py:353-358`).
+        // 5. Non-empty candidates: push
+        //    `PendingDecision::LookAtOpponentHandMayDiscard
+        //    {source_obj_id, controller, target_player, candidates}`
+        //    onto the queue. The Cycle 1 substrate's
+        //    `submit_look_at_opponent_hand_may_discard_decision`
+        //    dispatcher consumes it; auto-resolve `"default"`
+        //    declines.
+        //
+        // **No `revealed_to` mutation.** Rust's `GameObject` does NOT
+        // carry a per-object `revealed_to` slot today; Python's
+        // `reveal_to(card, controller)` step is a Python-side helper
+        // that has no Rust-side analog. The cross-engine observable
+        // that matters for parity (the discard/decline outcome on
+        // `target_player.hand` / `target_player.graveyard`) is byte-
+        // equal because neither engine reads `revealed_to` for any
+        // subsequent state mutation. Documented honest-stop in
+        // `docs/SEARCH_LIMITATIONS.md`.
+        Effect::TargetOpponentLookHandMayDiscard => {
+            // 1. Source-controller resolution: 5-zone walk + stack
+            //    scan. Mirrors round-24 EachOpponentDiscards /
+            //    round-26 EachOpponentLosesLife shape.
+            let mut source_controller: Option<u8> = None;
+            'outer: for player in state.players.iter() {
+                for zone in [
+                    &player.hand,
+                    &player.library,
+                    &player.battlefield,
+                    &player.graveyard,
+                    &player.exile,
+                ] {
+                    for obj in zone.iter() {
+                        if obj.id == source_obj_id {
+                            source_controller = Some(obj.controller);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if source_controller.is_none() {
+                if let Some(item) = state
+                    .stack
+                    .iter()
+                    .find(|i| i.source_obj_id == source_obj_id)
+                {
+                    source_controller = Some(item.controller);
+                }
+            }
+            let Some(controller) = source_controller else {
+                return Ok(()); // source not found → silent fizzle
+            };
+            // 2. 2-player "target opponent" reduces to the one
+            //    opponent.
+            let opponent_idx = (1 - controller) as usize;
+            // 3. Build candidate set: every nonland card id in the
+            //    opponent's hand, in hand-iteration order.
+            let candidates: Vec<u32> = state.players[opponent_idx]
+                .hand
+                .iter()
+                .filter_map(|o| {
+                    let printing = state.registry.lookup(o.printing_id)?;
+                    if printing.card_types.iter().any(|t| t == "Land") {
+                        None
+                    } else {
+                        Some(o.id)
+                    }
+                })
+                .collect();
+            // 4. Empty candidates: silent no-op (Python parity).
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            // 5. Non-empty: push the decision.
+            state.pending_decisions.push(
+                crate::state::PendingDecision::LookAtOpponentHandMayDiscard {
+                    source_obj_id,
+                    controller,
+                    target_player: opponent_idx as u8,
+                    candidates,
+                },
+            );
+        }
         // **20th Rust slice (XXX Pin 3 honest-stop closure) --
         // Lightstall Inquisitor each-opponent-exiles-card-from-hand-
         // with-cast-permission.** Mirrors Python's

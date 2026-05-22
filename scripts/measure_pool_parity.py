@@ -828,6 +828,24 @@ PROBE_MODULES: tuple[Path, ...] = (
     # attribution gap and makes the metric robust against future
     # rearrangement of the redundant routes.
     REPO_ROOT / "tests" / "test_probe_ppp_downstream.py",
+    # **cracked-skull-cycle-2-p1 (2026-05-22):** Cracked Skull C2 closure
+    # — the second-cycle PROBED flip of the Cycle-1 (C1) substrate. C2
+    # ships ``Effect::TargetOpponentLookHandMayDiscard`` on the Rust
+    # side (parse + to_pydict + resolve arm), the cross-engine bridge
+    # arm ``target_opponent_look_hand_may_discard`` in
+    # ``cross_engine.py::_ta_dict_to_python_effect``, and the Phase-3
+    # safe-trigger admit-set widen for Cracked Skull's two-trigger
+    # composition (``ENTERS+IsSelf+TargetOpponentLookHandMayDiscard``
+    # shape 4 + ``DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent`` shape
+    # 5). The ``test_cross_engine_real_eoe_cracked_skull_enters_parity``
+    # probe drives the genuine parsed Cracked Skull EoE printing
+    # through the bridge round-trip + Python-side resolve smoke,
+    # matching the HHHH/Pain-for-All / Tractor-Beam canonical Aura-
+    # probe shape. Flips Cracked Skull BLOCKED-multi-gate → PROBED
+    # (the first Aura with a two-trigger composition — ETB +
+    # DEALT_DAMAGE host-event — to land end-to-end on the bench
+    # loader).
+    REPO_ROOT / "tests" / "test_cracked_skull_parity.py",
 )
 
 # Tier keys (stable — the doc + test reference these verbatim).

@@ -5266,6 +5266,10 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
         PainForAllDamageEchoEffect,
         PainForAllETBEffect,
     )
+    from mtg_bot.effects.generic.destroy import DestroyEnchantedPermanent
+    from mtg_bot.effects.generic.discard import (
+        TargetOpponentLookHandMayDiscard,
+    )
     from mtg_bot.effects.generic.tap import TapEnchantedPermanent
 
     if not triggered_abilities:
@@ -5298,6 +5302,44 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
             and isinstance(ta.predicate, IsHost)
             and ta.predicate.subject is None
             and isinstance(ta.effect, PainForAllDamageEchoEffect)
+        ):
+            continue
+        # **Cracked Skull C2 (2026-05-22) — admit shape 4: Aura ETB
+        # look-at-hand + may-discard.** ``ENTERS+IsSelf(None)+
+        # TargetOpponentLookHandMayDiscard`` — Cracked Skull's first
+        # trigger. The full Rust substrate (Effect variant + parse
+        # arm + resolve arm + to_pydict arm + bridge arm) lands in
+        # Cycle 2; this safe-trigger admit unblocks it end-to-end.
+        if (
+            ta.event is Event.ENTERS
+            and isinstance(ta.predicate, IsSelf)
+            and ta.predicate.subject is None
+            and isinstance(ta.effect, TargetOpponentLookHandMayDiscard)
+        ):
+            continue
+        # **Cracked Skull C2 (2026-05-22) — admit shape 5: Aura
+        # DEALT_DAMAGE → destroy host.** ``DEALT_DAMAGE+IsHost(None)+
+        # DestroyEnchantedPermanent`` — Cracked Skull's second
+        # trigger (the "when enchanted creature is dealt damage,
+        # destroy it" half). ``DestroyEnchantedPermanent`` is a Rust-
+        # bridged unit variant
+        # (``Effect::DestroyEnchantedPermanent`` + bridge arm at
+        # cross_engine.py:6551); the DEALT_DAMAGE event + IsHost
+        # predicate are both Rust-bridged (Pain for All damage echo
+        # shape established the DEALT_DAMAGE + IsHost emitter at
+        # round-80). This admit widens the Phase-3 safe-trigger
+        # gate to accept the Cracked Skull / Sporogenic Infection /
+        # Cryoshatter family's destroy-host half. Sporogenic
+        # Infection's ENTERS half (TargetOpponentSacrificesCreature
+        # OtherThanEnchanted) is not yet covered — that's a future
+        # follow-up slice; Cryoshatter's BECOMES_TAPPED-or-
+        # DEALT_DAMAGE compound trigger is the dedicated
+        # Cryoshatter-substrate lane.
+        if (
+            ta.event is Event.DEALT_DAMAGE
+            and isinstance(ta.predicate, IsHost)
+            and ta.predicate.subject is None
+            and isinstance(ta.effect, DestroyEnchantedPermanent)
         ):
             continue
         return False
@@ -5354,6 +5396,10 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
         PainForAllDamageEchoEffect,
         PainForAllETBEffect,
     )
+    from mtg_bot.effects.generic.destroy import DestroyEnchantedPermanent
+    from mtg_bot.effects.generic.discard import (
+        TargetOpponentLookHandMayDiscard,
+    )
     from mtg_bot.effects.generic.tap import TapEnchantedPermanent
 
     if isinstance(ta.effect, PainForAllETBEffect):
@@ -5388,6 +5434,31 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
             "event": "enters",
             "predicate": {"kind": "source_is_self"},
             "effect": {"kind": "tap_enchanted_permanent"},
+            "once_per_turn": False,
+        }
+    if isinstance(ta.effect, TargetOpponentLookHandMayDiscard):
+        # **Cracked Skull C2 — shape 4: ENTERS+IsSelf+
+        # TargetOpponentLookHandMayDiscard.** Cracked Skull's
+        # look-at-opponent-hand + may-discard ETB. Rust kind
+        # ``target_opponent_look_hand_may_discard`` (cards.rs +
+        # cross_engine.py bridge arm landed in this slice).
+        return {
+            "event": "enters",
+            "predicate": {"kind": "source_is_self"},
+            "effect": {"kind": "target_opponent_look_hand_may_discard"},
+            "once_per_turn": False,
+        }
+    if isinstance(ta.effect, DestroyEnchantedPermanent):
+        # **Cracked Skull C2 — shape 5: DEALT_DAMAGE+IsHost+
+        # DestroyEnchantedPermanent.** Cracked Skull's
+        # "when enchanted creature is dealt damage, destroy it"
+        # half. Rust kind ``destroy_enchanted_permanent`` (cards.rs +
+        # cross_engine.py:6551 bridge arm already shipped pre-C2;
+        # only the safe-trigger admit + emitter arms are new here).
+        return {
+            "event": "dealt_damage",
+            "predicate": {"kind": "is_host"},
+            "effect": {"kind": "destroy_enchanted_permanent"},
             "once_per_turn": False,
         }
     # Should be unreachable when pre-gated by

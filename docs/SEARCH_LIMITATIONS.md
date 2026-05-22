@@ -10327,8 +10327,9 @@ slices.
 
 ## Cracked Skull — look-at-hand + may-discard substrate (Rust side)
 
-**Status (2026-05-22): Cycle 1 LANDED on
-`feature/cracked-skull-cycle-1-p1` (substrate only).**
+**Status (2026-05-22): Cycle 1 + Cycle 2 LANDED. Cracked Skull
+PROBED end-to-end on `feature/cracked-skull-cycle-2-p1` (the C1
+substrate's PROBED-flip closure).**
 
 Cracked Skull (`{2}{B}` Enchantment — Aura, DSK special-guest reprint
 in the EoE pool) prints two trigger halves on its Aura body:
@@ -10369,23 +10370,49 @@ no-agent-seated fallback is to silently decline (no discard).
   snapshots stay identical. 18 substrate tests pinned at
   `tests/test_cracked_skull_cycle1.py`.
 
-* **Cycle 2 (planned).** `Effect::TargetOpponentLookHandMayDiscard`
-  unit variant on `rust/src/cards.rs` (mirrors Python's
-  field-free Effect class), parse/admit-gate path (admit Cracked
-  Skull at the loader once Cycle 2 lands), Python → Rust effect
-  bridge (`effects_to_pydict` round-trip), resolve arm in
-  `state_ops_resolve.rs` that locates the source on bf, computes
-  the legal opponent set (controller-of-effect resolution as
-  with the SacrificeSelfUnlessTapPermanent / EachOpponentDiscards
-  / Lightstall arms), looks up the target opponent's hand,
-  filters to nonland candidate ids, and pushes
+* **Cycle 2 (LANDED, 2026-05-22).** `Effect::TargetOpponent
+  LookHandMayDiscard` unit variant on `rust/src/cards.rs`
+  (mirrors Python's field-free Effect class) + parse arm +
+  to_pydict arm + cross-engine bridge arm
+  `target_opponent_look_hand_may_discard` in
+  `src/mtg_bot/parity/cross_engine.py::_ta_dict_to_python_effect`
+  + resolve arm in `state_ops_resolve.rs` that locates the source
+  on bf via the 5-zone walk + stack scan, takes
+  `opponent_idx = 1 - controller`, filters nonland card ids from
+  the opponent's hand, and pushes
   `PendingDecision::LookAtOpponentHandMayDiscard` (skipping the
   push when candidates is empty — Python parity at
   `effects/generic/discard.py:353-358` "if not options: log,
-  return"). Cycle 2 also stamps `revealed_to` on every card in
-  the target opponent's hand (the printed "look at" step's
-  one-way reveal — Cycle 1 substrate is pure decision-queue
-  plumbing). Trajectory probe + PROBED flip on closure.
+  return"). Phase-3 safe-trigger gate
+  (`_aura_triggers_are_phase3_safe`) widened with two new admit
+  shapes for Cracked Skull's two-trigger composition:
+  `ENTERS+IsSelf+TargetOpponentLookHandMayDiscard` (shape 4) +
+  `DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent` (shape 5).
+  Phase-3 emitter (`_python_ta_to_safe_dict_aura_phase3`) widened
+  with matching emitter arms. Live deck loader admits Cracked
+  Skull end-to-end; trajectory probe lands at
+  `tests/test_cracked_skull_parity.py::test_cross_engine_real_eoe_cracked_skull_enters_parity`
+  (the canonical real-EoE bridge round-trip + Python resolve smoke
+  pin). 20 tests pin the closure end-to-end (parser SoT +
+  serializer round-trip + admit-gate flip + cast_aura + ETB-
+  trigger fires + Effect arm pushes-and-drains decline + C1
+  substrate push-then-submit-or-auto-resolve drains). The
+  Cycle 2 closure flips Cracked Skull BLOCKED-multi-gate →
+  PROBED (the first Aura with a two-trigger composition — ETB +
+  DEALT_DAMAGE host event — to ride the bench loader end-to-end).
+
+  **`revealed_to` honest-stop.** Rust's `GameObject` does NOT
+  carry a per-object `revealed_to` slot today; Python's
+  `reveal_to(card, controller)` step (the printed "look at"
+  one-way reveal) is a Python-side helper with no Rust analog.
+  The Cycle 2 resolve arm SKIPS the look-at reveal step — the
+  `PendingDecision` push is the entirety of the Rust-side state
+  mutation pre-submit. The cross-engine observable that matters
+  for parity (the discard / decline outcome on
+  `target_player.hand` and `target_player.graveyard`) is
+  byte-equal because neither engine reads `revealed_to` for any
+  subsequent state mutation. The look-at step's hidden-info
+  surface gap is the honest-stop boundary documented here.
 
 **Sibling-shape precedent.** The Cycle 1 substrate mirrors the
 20th-Rust-slice (VVV Pin 2) Command Bridge / SacrificeSelfUnlessTap

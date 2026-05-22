@@ -314,21 +314,26 @@ def test_predicate_declines_non_aura():
 
 
 def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
-    """**Phase 4 S3 closure (Moonlit Meditation, 2026-05-21).** The
-    closure adds Moonlit Meditation to the admit set (the Rust
-    CreateToken arms now consult the controller's attached Moonlit
-    Aura via ``moonlit_token_substitution`` and swap to the host's
-    printing with a per-object Token-supertype override). Combined
-    with the prior Phase 1/Phase 2/Phase 3 first deliverable
-    widenings, the bench-loader admits SIX live EoE Auras:
-    Frantic Strength + Shardmage's Rescue (S1 — keyword + P/T),
-    Duskmourn's Domination (S2 — control + lose-abilities), Tractor
-    Beam (S2 — control + prevents_untap), Pain for All (S4 —
-    triggered, the Phase 3 closure), and Moonlit Meditation (S3 —
-    replacement, the Phase 4 S3 closure). Every other S4 carrier
-    (Chorale of the Void, Cracked Skull, Sporogenic Infection)
-    stays declined on their non-Phase-3-safe trigger shape;
-    Meltstrider's Resolve stays declined on its
+    """**Cracked Skull C2 closure (2026-05-22).** The closure adds
+    Cracked Skull to the admit set (the Phase-3 safe-trigger gate
+    now admits the two-trigger composition
+    ``ENTERS+IsSelf+TargetOpponentLookHandMayDiscard`` +
+    ``DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent``). Combined
+    with the Phase 4 S3 closure (Moonlit Meditation,
+    2026-05-21) and the prior Phase 1/Phase 2/Phase 3 first
+    deliverable widenings, the bench-loader admits SEVEN live EoE
+    Auras:
+
+      * Frantic Strength + Shardmage's Rescue (S1 — keyword + P/T),
+      * Duskmourn's Domination (S2 — control + lose-abilities),
+      * Tractor Beam (S2 — control + prevents_untap),
+      * Pain for All (S4 — triggered, Phase 3 closure),
+      * Moonlit Meditation (S3 — replacement, Phase 4 S3 closure),
+      * Cracked Skull (S4 — multi-trigger composition, C2 closure).
+
+    Every remaining S4 carrier (Chorale of the Void, Sporogenic
+    Infection) stays declined on their non-Phase-3-safe trigger
+    shape; Meltstrider's Resolve stays declined on its
     ``EnchantedCreatureFightsTargetEffect`` trigger (separate
     follow-up slice).
 
@@ -345,10 +350,10 @@ def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
             admitted.append(name)
         else:
             declined.append((name, "declined"))
-    # Phase 4 S3 closure admit set: S1 carriers + S2 Duskmourn-shape +
-    # Tractor Beam + Pain for All + Moonlit Meditation. If this set
-    # changes (parser drift, future widen), update both this pin AND
-    # the deck-count expectations in the plan.
+    # Cracked Skull C2 closure admit set: S1 carriers + S2 Duskmourn-
+    # shape + Tractor Beam + Pain for All + Moonlit Meditation +
+    # Cracked Skull. If this set changes (parser drift, future widen),
+    # update both this pin AND the deck-count expectations in the plan.
     assert sorted(admitted) == sorted([
         "Frantic Strength",
         "Shardmage's Rescue",
@@ -356,11 +361,12 @@ def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
         "Tractor Beam",
         "Pain for All",
         "Moonlit Meditation",
+        "Cracked Skull",
     ]), (
-        f"Phase 4 S3 closure expected six carriers to admit; got "
-        f"{sorted(admitted)!r}. If this is intentional (a later Phase "
-        f"widen of the predicate's admit shape), update this pin to "
-        f"assert the new expected admit list explicitly."
+        f"Cracked Skull C2 closure expected seven carriers to admit; "
+        f"got {sorted(admitted)!r}. If this is intentional (a later "
+        f"Phase widen of the predicate's admit shape), update this "
+        f"pin to assert the new expected admit list explicitly."
     )
     # Sanity: the parser pool has at least the 14 Auras the scout
     # documented (round-61 N1 + round-63 N4 drift extensions).
@@ -744,8 +750,17 @@ def test_loader_admits_at_least_one_live_eoe_aura_post_phase_2():
         "Phase 4 S3 closure expected Moonlit Meditation to admit. "
         "Admitted set: %r" % (admitted_auras,)
     )
+    # Cracked Skull C2 closure (2026-05-22): the two-trigger
+    # composition (ENTERS+IsSelf+TargetOpponentLookHandMayDiscard +
+    # DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent) is now
+    # Phase-3-safe; Cracked Skull admits through the loader (first
+    # Aura with a two-trigger composition to ride the bench loader
+    # end-to-end).
+    assert "Cracked Skull" in admitted_auras, (
+        "Cracked Skull C2 closure expected Cracked Skull to admit. "
+        "Admitted set: %r" % (admitted_auras,)
+    )
     must_decline = {
-        "Cracked Skull",             # S4 triggered_abilities (non-Phase-3-safe)
         "Sporogenic Infection",      # S4 triggered_abilities (non-Phase-3-safe)
         "Chorale of the Void",       # S4 triggered_abilities (non-Phase-3-safe)
         "Meltstrider's Resolve",     # residue triggered_abilities (non-Phase-3-safe — Fight effect)

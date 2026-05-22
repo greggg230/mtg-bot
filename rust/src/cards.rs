@@ -5566,6 +5566,77 @@ pub enum Effect {
         max_n: i32,
         max_total_mv: i32,
     },
+    /// **Cracked Skull look-at-hand + may-discard substrate — Cycle 2
+    /// (2026-05-22).** "Look at target opponent's hand. You may
+    /// choose a nonland card from it. That player discards that
+    /// card." Cracked Skull's ETB trigger half. Python class:
+    /// `TargetOpponentLookHandMayDiscard` (no fields) at
+    /// `src/mtg_bot/effects/generic/discard.py:298-391`.
+    ///
+    /// **Field-free unit variant on both engines.** Python's
+    /// `@dataclass(frozen=True)` has no field slots; the controller-
+    /// of-effect (the caster who is making the may-gate decision) and
+    /// the target opponent (whose hand is looked at + discarded from)
+    /// are both resolved at resolve time — caster via the source-
+    /// controller transient (`state.current_resolve_source_controller`)
+    /// and the opponent via the standard "1 - controller" in two-
+    /// player.
+    ///
+    /// **Resolve semantics (mirrors `discard.py:330-385`).**
+    /// 1. Source-controller resolution: 5-zone walk + stack scan
+    ///    (mirrors the round-24 EachOpponentDiscards source-finder
+    ///    pattern). Source-not-found → silent fizzle.
+    /// 2. 2-player "target opponent" reduces to the one opponent:
+    ///    `opponent_idx = (1 - controller) as usize`.
+    /// 3. Compute candidates: every nonland card id in
+    ///    `target.hand`, in hand-iteration order (matches Python's
+    ///    list-comprehension order at `discard.py:352`). Land cards
+    ///    are excluded per the printed "nonland card" filter; if a
+    ///    card's printing has the Land card type it is filtered.
+    /// 4. Empty candidates → silent no-op (Python parity at
+    ///    `discard.py:353-358`: "if not options: log, return"). The
+    ///    decision is NOT pushed; the Cycle 1 substrate explicitly
+    ///    documents this Effect-arm invariant.
+    /// 5. Non-empty candidates → stamp `revealed_to[controller] =
+    ///    true` on every card in `target.hand` (the printed "look
+    ///    at" step's one-way reveal — only the caster sees, the
+    ///    public-reveal scope used by `TargetOpponentDiscardsCaster
+    ///    Choice` does not apply here). Then push
+    ///    `PendingDecision::LookAtOpponentHandMayDiscard {
+    ///    source_obj_id, controller, target_player, candidates }`
+    ///    onto the queue.
+    ///
+    /// The controller drains via
+    /// `submit_look_at_opponent_hand_may_discard_decision(Some(id))`
+    /// (force the opponent to discard that card; mirrors Python's
+    /// `target.hand.remove + zone=GRAVEYARD + graveyard.append`) or
+    /// `submit_look_at_opponent_hand_may_discard_decision(None)`
+    /// (decline the may-gate; no discard fires). Auto-resolve
+    /// `"default"` declines (mirrors Python's no-agent-seated
+    /// fallback at `discard.py:362-363`).
+    ///
+    /// **Schema parity with Python.** Unit variant on both sides — no
+    /// fields. The bridge translates this Rust variant to
+    /// `TargetOpponentLookHandMayDiscard()` (field-free
+    /// construction). The source-and-controller are read from
+    /// `state.current_resolve_source_controller` (or fall through to
+    /// `state.active_player`) at resolve time, mirroring the
+    /// `SacrificeSelfUnlessTapPermanent` controller-resolution shape.
+    ///
+    /// **`revealed_to` substrate honest-stop.** Rust's `GameObject`
+    /// does NOT today carry a `revealed_to` slot (the per-object
+    /// hidden-information reveal flag); Python's `reveal_to(card,
+    /// controller)` is a Python-side helper that mutates a per-object
+    /// reveal-set. The Cycle 2 resolve arm therefore SKIPS the look-
+    /// at reveal step — the `PendingDecision` push is the entirety of
+    /// the Rust-side state mutation pre-submit. The cross-engine
+    /// observable that matters at parity (the discard / decline
+    /// outcome on `target_player.hand` and `target_player.graveyard`)
+    /// is byte-equal because neither engine reads `revealed_to` for
+    /// any subsequent state mutation. The look-at-step's hidden-info
+    /// scope difference is documented honest-stop in
+    /// `docs/SEARCH_LIMITATIONS.md`.
+    TargetOpponentLookHandMayDiscard,
 }
 
 /// **BBB downstream complement — 7th Rust slice.**
@@ -8950,6 +9021,18 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
         }
         "tap_enchanted_permanent" => {
             Ok(Effect::TapEnchantedPermanent)
+        }
+        "target_opponent_look_hand_may_discard" => {
+            // **Cracked Skull look-at-hand + may-discard substrate —
+            // Cycle 2 (2026-05-22).** Unit variant; no payload fields
+            // beyond `kind`. Mirrors the slice-19 / slice-20 unit-
+            // variant parse arm shape verbatim (extra dict fields
+            // silently ignored for round-trip dict-shape consistency).
+            // Python's `TargetOpponentLookHandMayDiscard`
+            // (`effects/generic/discard.py:298-391`) is a field-free
+            // `@dataclass(frozen=True)`; the bridge constructs
+            // `TargetOpponentLookHandMayDiscard()` with no args.
+            Ok(Effect::TargetOpponentLookHandMayDiscard)
         }
         "put_stun_counter_on_tapped_creature" => {
             // Unit variant; no fields. Mirrors Python's
@@ -12713,6 +12796,16 @@ pub(crate) fn effect_to_pydict<'py>(
         }
         Effect::TapEnchantedPermanent => {
             d.set_item("kind", "tap_enchanted_permanent")?;
+        }
+        Effect::TargetOpponentLookHandMayDiscard => {
+            // **Cracked Skull look-at-hand + may-discard substrate —
+            // Cycle 2 (2026-05-22) — to_pydict.** Unit variant; no
+            // payload fields beyond `kind` (mirrors Python's field-
+            // free `@dataclass(frozen=True)` at
+            // `effects/generic/discard.py:298-318`). Round-trip dict-
+            // shape consistency (slice-19 / slice-20 unit-variant
+            // precedent).
+            d.set_item("kind", "target_opponent_look_hand_may_discard")?;
         }
         Effect::PutStunCounterOnTappedCreature => {
             // Round-30 stun-counter substrate. Unit variant; no

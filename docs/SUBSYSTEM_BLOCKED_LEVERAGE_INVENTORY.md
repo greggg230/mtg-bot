@@ -489,11 +489,21 @@ The 7-card subsystem-gated row's residue:
   replacement-effect substrate consumer wire-up — substrate landed at
   `7b2f62f0`; the host-as-token swap mechanism is the remaining
   honest-stop and gates the loader admit widen.**
-* **Multi-gated 3:** Chorale of the Void, Cracked Skull, Sporogenic
-  Infection — all S4-shape, all multi-gated with effect-uncovered +
-  nonsafe-trig + Aura. Phase 3 S4 substrate (`35ede8b0`) is the Aura
-  half; per-card Effect-uncovered closures + nonsafe-trigger event
-  bridges are the remaining halves.
+* **Multi-gated 2 (post-Cracked-Skull-C2 closure, 2026-05-22):**
+  Chorale of the Void, Sporogenic Infection — both S4-shape, both
+  multi-gated with effect-uncovered + nonsafe-trig + Aura. Phase 3
+  S4 substrate (`35ede8b0`) is the Aura half; per-card Effect-
+  uncovered closures + nonsafe-trigger event bridges are the
+  remaining halves.
+* **Cracked Skull (PROBED, 2026-05-22, `feature/cracked-skull-
+  cycle-2-p1`):** the first Aura-S4 multi-gate-composition card to
+  flip end-to-end. Cycle 2 ships
+  `Effect::TargetOpponentLookHandMayDiscard` + cross-engine
+  bridge arm + Phase-3 admit-set widen for the two-trigger
+  composition (ENTERS look-at-hand-may-discard + DEALT_DAMAGE
+  destroy-host). 20 parity tests at
+  `tests/test_cracked_skull_parity.py`; full closure entry at
+  `docs/SEARCH_LIMITATIONS.md` (Cracked Skull section).
 
 Sibling lane 3 (`feature/aura-phase-4`) shipped Phase 4 first
 deliverable at `6fa5ac9c` (Effect::SacrificeSelfUnlessVoidActive
@@ -736,6 +746,33 @@ upstream of this dated paragraph).
   substrate tests pinned at `tests/test_cracked_skull_cycle1.py`.
   Full Cycle 1 entry at `docs/SEARCH_LIMITATIONS.md` (Cracked
   Skull section).
+
+  **Cracked Skull Cycle 2 landed (2026-05-22,
+  `feature/cracked-skull-cycle-2-p1`).** Closure of the Aura-S4
+  multi-gate composition lane's ETB-trigger half + PROBED flip.
+  Cycle 2 ships: `Effect::TargetOpponentLookHandMayDiscard` unit
+  variant on `rust/src/cards.rs` (parse + to_pydict + resolve
+  arm), cross-engine bridge arm
+  `target_opponent_look_hand_may_discard` in
+  `src/mtg_bot/parity/cross_engine.py::_ta_dict_to_python_effect`,
+  Phase-3 safe-trigger admit-set widen
+  (`_aura_triggers_are_phase3_safe`) adding shape 4
+  (`ENTERS+IsSelf+TargetOpponentLookHandMayDiscard`) + shape 5
+  (`DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent` — Cracked
+  Skull's second trigger half), and the matching
+  `_python_ta_to_safe_dict_aura_phase3` emitter arms. Net result:
+  Cracked Skull progresses from BLOCKED-multi-gate →
+  **PROBED** end-to-end (the first Aura with a two-trigger
+  composition — ETB look-at-hand-may-discard + DEALT_DAMAGE
+  host-event destroy — to ride the bench loader end-to-end). 20
+  parity tests pinned at
+  `tests/test_cracked_skull_parity.py`. `revealed_to`
+  honest-stop documented in `docs/SEARCH_LIMITATIONS.md`
+  (Cracked Skull section): Rust's `GameObject` doesn't carry a
+  per-object `revealed_to` slot today, but the post-resolve
+  cross-engine observable on `target_player.hand` /
+  `target_player.graveyard` is byte-equal because neither engine
+  reads `revealed_to` for any subsequent state mutation.
 
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
