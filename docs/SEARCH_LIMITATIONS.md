@@ -10325,6 +10325,88 @@ slices.
 
 ---
 
+## Cracked Skull — look-at-hand + may-discard substrate (Rust side)
+
+**Status (2026-05-22): Cycle 1 LANDED on
+`feature/cracked-skull-cycle-1-p1` (substrate only).**
+
+Cracked Skull (`{2}{B}` Enchantment — Aura, DSK special-guest reprint
+in the EoE pool) prints two trigger halves on its Aura body:
+
+1. ETB (ENTERS): "Look at target opponent's hand. You may choose a
+   nonland card from it. That player discards that card."
+2. DEALT_DAMAGE (host-damage): "When enchanted creature is dealt
+   damage, destroy it." — already shipped via
+   `Effect::DestroyEnchantedPermanent` + `Predicate::IsHost` + the
+   `attached_to` source-substitution at `state_ops_resolve.rs`.
+
+The ETB half is the long-pole shape. The Python effect class
+`TargetOpponentLookHandMayDiscard` at
+`src/mtg_bot/effects/generic/discard.py:298-391` mints an
+agent-driven `look-at-hand → may-gate (choose_yes_no) →
+directed-discard (choose_card_from_opponent_hand)` sequence; the
+no-agent-seated fallback is to silently decline (no discard).
+
+**Multi-cycle lane (2 cycles total).**
+
+* **Cycle 1 (LANDED, 2026-05-22).** Runtime substrate:
+  `PendingDecision::LookAtOpponentHandMayDiscard {source_obj_id,
+  controller, target_player, candidates}` variant on
+  `rust/src/state.rs`, dict-snapshot surface,
+  fingerprint-serialization arm (`state_ops_fingerprint.rs`),
+  `submit_look_at_opponent_hand_may_discard_decision` dispatcher
+  (sibling shape to `submit_tap_permanent_decision`: `Some(id)` →
+  directed discard from `target_player.hand` → `target_player
+  .graveyard` with `Event::DiscardsCard` dispatch; `None` →
+  decline-no-op), `push_look_at_opponent_hand_may_discard_choice`
+  synthetic-test PyO3 helper, and two auto-resolve strategies
+  (`"look_at_hand_decline"` aliases the default-decline path,
+  `"look_at_hand_discard_first"` mirrors the
+  `tap_permanent_first` deterministic-first precedent).
+  Back-compat byte-equal: zero production caller mints the
+  variant today; the synthetic-test helper is the only push
+  path, so pre-Cycle-1 pinned fingerprints / pending-decision
+  snapshots stay identical. 18 substrate tests pinned at
+  `tests/test_cracked_skull_cycle1.py`.
+
+* **Cycle 2 (planned).** `Effect::TargetOpponentLookHandMayDiscard`
+  unit variant on `rust/src/cards.rs` (mirrors Python's
+  field-free Effect class), parse/admit-gate path (admit Cracked
+  Skull at the loader once Cycle 2 lands), Python → Rust effect
+  bridge (`effects_to_pydict` round-trip), resolve arm in
+  `state_ops_resolve.rs` that locates the source on bf, computes
+  the legal opponent set (controller-of-effect resolution as
+  with the SacrificeSelfUnlessTapPermanent / EachOpponentDiscards
+  / Lightstall arms), looks up the target opponent's hand,
+  filters to nonland candidate ids, and pushes
+  `PendingDecision::LookAtOpponentHandMayDiscard` (skipping the
+  push when candidates is empty — Python parity at
+  `effects/generic/discard.py:353-358` "if not options: log,
+  return"). Cycle 2 also stamps `revealed_to` on every card in
+  the target opponent's hand (the printed "look at" step's
+  one-way reveal — Cycle 1 substrate is pure decision-queue
+  plumbing). Trajectory probe + PROBED flip on closure.
+
+**Sibling-shape precedent.** The Cycle 1 substrate mirrors the
+20th-Rust-slice (VVV Pin 2) Command Bridge / SacrificeSelfUnlessTap
+Permanent lane: `Some(id)` = act on `id`; `None` = decline. The same
+shape covers Cracked Skull because the may-gate's "no" branch and
+the printed-target's "yes (id)" branch collapse to a single
+decision-with-optional-id, exactly like Command Bridge's
+"tap-permanent-id-or-sacrifice-self".
+
+Source files updated this cycle:
+* `rust/src/state.rs` — append `LookAtOpponentHandMayDiscard`
+  variant onto `enum PendingDecision`.
+* `rust/src/state_ops_fingerprint.rs` — `Value::Array` arm.
+* `rust/src/state_ops_decisions.rs` — dict snapshot,
+  auto-resolve arm, helper `apply_directed_discard_from_opponent_hand`,
+  `submit_look_at_opponent_hand_may_discard_decision` dispatcher,
+  `push_look_at_opponent_hand_may_discard_choice` synthetic helper,
+  strategy-name validation widened.
+
+---
+
 When you take a deliberate shortcut (heuristic, approximation,
 incomplete CR conformance), add a section here with:
 - Where in the code (file:line)

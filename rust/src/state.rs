@@ -1999,6 +1999,83 @@ pub enum PendingDecision {
         controller: u8,
         candidates: Vec<u32>,
     },
+    /// **Cracked Skull look-at-hand + may-discard substrate — Cycle 1
+    /// (2026-05-22).** "Look at target opponent's hand. You may choose
+    /// a nonland card from it. That player discards that card." Pushed
+    /// (in Cycle 2) by `Effect::TargetOpponentLookHandMayDiscard` —
+    /// Cracked Skull's ETB trigger half. Cycle 1 lands the runtime
+    /// substrate; Cycle 2 wires the Effect variant + bridge + admit
+    /// + PROBED flip.
+    ///
+    /// **Sibling-shape precedent.** Same shape as `TapPermanentChoice`:
+    /// the controller picks ONE id from `candidates` to act on (here,
+    /// the opponent discards that card) OR `None` to decline (the may-
+    /// gate's "no" branch — no discard happens). `candidates` is the
+    /// flat list of nonland card ids in the target opponent's hand,
+    /// computed at push time and source-excluded by construction (the
+    /// caster never picks their own cards — the discard target is the
+    /// opponent's hand). Land cards are excluded at push time per the
+    /// printed "nonland card" filter (Python parity at
+    /// `effects/generic/discard.py:352`).
+    ///
+    /// **Payload.** Carries:
+    ///   * `source_obj_id` — the Aura/source on bf whose ETB triggered
+    ///     (recorded for log-correlation; not used in routing).
+    ///   * `controller` — the player making the choice (the caster /
+    ///     ETB-trigger controller).
+    ///   * `target_player` — the opponent whose hand was looked at;
+    ///     the discard fires from this player's hand (NOT the
+    ///     controller's). Distinct from `controller` because the choice-
+    ///     making seat and the discard-target seat are different roles.
+    ///   * `candidates` — flat list of nonland card ids currently in
+    ///     `target_player.hand`, in popped-from-hand iteration order
+    ///     (matches Python's `[c for c in target.hand if not
+    ///     c.printing.is_land]` list-comprehension order).
+    ///
+    /// **Submit.** (Cycle 1 lands the dispatcher.)
+    /// `submit_look_at_opponent_hand_may_discard_decision(Some(id))`
+    /// routes `id` from `target_player.hand` → `target_player.graveyard`
+    /// and stamps `zone = Zone::Graveyard` on the card object;
+    /// `None` declines (no discard — same shape as `TapPermanentChoice`'s
+    /// decline-via-`None`). `id` MUST be one of the candidate ids;
+    /// an unknown id raises `ValueError` transactionally.
+    ///
+    /// **Auto-resolve default.** `"default"` declines (no discard) —
+    /// matches Python's no-agent-seated fallback at
+    /// `effects/generic/discard.py:362-363` (`if caster.agent is None:
+    /// return`). Explicit strategy `"look_at_hand_discard_first"`
+    /// discards `candidates[0]` (the first nonland card in hand
+    /// iteration order — sibling of `tap_permanent_first`'s "FIRST-
+    /// listed untapped permanent" semantics; useful for test fixtures
+    /// that want to exercise the discard branch under auto-resolve).
+    ///
+    /// **Empty candidate set.** Cycle 1 contract: the Cycle 2 Effect
+    /// arm SHOULD skip pushing the decision when `candidates` is
+    /// empty (Python parity at `effects/generic/discard.py:353-358`:
+    /// "if not options: log and return"). Cycle 1's synthetic-test
+    /// push helper does NOT enforce this guard — callers (test
+    /// fixtures only — no production caller exists in Cycle 1) may
+    /// push an empty-candidate variant to exercise the decline-default
+    /// path. Submit with `Some(id)` on an empty-candidate head raises
+    /// `ValueError` (id not in empty set); submit with `None` is a
+    /// well-defined decline-no-op.
+    ///
+    /// **No reveal-state mutation in Cycle 1.** Python's resolve also
+    /// mutates `reveal_to(card, controller)` on every card in
+    /// `target.hand` (one-way reveal — caster sees the hand). Rust's
+    /// per-object `revealed_to` slot will be the Cycle 2 Effect arm's
+    /// responsibility to stamp at push time. Cycle 1's substrate is
+    /// PURE decision-queue plumbing — no hand-reveal mutation, no
+    /// `revealed_to` flag flips. The fingerprint serialization
+    /// captures only the candidate ids (analogous to
+    /// `TapPermanentChoice`'s candidates-only shape), which is the
+    /// minimal information determining the choice surface.
+    LookAtOpponentHandMayDiscard {
+        source_obj_id: u32,
+        controller: u8,
+        target_player: u8,
+        candidates: Vec<u32>,
+    },
 }
 
 /// `GameState` carries an `Arc<RegistryData>` so every clone shares

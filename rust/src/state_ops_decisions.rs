@@ -164,6 +164,8 @@ pub(crate) fn auto_resolve_pending(
         | "tap_permanent_decline"
         | "tap_permanent_first"
         | "enchant_target_first"
+        | "look_at_hand_decline"
+        | "look_at_hand_discard_first"
         | "default" => {}
         other => {
             return Err(PyValueError::new_err(format!(
@@ -173,7 +175,8 @@ pub(crate) fn auto_resolve_pending(
                  if_you_do_yes, if_you_do_no, manifest_top, reveal_yes, \
                  reveal_no, optional_pay_yes, optional_pay_no, \
                  scry_keep_top, scry_send_bottom, tap_permanent_decline, \
-                 tap_permanent_first, enchant_target_first, default"
+                 tap_permanent_first, enchant_target_first, \
+                 look_at_hand_decline, look_at_hand_discard_first, default"
             )))
         }
     }
@@ -553,6 +556,43 @@ pub(crate) fn auto_resolve_pending(
                 // target_obj_id=None so STEP 4 fizzles on resolve —
                 // matches the "no legal target chosen" semantics.
             }
+            PendingDecision::LookAtOpponentHandMayDiscard {
+                source_obj_id: _,
+                controller: _,
+                target_player,
+                candidates,
+            } => {
+                // **Cracked Skull look-at-hand + may-discard substrate
+                // — Cycle 1 (2026-05-22) — auto-resolve.**
+                //
+                // "look_at_hand_discard_first" -> discard candidates[0]
+                //   from `target_player`'s hand. Mirrors the
+                //   `tap_permanent_first` deterministic-first
+                //   precedent for cases where a test fixture wants to
+                //   exercise the discard branch under auto-resolve.
+                //
+                // "default" / unrelated -> decline (no discard). Matches
+                //   Python's no-agent-seated fallback at
+                //   `effects/generic/discard.py:362-363` (`if
+                //   caster.agent is None: return`). The default is
+                //   decline, not "discard first", because Cracked
+                //   Skull's printed text reads "You MAY choose a
+                //   nonland card" — the may-gate's no-agent answer is
+                //   "no" (don't direct the discard), matching the
+                //   broader sibling pattern that `TapPermanentChoice`
+                //   defaults to decline (combinators.py:139-141).
+                let discard_first =
+                    matches!(strategy, "look_at_hand_discard_first");
+                if discard_first && !candidates.is_empty() {
+                    apply_directed_discard_from_opponent_hand(
+                        state,
+                        target_player,
+                        candidates[0],
+                    )?;
+                }
+                // Else: decline -> no mutation. Mirrors Python's
+                // no-agent-seated return-without-discarding.
+            }
         }
     }
     Ok(())
@@ -613,6 +653,83 @@ fn bind_enchant_target_to_stack_item(
 /// (LTB'd between push and submit), the tap is a silent partial. The
 /// submit dispatcher's validation already runs the bf-presence check
 /// at submit time before reaching this helper.
+/// **Cracked Skull look-at-hand + may-discard substrate — Cycle 1
+/// (2026-05-22).** Apply the "force the target opponent to discard
+/// `chosen_id` from their hand" branch of the
+/// `PendingDecision::LookAtOpponentHandMayDiscard` resolve. Mirrors
+/// Python's `target.hand.remove(chosen); chosen.zone = Zone.GRAVEYARD;
+/// target.graveyard.append(chosen)` at
+/// `effects/generic/discard.py:379-381` byte-for-byte on the zone
+/// routing, plus Python's `state.log.append(...)` echo (Rust drops
+/// log strings — never observed by parity).
+///
+/// **Per-object state reset on zone change** (CR 400.7) — mirrors the
+/// `Effect::DiscardCard` arm at `state_ops_resolve.rs:3246-3252`:
+/// `tapped`/`summoning_sick`/`damage`/`counters`/`attached_to`/
+/// `exiled_with_source` reset on the way to graveyard. For a card
+/// in hand the fields are at default already (a card in hand cannot
+/// be tapped, summoning-sick, or have damage / counters), but the
+/// reset keeps schema-uniformity with every other zone-change path.
+///
+/// **`Event::DiscardsCard` dispatch** mirrors the
+/// `Effect::DiscardCard` arm's dispatch shape verbatim. Subject is
+/// the discarding player sentinel (`PLAYER_SUBJECT_OFFSET +
+/// target_player`) — the same convention every player-subject event
+/// uses (BEGINNING_OF_END_STEP, etc.). Entropic Battlecruiser's
+/// "Whenever an opponent discards a card, they lose 3 life" trigger
+/// reaches the dispatcher via this fan-out.
+///
+/// **Defensive: missing chosen_id.** If `chosen_id` is no longer in
+/// `target_player.hand` (e.g. the card was moved out by a separate
+/// effect between push and submit — defensive; the submit
+/// dispatcher's validation runs the candidate-set check at submit
+/// time before reaching this helper), this is a silent no-op on the
+/// discard. The auto-resolve path's deterministic-first pick from
+/// `candidates[0]` cannot trigger this case (the candidates list is
+/// snapshotted at push time and is exactly what's in hand at that
+/// moment — the auto-resolve drains immediately).
+fn apply_directed_discard_from_opponent_hand(
+    state: &mut GameState,
+    target_player: u8,
+    chosen_id: u32,
+) -> PyResult<()> {
+    let tidx = target_player as usize;
+    if tidx >= 2 {
+        // Defensive — invalid player id; never panics, just silent
+        // no-op. The push helper validates target_player at push time.
+        return Ok(());
+    }
+    let pos = state.players[tidx]
+        .hand
+        .iter()
+        .position(|o| o.id == chosen_id);
+    let Some(pos) = pos else {
+        // Card already left the hand (defensive). Silent partial.
+        return Ok(());
+    };
+    let hand_mut: &mut Vec<crate::state::GameObject> =
+        Arc::make_mut(&mut state.players[tidx].hand);
+    let mut obj = hand_mut.remove(pos);
+    obj.zone = crate::state_ops_zones::ZONE_GRAVEYARD;
+    obj.tapped = false;
+    obj.summoning_sick = false;
+    obj.damage = 0;
+    obj.counters = 0;
+    obj.attached_to = None;
+    obj.exiled_with_source = None;
+    Arc::make_mut(&mut state.players[tidx].graveyard).push(obj);
+    // Fire DiscardsCard on the discarding player (same shape as
+    // Effect::DiscardCard at state_ops_resolve.rs:3263-3269).
+    let discarding_player_subject =
+        crate::cards::PLAYER_SUBJECT_OFFSET + tidx as u32;
+    crate::state_ops_resolve::dispatch_event(
+        state,
+        crate::cards::Event::DiscardsCard,
+        discarding_player_subject,
+    )?;
+    Ok(())
+}
+
 fn apply_tap_permanent_keep_source(
     state: &mut GameState,
     controller: u8,
@@ -1289,6 +1406,35 @@ impl GameState {
                     d.set_item("kind", "EnchantTargetChoice")?;
                     d.set_item("source_obj_id", *source_obj_id)?;
                     d.set_item("controller", *controller)?;
+                    d.set_item("candidates", candidates.clone())?;
+                }
+                PendingDecision::LookAtOpponentHandMayDiscard {
+                    source_obj_id,
+                    controller,
+                    target_player,
+                    candidates,
+                } => {
+                    // **Cracked Skull look-at-hand + may-discard
+                    // substrate — Cycle 1 (2026-05-22).** Surface dict
+                    // for Cracked Skull's ETB trigger: look at the
+                    // target opponent's hand, may direct a discard.
+                    // `candidates` is the flat list of nonland card
+                    // ids in `target_player.hand` at push time (Python
+                    // parity: `effects/generic/discard.py:352`'s
+                    // `[c for c in target.hand if not c.printing.is_land]`).
+                    // The controller drains via
+                    // `submit_look_at_opponent_hand_may_discard_decision(Some(id))`
+                    // (force discard of that card) or
+                    // `submit_look_at_opponent_hand_may_discard_decision(None)`
+                    // (decline the may-gate — no discard). Same id-
+                    // based idiom as `TapPermanentChoice`'s
+                    // `candidates: Vec<u32>` flat list, extended with
+                    // a `target_player` slot (distinct from
+                    // `controller` — the discard target seat).
+                    d.set_item("kind", "LookAtOpponentHandMayDiscard")?;
+                    d.set_item("source_obj_id", *source_obj_id)?;
+                    d.set_item("controller", *controller)?;
+                    d.set_item("target_player", *target_player)?;
                     d.set_item("candidates", candidates.clone())?;
                 }
             }
@@ -2153,6 +2299,166 @@ impl GameState {
         Ok(())
     }
 
+    /// **Cracked Skull look-at-hand + may-discard substrate — Cycle 1
+    /// (2026-05-22).** Consume the head
+    /// `LookAtOpponentHandMayDiscard` on the pending-decisions queue:
+    /// `chosen_id = Some(id)` directs the target opponent to discard
+    /// `id` from their hand → graveyard (mirrors Python's
+    /// `target.hand.remove(chosen); chosen.zone = Zone.GRAVEYARD;
+    /// target.graveyard.append(chosen)` at
+    /// `effects/generic/discard.py:379-381`).
+    /// `chosen_id = None` declines the may-gate — no discard fires
+    /// (mirrors Python's `if not caster.agent.choose_yes_no: log,
+    /// return` at `effects/generic/discard.py:364-372`).
+    ///
+    /// **Submit contract.** `chosen_id` MUST be one of the candidate
+    /// ids in the head's `candidates` Vec OR `None`. An unknown id
+    /// raises `ValueError` transactionally — no mutation on failure,
+    /// the decision stays at the head of the queue. Mirrors the
+    /// `submit_tap_permanent_decision` validation shape exactly.
+    ///
+    /// Raises `ValueError` if:
+    /// - the queue is empty
+    /// - the head is not a `LookAtOpponentHandMayDiscard`
+    /// - `chosen_id = Some(id)` and `id` is not in the candidate set
+    #[pyo3(signature = (chosen_id=None))]
+    fn submit_look_at_opponent_hand_may_discard_decision(
+        &mut self,
+        chosen_id: Option<u32>,
+    ) -> PyResult<()> {
+        if self.pending_decisions.is_empty() {
+            return Err(PyValueError::new_err(
+                "submit_look_at_opponent_hand_may_discard_decision: \
+                 no pending decision",
+            ));
+        }
+        // Inspect head — fail before any mutation on a discriminant
+        // mismatch or unknown chosen_id.
+        match &self.pending_decisions[0] {
+            PendingDecision::LookAtOpponentHandMayDiscard {
+                candidates,
+                ..
+            } => {
+                if let Some(id) = chosen_id {
+                    if !candidates.contains(&id) {
+                        return Err(PyValueError::new_err(format!(
+                            "submit_look_at_opponent_hand_may_discard_decision: \
+                             chosen_id {id} is not one of the candidate \
+                             opponent-hand nonland-card ids {:?}",
+                            candidates
+                        )));
+                    }
+                }
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "submit_look_at_opponent_hand_may_discard_decision: \
+                     head of pending-decisions queue is not a \
+                     LookAtOpponentHandMayDiscard (got {:?}); call the \
+                     variant-specific submit_* dispatcher (e.g. \
+                     submit_surveil_decision)",
+                    std::mem::discriminant(other)
+                )));
+            }
+        }
+        // Validation passed — consume the head and route.
+        let decision = self.pending_decisions.remove(0);
+        let target_player = match decision {
+            PendingDecision::LookAtOpponentHandMayDiscard {
+                target_player,
+                ..
+            } => target_player,
+            _ => unreachable!("validated above"),
+        };
+        match chosen_id {
+            Some(id) => {
+                apply_directed_discard_from_opponent_hand(
+                    self,
+                    target_player,
+                    id,
+                )
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// **Cracked Skull look-at-hand + may-discard substrate — Cycle 1
+    /// (2026-05-22) — synthetic-test push helper.** Push a
+    /// `PendingDecision::LookAtOpponentHandMayDiscard` onto the
+    /// queue directly. Used by Cycle 1 tests to exercise the
+    /// substrate without an Effect arm minting the decision (Cycle 2
+    /// adds the live mint at the
+    /// `Effect::TargetOpponentLookHandMayDiscard` resolve site).
+    ///
+    /// **Production caller count.** ZERO in Cycle 1 (substrate only).
+    /// Cycle 2's Effect resolve arm replaces this push helper as the
+    /// sole live mint site; the helper stays for synthetic-test
+    /// coverage of the substrate primitives in isolation.
+    ///
+    /// **Empty candidate set.** Accepted at push time — the push
+    /// helper is the test-only entrypoint and a Cycle 1 test
+    /// exercises the empty-candidate decline-default path. The Cycle 2
+    /// Effect arm SHOULD short-circuit (no push) on empty candidates
+    /// per Python parity at `effects/generic/discard.py:353-358`, but
+    /// the substrate doesn't enforce that guard — it's an Effect-arm
+    /// invariant in Cycle 2.
+    ///
+    /// **Validation.** `target_player` MUST be 0 or 1 (a valid player
+    /// seat). Every candidate id MUST refer to a card currently in
+    /// `state.players[target_player].hand` (the push helper is the
+    /// test-only entrypoint, but invalid ids would create a
+    /// queue-state that no submit can safely route — the validation
+    /// is therefore strict). Raises `ValueError` transactionally if
+    /// any candidate id is missing from `target_player.hand` or if
+    /// `target_player` is invalid.
+    fn push_look_at_opponent_hand_may_discard_choice(
+        &mut self,
+        source_obj_id: u32,
+        controller: u8,
+        target_player: u8,
+        candidates: Vec<u32>,
+    ) -> PyResult<()> {
+        if target_player >= 2 {
+            return Err(PyValueError::new_err(format!(
+                "push_look_at_opponent_hand_may_discard_choice: \
+                 target_player={target_player} is not a valid player \
+                 seat (must be 0 or 1)"
+            )));
+        }
+        if controller >= 2 {
+            return Err(PyValueError::new_err(format!(
+                "push_look_at_opponent_hand_may_discard_choice: \
+                 controller={controller} is not a valid player seat \
+                 (must be 0 or 1)"
+            )));
+        }
+        // Each candidate id must currently live in target_player.hand.
+        let tidx = target_player as usize;
+        let hand_ids: std::collections::HashSet<u32> = self.players[tidx]
+            .hand
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        for id in &candidates {
+            if !hand_ids.contains(id) {
+                return Err(PyValueError::new_err(format!(
+                    "push_look_at_opponent_hand_may_discard_choice: \
+                     candidate id {id} is not in \
+                     state.players[{target_player}].hand"
+                )));
+            }
+        }
+        self.pending_decisions.push(
+            PendingDecision::LookAtOpponentHandMayDiscard {
+                source_obj_id,
+                controller,
+                target_player,
+                candidates,
+            },
+        );
+        Ok(())
+    }
+
     /// Drain the pending-decisions queue using a deterministic
     /// strategy. Useful for callers that don't model the choice
     /// dimension (training harnesses, parity tests, deterministic
@@ -2193,13 +2499,20 @@ impl GameState {
     ///   per-variant defaults.
     /// * `"scry_send_bottom"` — ScryChoice routes the examined card to
     ///   library bottom. Other variants fall through.
+    /// * `"look_at_hand_decline"` — LookAtOpponentHandMayDiscard
+    ///   declines the may-gate (no discard). Other variants fall
+    ///   through.
+    /// * `"look_at_hand_discard_first"` — LookAtOpponentHandMayDiscard
+    ///   discards `candidates[0]` from the target opponent's hand.
+    ///   Other variants fall through.
     /// * `"default"` — Surveil keeps all on top; MayDo + IfYouDo
     ///   answer "yes"; PickCardFromExamined picks the topmost
     ///   examined card; ChooseModeChoice picks `modes[0]`; the
     ///   OptionalManaCostChoice does the Python-parity "pay if
     ///   affordable, else skip" (mirrors the base-Agent default in
     ///   Python); ScryChoice routes the examined card back to library
-    ///   top (conservative non-decision).
+    ///   top (conservative non-decision); LookAtOpponentHandMayDiscard
+    ///   declines the may-gate (no discard — Python no-agent parity).
     ///
     /// Raises `ValueError` on an unknown strategy.
     fn auto_resolve_pending_decisions(&mut self, strategy: &str) -> PyResult<()> {

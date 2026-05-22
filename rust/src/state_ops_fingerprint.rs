@@ -599,6 +599,30 @@ impl GameState {
                             candidates.iter().map(|id| json!(*id)).collect(),
                         ),
                     ]),
+                    // **Cracked Skull look-at-hand + may-discard
+                    // substrate — Cycle 1 (2026-05-22).** The candidate
+                    // ids + the target_player slot fully determine the
+                    // pending-state shape: re-resolving with a different
+                    // candidate set OR a different target seat would
+                    // expose a different choice surface, so both
+                    // participate in the fingerprint. Shape mirrors
+                    // `TapPermanentChoice`'s flat u32 list, extended
+                    // with the target_player slot (distinct from the
+                    // controller — the discard target seat).
+                    PendingDecision::LookAtOpponentHandMayDiscard {
+                        source_obj_id,
+                        controller,
+                        target_player,
+                        candidates,
+                    } => Value::Array(vec![
+                        Value::String("LookAtOpponentHandMayDiscard".to_string()),
+                        json!(*source_obj_id),
+                        json!(*controller),
+                        json!(*target_player),
+                        Value::Array(
+                            candidates.iter().map(|id| json!(*id)).collect(),
+                        ),
+                    ]),
                 })
                 .collect();
             parts_vec.push(Value::Array(pds));

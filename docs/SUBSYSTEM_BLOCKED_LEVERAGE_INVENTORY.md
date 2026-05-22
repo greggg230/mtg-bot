@@ -708,6 +708,35 @@ upstream of this dated paragraph).
   overrides. Full Cycle 1 entry at `docs/SEARCH_LIMITATIONS.md`
   §1 (Mutinous Massacre).
 
+  **Cracked Skull Cycle 1 landed (2026-05-22,
+  `feature/cracked-skull-cycle-1-p1`).** Substrate-only for the
+  Aura-S4 multi-gate composition lane's ETB-trigger half (Cracked
+  Skull's "look at target opponent's hand; you may choose a
+  nonland card from it; that player discards that card" oracle
+  text, the second of three Aura-S4 multi-gate composition cards
+  alongside Chorale of the Void and Sporogenic Infection). Rust-
+  side: `PendingDecision::LookAtOpponentHandMayDiscard
+  {source_obj_id, controller, target_player, candidates}` variant
+  on `enum PendingDecision`; fingerprint-serialization arm;
+  dict-snapshot surface; `submit_look_at_opponent_hand_may_discard
+  _decision(Option<u32>)` dispatcher (sibling shape to
+  `submit_tap_permanent_decision` — `Some(id)` directs the
+  opponent to discard that card; `None` declines the may-gate);
+  `push_look_at_opponent_hand_may_discard_choice` synthetic-test
+  PyO3 helper (zero production callers in C1; C2's Effect arm
+  replaces it as the sole live mint); two auto-resolve
+  strategies (`"look_at_hand_decline"` aliases the default-decline
+  path, `"look_at_hand_discard_first"` mirrors `tap_permanent_first`).
+  Substrate landing is **back-compat byte-equivalent** on
+  production self-play / cross-engine trajectories — no production
+  caller mints the variant today; pre-Cycle-1 pending-decision
+  fingerprints / snapshots stay identical. Cycle 2 wires
+  `Effect::TargetOpponentLookHandMayDiscard` + Python ↔ Rust
+  bridge + admit-gate at the Aura loader + PROBED flip. 18
+  substrate tests pinned at `tests/test_cracked_skull_cycle1.py`.
+  Full Cycle 1 entry at `docs/SEARCH_LIMITATIONS.md` (Cracked
+  Skull section).
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 
