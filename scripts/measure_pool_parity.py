@@ -828,6 +828,20 @@ PROBE_MODULES: tuple[Path, ...] = (
     # attribution gap and makes the metric robust against future
     # rearrangement of the redundant routes.
     REPO_ROOT / "tests" / "test_probe_ppp_downstream.py",
+    # **control-change-ueot-cycle-4-p1 (2026-05-22):** Cycle 4 of the
+    # control-change-UEOT subsystem — Mutinous Massacre closure
+    # (~4,671 17lands decks). The dedicated probe module
+    # ``test_mutinous_massacre_parity.py`` carries the canonical
+    # ``test_cross_engine_real_eoe_mutinous_massacre_control_change
+    # _parity`` function which drives the genuine parsed Mutinous
+    # Massacre printing through both engines. The C1-C3 substrate
+    # (controller_override field + helper + cleanup drain + bridge
+    # round-trip — landed across cycles 1-3 of the same triad lane)
+    # + this lane's ``Effect::MutinousMassacreEffect`` field-free unit
+    # variant + resolve arm (the FIRST Rust call site that mints a
+    # non-None override) + bridge arms + reverse-serializer leaf
+    # flips Mutinous Massacre COVERED → PROBED.
+    REPO_ROOT / "tests" / "test_mutinous_massacre_parity.py",
 )
 
 # Tier keys (stable — the doc + test reference these verbatim).

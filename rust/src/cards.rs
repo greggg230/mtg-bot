@@ -2014,6 +2014,67 @@ pub enum Effect {
     ///    the GameObject onto `former_controller`'s battlefield,
     ///    queue ETB dispatch.
     EmergencyEjectEffect { token_printing_id: u32 },
+    /// **Control-change-UEOT subsystem — Cycle 4 live mint site
+    /// (2026-05-22; ~4,671 17lands decks).** `{3}{B}{B}{R}{R}`
+    /// Sorcery: "Choose odd or even. Destroy each creature with
+    /// mana value of the chosen quality. Then gain control of all
+    /// creatures until end of turn. Untap them. They gain haste
+    /// until end of turn. (Zero is even.)"
+    ///
+    /// Mirrors Python's `MutinousMassacreEffect`
+    /// (`effects/bespoke.py:1283`). Field-free unit variant — the
+    /// odd/even pick is NOT serialized on the variant. The Python
+    /// resolve calls `agent.choose_mode(["odd", "even"])` from
+    /// inside the effect body and branches; the Rust resolve mirrors
+    /// the Python no-agent fallback (default pick=0 / odd) since
+    /// Rust has no agent surface inside `apply_effect`. The probe
+    /// drives both engines through a path where the agent picks 0
+    /// (the same deterministic-first pattern the bf-iter probes
+    /// already pin byte-equal — see the `_PickFirstLegalTargetAgent`
+    /// convention).
+    ///
+    /// **Resolve semantics (mirrors `MutinousMassacreEffect.resolve`
+    /// at `effects/bespoke.py:1296-1356` byte-equal):**
+    /// 1. Pick = 0 (odd). Synthetic-test fallback also = 0; matches
+    ///    Python's `if p.agent is not None: pick = ... else: pick=0`
+    ///    no-agent branch at `:1303-1306`.
+    /// 2. Walk `bf_iter_etb_sorted` and collect creatures whose
+    ///    `mana_cost.total` parity matches the chosen quality
+    ///    (`odd` → mv % 2 == 1; `even` → mv % 2 == 0). Skip
+    ///    indestructible (CR 701.7c — indestructible can't be
+    ///    destroyed; matches Python's `turn.destroy()` early-return).
+    /// 3. Destroy each via the proven `DestroyAllCreatures` arm body
+    ///    (bf-remove → reset → push to graveyard → DIES + LEAVES +
+    ///    token-cease dispatches). The destroy filter respects
+    ///    indestructible; the gain-control phase below does NOT skip
+    ///    indestructible (CR 110.1 — control change works on any
+    ///    permanent).
+    /// 4. For every surviving battlefield creature whose effective
+    ///    controller != caster:
+    ///    a. Stamp `controller_override = Some(caster_pid)` (the
+    ///       Cycle-1 substrate's mint site — inlined here per per-
+    ///       slice file-iso). Idempotent same-controller short-
+    ///       circuit (matches the Cycle-1 helper's behavior).
+    ///    b. `obj.tapped = false` (untap).
+    ///    c. Push `UeotModifier::GrantKeyword { keyword: "haste" }`
+    ///       onto `obj.ueot_modifiers` (the proven `BiosynthicBurst
+    ///       Effect` haste-grant push shape). Expires at the next
+    ///       cleanup pass via the round-27 CR 514.3 UEOT-clear pass.
+    /// 5. The cleanup-step `clear_controller_overrides_all` pass
+    ///    drains every stamped override back to `None` at end of
+    ///    turn — the Cycle-1 substrate already wired this.
+    ///
+    /// **Field-free unit variant** (the `ExorciseEffect` /
+    /// `CloseEncounterEffect` Tier-A unit-variant idiom). No dict
+    /// payload — the pick is intrinsic to the resolve arm (Rust no-
+    /// agent default; the probe path drives the same default on
+    /// Python). Python's `MutinousMassacreEffect` is a parameterless
+    /// frozen dataclass.
+    ///
+    /// **Schema parity with Python.** Unit variant on both sides — no
+    /// fields. The bridge translates this Rust variant to
+    /// `MutinousMassacreEffect()` (field-free construction).
+    MutinousMassacreEffect,
     /// Deal `amount` damage to any target — creature OR player
     /// (Lightning Bolt pattern, CR 701.4). 7 cards in EoE pool per
     /// round-20 measurement (Debris Field Crusher etc.). Mirrors
@@ -8515,6 +8576,17 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
                 require(dict, "token_printing_id")?.extract()?;
             Ok(Effect::EmergencyEjectEffect { token_printing_id })
         }
+        "mutinous_massacre_effect" => {
+            // Control-change-UEOT subsystem — Cycle 4 live mint site
+            // (2026-05-22; ~4,671 17lands decks). Unit variant — no
+            // required fields. The odd/even pick is intrinsic to the
+            // resolve arm (Rust default = pick 0 / odd, mirroring
+            // Python's no-agent fallback at `bespoke.py:1303-1306`).
+            // Extra keys ignored. Mirrors the `close_encounter_effect`
+            // / `exorcise_effect` field-free unit-variant parser arm
+            // shape.
+            Ok(Effect::MutinousMassacreEffect)
+        }
         "deal_damage_any_target" => {
             // Python's `DealDamageAnyTarget(DealDamage)` carries the
             // inherited `amount` field plus an `optional: bool` slot
@@ -12415,6 +12487,17 @@ pub(crate) fn effect_to_pydict<'py>(
             // on the StackItem (`current_resolve_payload_target_id`).
             d.set_item("kind", "emergency_eject_effect")?;
             d.set_item("token_printing_id", *token_printing_id)?;
+        }
+        Effect::MutinousMassacreEffect => {
+            // Control-change-UEOT subsystem — Cycle 4 live mint site
+            // (2026-05-22). Unit variant — `kind` only (the Close
+            // Encounter / Exorcise field-free to_dict idiom).
+            // Bidirectional with the `mutinous_massacre_effect`
+            // parse arm + the `cross_engine.py` bridge arm + the
+            // `trajectory.py` reverse-serializer leaf. The odd/even
+            // pick is intrinsic to the resolve arm (NOT serialized
+            // — Rust mirrors Python's no-agent default pick=0).
+            d.set_item("kind", "mutinous_massacre_effect")?;
         }
         Effect::DealDamageAnyTarget { amount } => {
             d.set_item("kind", "deal_damage_any_target")?;

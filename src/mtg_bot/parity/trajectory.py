@@ -4124,6 +4124,7 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
         DiplomaticRelationsEffect,
         ExorciseEffect,
         FocusFireEffect,
+        MutinousMassacreEffect,
         SeedshipImpactEffect,
     )
     from mtg_bot.effects.generic.damage import (
@@ -4488,6 +4489,22 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
         # into the spell-card-bridge admit set.
         if isinstance(eff, CloseEncounterEffect):
             return {"kind": "close_encounter_effect"}
+        # **Control-change-UEOT subsystem — Cycle 4 live mint site
+        # (2026-05-22; ~4,671 17lands decks).** Pid-FREE covered unit
+        # variant — Rust's ``parse_effect`` ``"mutinous_massacre_
+        # effect"`` arm takes NO fields and the dict→Python bridge arm
+        # (cross_engine.py ``mutinous_massacre_effect``) constructs
+        # the field-free ``MutinousMassacreEffect()``. The odd/even
+        # pick is intrinsic to the resolve arm (Rust default = pick
+        # 0 / odd, mirroring Python's no-agent fallback at
+        # ``bespoke.py:1303-1306``). No token pid → no
+        # :func:`_seat_token_printings` dependency; the round-trip is
+        # the clean ``close_encounter_effect`` / ``exorcise_effect``
+        # unit-leaf idiom. Adding this leaf flips Mutinous Massacre
+        # into the spell-card-bridge admit set under the Phase-3
+        # ``(0, 0)``-shape wrath admit arm — the §2 auto-grow teeth.
+        if isinstance(eff, MutinousMassacreEffect):
+            return {"kind": "mutinous_massacre_effect"}
         # **Phase-3 wrath-admit-widening (2026-05-21).** Pyroclasm-shape
         # mass-damage leaf — ``DealNDamageToEachCreature(amount)``. The
         # bridge arm at ``cross_engine.py::damage_each_creature`` REQUIRES

@@ -202,10 +202,10 @@ _PHASE1_ADMITTED_AT_THIS_HEAD = [
     "Close Encounter", "Cut Propulsion", "Depressurize",
     "Diplomatic Relations", "Drill Too Deep", "Emergency Eject",
     "Exorcise", "Focus Fire", "Invasive Maneuvers", "Manifest Dread",
-    "Orbital Plunge", "Pyroclasm", "Radiant Strike",
-    "Reroute Systems", "Ruinous Rampage", "Scour for Scrap",
-    "Scout for Survivors", "Seedship Impact", "Shattered Wings",
-    "Under the Skin", "Untimely Malfunction",
+    "Mutinous Massacre", "Orbital Plunge", "Pyroclasm",
+    "Radiant Strike", "Reroute Systems", "Ruinous Rampage",
+    "Scour for Scrap", "Scout for Survivors", "Seedship Impact",
+    "Shattered Wings", "Under the Skin", "Untimely Malfunction",
 ]
 # The two members this module's carrier-sweep probes drive directly
 # through the full Phase-1 carrier path (Seedship / Orbital and Focus

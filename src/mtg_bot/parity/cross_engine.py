@@ -9278,6 +9278,43 @@ def _ta_dict_to_python_effect(eff_dict: dict):
         # uncovered single-gated tier classifier.
         from mtg_bot.effects.bespoke import ExorciseEffect
         return ExorciseEffect()
+    if kind == "mutinous_massacre_effect":
+        # **Control-change-UEOT subsystem — Cycle 4 live mint site
+        # (2026-05-22; ~4,671 17lands decks).** Rust substrate
+        # ``Effect::MutinousMassacreEffect`` (cards.rs field-free UNIT
+        # variant; parser ``"mutinous_massacre_effect"``; resolve in
+        # state_ops_resolve.rs beside the ``CloseEncounterEffect`` arm).
+        #
+        # **Field shape (unit variant).** No fields — bare
+        # ``{"kind": "mutinous_massacre_effect"}``. Python's
+        # ``MutinousMassacreEffect`` (effects/bespoke.py:1283) is a
+        # frozen dataclass with no constructor parameters. The
+        # odd/even pick is intrinsic to the resolve arm (Rust default
+        # = pick 0 / odd, mirroring Python's no-agent fallback at
+        # ``bespoke.py:1303-1306``).
+        #
+        # **Resolve semantics (parity-relevant).** Both engines pick
+        # 0 (odd) by default; the cross-engine probe drives a no-
+        # agent caster so the byte-equal default fires on both sides.
+        # Destroy phase walks creatures with mv % 2 == 1 (skipping
+        # indestructible per CR 701.7c); grant phase walks every
+        # surviving creature and stamps ``controller_override =
+        # Some(caster)`` (the Cycle-1 substrate's live mint site —
+        # FIRST call site on the Rust engine that mints a non-None
+        # override). Surviving creatures also untap and gain haste
+        # UEOT. The cleanup-step drain (Cycle-1 substrate's
+        # ``clear_controller_overrides_all`` + ``clear_ueot_modifiers
+        # _all``) reverts both at end of turn.
+        #
+        # **Real test-pool consumer**: Mutinous Massacre — Sorcery
+        # ``{3}{B}{B}{R}{R}`` "Choose odd or even. Destroy each
+        # creature with mana value of the chosen quality. Then gain
+        # control of all creatures until end of turn. Untap them.
+        # They gain haste until end of turn. (Zero is even.)" ~4,671
+        # 17lands decks (control-change-UEOT subsystem live mint
+        # site after the C1-C3 substrate landed).
+        from mtg_bot.effects.bespoke import MutinousMassacreEffect
+        return MutinousMassacreEffect()
     if kind == "close_encounter_effect":
         # **Close Encounter — additional-cost-choice closure
         # (Cycle 3, 2026-05-21; ~16,098 17lands decks — highest-

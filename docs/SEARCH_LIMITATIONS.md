@@ -9726,22 +9726,90 @@ per-card slice. Cycle list:
     now unblocked — the round-trip plumbing carries the minted
     override across the harness boundary so cross-engine probes
     can pin behavioral parity end-to-end.
-- **C4** — `Effect::GrantControlOfTargetUntilEOT { ... }` parse +
-  to_pydict + resolve arms; per-card slice for Systems Override
-  (`{2}{R}` single-target sibling). Then
-  `Effect::MutinousMassacre { pick: u8 }` (variant-parameter shape
-  — different from per-mode dispatch shape; composes destroy-by-
-  parity + grant-control-all + untap + haste-grant); bridge round-
-  trip; admit auto-join; ~200 LoC + 5 cross-engine probes. Could
-  also expose a resolve-time agent prompt via a new
-  `PendingDecision::ChooseOddOrEven` (deferred to C5 for a
-  deterministic-first first slice).
-- **C5** — Threaten / Act-of-Treason / Sothera’s Requiem are
+- **C4 — LANDED (2026-05-22, `feature/control-change-ueot-cycle-4-p1`).**
+  Mutinous Massacre live mint site — the FIRST Rust call site that
+  mints a non-None `controller_override`. Field-free unit variant
+  shape (NOT the `{ pick: u8 }` parameter shape the earlier cycle-
+  list sketched — Rust mirrors Python's no-agent default pick=0 /
+  odd at `bespoke.py:1303-1306` rather than serializing the pick).
+  - **Rust scope:**
+    - `Effect::MutinousMassacreEffect` field-free unit variant in
+      `rust/src/cards.rs` (declaration + `mutinous_massacre_effect`
+      parse arm + `to_pydict` arm) — schema parity with Python's
+      parameterless `MutinousMassacreEffect` dataclass.
+    - Resolve arm in `rust/src/state_ops_resolve.rs` beside the
+      `CloseEncounterEffect` sibling:
+      * Destroy phase: `bf_iter_etb_sorted` + parity-filter
+        (`mana_cost.total % 2 == 1` for pick=0 / odd default) +
+        indestructible-skip (CR 701.7c) + per-victim bf-remove +
+        zone-stamp + reset transients (R77-CFI1 counters retained)
+        + push-to-graveyard + DIES + LEAVES + token-cease dispatches
+        (mirrors `Effect::DestroyAllCreatures` precedent).
+      * Gain-control phase: re-walk surviving creatures, inline the
+        Cycle-1 grant body (the helper is a `#[pymethods]` private
+        method in `state_ops_cleanup.rs`; per-slice file-iso
+        re-derives the ~10-line body), stamp
+        `controller_override = Some(caster)` with same-controller
+        short-circuit, untap, push `UeotModifier::GrantKeyword
+        { keyword: "haste" }`.
+  - **Python-side bridge:**
+    - `cross_engine.py::_ta_dict_to_python_effect`
+      `"mutinous_massacre_effect"` arm — constructs the field-free
+      `MutinousMassacreEffect()`.
+    - `trajectory.py::_python_spell_effect_to_dict` `_leaf` arm —
+      emits `{"kind": "mutinous_massacre_effect"}`. Adding this
+      leaf is what flips Mutinous Massacre COVERED → ADMITTED →
+      PROBED through the Phase-3 `(0, 0)` wrath admit arm (auto-
+      grow, no hardcoded card-name list — the §2 teeth).
+  - **Pool flip**: Mutinous Massacre COVERED → PROBED (4,671 17lands
+    decks). PROBED count 279 → 280. Admit-set count 24 → 25.
+  - **Tests:** `tests/test_mutinous_massacre_parity.py` — parser
+    SoT pin, serializer round-trip, admit-gate flip pin, covered-
+    class pin, Rust resolve unit pins (odd-parity destroy + grant +
+    untap + haste, indestructible spared, tap survives untap, own-
+    creature path with no override stamp, zero-MV-is-even, empty-
+    bf silent no-op, cleanup drain composes, parity-only-no-
+    controller-protection on own-bf), GENUINE real-EoE cross-engine
+    probe driving the parsed printing through both engines (the
+    PROBED-tier credit anchor).
+  - **Substrate-only invariant maintained for pre-C4 trajectories.**
+    Every state that doesn't cast Mutinous Massacre stays byte-
+    equivalent to pre-C4 — the new resolve arm is dispatched only
+    when the live `Effect::MutinousMassacreEffect` variant appears
+    in the effect chain, which is gated on the parser claiming the
+    Mutinous-Massacre literal line.
+  - **Cycle-1 substrate composes uniformly.** The cleanup-step
+    `clear_controller_overrides_all` drain reverts the stamped
+    override back to `None` at end of turn — composed in
+    `cleanup_step_for_active_player` alongside the round-27
+    `clear_ueot_modifiers_all` which clears the haste UEOT
+    modifier. Both fire in the same pass. Pinned end-to-end in the
+    real-EoE cross-engine probe.
+- **C5 (deferred)** — Systems Override (`{2}{R}` single-target
+  sibling, ~4,775 17lands decks). Shares the C1-C3 control-change
+  substrate AND now the C4 live mint site pattern (control-change
+  + untap + haste — identical to MutinousMassacre's gain-control
+  phase, but on a SINGLE bound target instead of every survivor).
+  Adds the Spacecraft-conditional charge-counter rider: 10 charge
+  counters at resolve + a delayed end-step trigger that removes
+  10. The charge-counter rider needs a NEW
+  `Effect::SystemsOverrideEffect` variant + the
+  `RemoveChargeCountersFromSourceDelayed` delayed-trigger Effect
+  variant + extending the Rust `DelayedTrigger` end-step drain to
+  dispatch non-WarpExileSelf effects. Scoped here as its own cycle
+  to keep the cycle blast radius bounded (the C4 lane is already
+  inlining the grant body per per-slice file-iso; mixing both card
+  closures in one cycle would compound the surface area). The
+  honest-stop ship-Mutinous-alone-this-cycle decision matches the
+  lane brief's "if 1-cycle-feasible" hedge.
+- **C6** — Threaten / Act-of-Treason / Sothera’s Requiem are
   cross-set siblings (not in EoE; deferred but the substrate
-  carries the same shape) + agent-prompt extension.
+  carries the same shape) + agent-prompt extension (live agent-
+  driven odd/even pick via a new `PendingDecision::ChooseOddOrEven`).
 
 Pool-flip per the cycle list: 1-2 cards per cycle (Mutinous
-Massacre, Systems Override) at ~5k-10k decks each.
+Massacre LANDED C4, Systems Override deferred to C5) at ~5k-10k
+decks each.
 
 ### 2. Zero Point Ballad — X-cost subsystem missing on Rust
 

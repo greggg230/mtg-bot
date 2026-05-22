@@ -599,14 +599,19 @@ of Shattered Wings's destroy-half filter, with two swaps: exile-not-
 destroy per CR 702.12 and power-4-not-flying with the effective-
 power read folding `obj.counters` + UEOT bonuses byte-equal with
 Python's `effective_power`). Admit set **20 → 21**.
-Remaining **16 single-gated** Effect-uncovered members:
-Archenemy's Charm, Close Encounter, Coordinated Clobbering,
-Darkness, Devastating Onslaught, Mutinous Massacre, Pull Through
-the Weft, Scour for Scrap, Scout for Survivors, Singularity
-Rupture, Systems Override, Terminal Velocity, Vengeful Possession,
-Warping Wail, Zero Point Ballad (15; the prior list's Emergency
-Eject + Invasive Maneuvers entries were stale — both shipped
-upstream of this dated paragraph).
+Remaining single-gated Effect-uncovered members: Archenemy's
+Charm, Coordinated Clobbering, Darkness, Devastating Onslaught,
+Pull Through the Weft, Singularity Rupture, Systems Override,
+Terminal Velocity, Vengeful Possession, Warping Wail, Zero Point
+Ballad (11). **Removed via in-flight closures (2026-05-21/22):**
+Close Encounter (close-encounter-substrate + scour-for-scrap-cycle-2
+admit-set re-anchor; PROBED ~16,098 decks); Scour for Scrap
+(scour-for-scrap-cycle-2; PROBED ~6,434 decks); Scout for Survivors
+(multi-target-admit-phase4; PROBED earlier); **Mutinous Massacre
+(control-change-ueot-cycle-4-p1; PROBED 2026-05-22 via 4-cycle
+closure of the control-change-UEOT subsystem triad, ~4,671 decks).**
+The prior list's Emergency Eject + Invasive Maneuvers entries were
+stale — both shipped upstream of this dated paragraph.
 
 * **Per-card cost:** 1-3 cycles each — **caveat (2026-05-21)**:
   the next-wrath-substrate triad walk
@@ -740,6 +745,39 @@ upstream of this dated paragraph).
   cross_engine_* test files); 77/77 PASS on trajectory_parity.
   Cycle 4 is now unblocked. Full Cycle 3 entry at
   `docs/SEARCH_LIMITATIONS.md` §1 (Mutinous Massacre).
+
+  **Control-change-UEOT Cycle 4 landed (2026-05-22,
+  `feature/control-change-ueot-cycle-4-p1`).** First live mint
+  site: Mutinous Massacre (~4,671 17lands decks) flipped COVERED
+  → PROBED via `Effect::MutinousMassacreEffect` field-free unit
+  variant + resolve arm (destroy by parity + gain-control + untap
+  + haste UEOT, the FIRST Rust call site that mints a non-None
+  `controller_override`) + bridge round-trip + reverse-serializer
+  leaf. Rust mirrors Python's no-agent default pick=0 / odd inside
+  the resolve arm (Rust has no agent surface at `apply_effect`;
+  the deterministic-first pattern is the byte-equal mirror —
+  Python's `if p.agent is not None: pick = ... else: pick=0` at
+  `bespoke.py:1303-1306`). The C1-C3 substrate composes uniformly:
+  the cleanup-step drain reverts the stamped override back to
+  `None` at end of turn (composed in `cleanup_step_for_active_player`
+  alongside the round-27 `clear_ueot_modifiers_all` for haste).
+  Admit set 24 → 25 (Mutinous Massacre AUTO-JOINS the Phase-3
+  `(0, 0)` wrath admit shape; no admit-set widening needed per the
+  §2 auto-grow teeth). 13 new tests in
+  `tests/test_mutinous_massacre_parity.py` (parser SoT + serializer
+  round-trip + admit-gate flip + covered-class pin + Rust resolve
+  unit pins for the 8 closure scenarios + the GENUINE real-EoE
+  cross-engine probe driving the parsed printing through both
+  engines). **Systems Override (~4,775 17lands decks) DEFERRED to
+  Cycle 5** per the lane brief's "if 1-cycle-feasible" honest-stop
+  — Systems Override needs ALSO a new
+  `Effect::SystemsOverrideEffect` variant + a
+  `RemoveChargeCountersFromSourceDelayed` delayed-trigger Effect
+  variant + extending the Rust `DelayedTrigger` end-step drain to
+  dispatch non-WarpExileSelf effects (the Spacecraft-conditional
+  charge-counter rider). Single-cycle land of both would compound
+  the surface area beyond a reviewable slice. Full Cycle 4 entry
+  at `docs/SEARCH_LIMITATIONS.md` §1 (Mutinous Massacre).
 
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.

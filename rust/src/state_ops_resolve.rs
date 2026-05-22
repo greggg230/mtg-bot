@@ -9830,6 +9830,247 @@ fn apply_effect(
                 target_id,
             )?;
         }
+        // **Control-change-UEOT subsystem — Cycle 4 live mint site
+        // (2026-05-22; ~4,671 17lands decks).** Mutinous Massacre
+        // `{3}{B}{B}{R}{R}` Sorcery — "Choose odd or even. Destroy
+        // each creature with mana value of the chosen quality. Then
+        // gain control of all creatures until end of turn. Untap
+        // them. They gain haste until end of turn. (Zero is even.)"
+        //
+        // Mirrors Python's `MutinousMassacreEffect.resolve` at
+        // `effects/bespoke.py:1296-1356` byte-equal:
+        //
+        // 1. **Pick = 0 (odd).** Python's `if p.agent is not None:
+        //    pick = ... else: pick=0` at `:1303-1306` defaults to 0
+        //    when no agent is set. The cross-engine probe drives the
+        //    same default on both engines (the probe's caster has no
+        //    agent OR has a `choose_mode` that returns 0). Rust has
+        //    no agent surface inside `apply_effect`, so the
+        //    deterministic-first pattern is the byte-equal mirror.
+        // 2. **Destroy phase.** Walk `bf_iter_etb_sorted`, collect
+        //    creatures whose printed `mana_cost.total` parity
+        //    matches odd (mv % 2 == 1). Indestructible creatures are
+        //    skipped (CR 701.7c — `turn.destroy` early-returns on
+        //    indestructible; Python's `destroy(state, v)` at `:1327`
+        //    hits the same gate). Reuse the proven destroy-victim
+        //    shape from `Effect::DestroyAllCreatures` (`:6733`):
+        //    bf-remove + zone-stamp + tap/damage/attached reset +
+        //    counters retained (R77-CFI1) + push-to-graveyard + DIES
+        //    + LEAVES + token-cease dispatches.
+        // 3. **Gain-control phase.** Re-walk every surviving creature
+        //    via `bf_iter_etb_sorted`. For each whose effective
+        //    controller != caster: stamp `controller_override =
+        //    Some(caster)`, untap (`obj.tapped = false`), and push
+        //    `UeotModifier::GrantKeyword { keyword: "haste" }` onto
+        //    `obj.ueot_modifiers` (the proven `BiosynthicBurstEffect`
+        //    push shape at `:8447`). Own-controlled survivors STILL
+        //    get untap + haste (Python's
+        //    `test_mutinous_massacre_own_creatures_untap_and_haste`
+        //    pins this — the grant-control branch short-circuits on
+        //    same-controller, but untap + haste still apply).
+        // 4. **Cleanup drain.** The override drains back to None at
+        //    the next cleanup pass via the Cycle-1
+        //    `clear_controller_overrides_all`; the haste-grant UEOT
+        //    modifier drains in the same pass via
+        //    `clear_ueot_modifiers_all`. Both already wired.
+        //
+        // **Field-iso inlining note.** `grant_control_change_ueot`
+        // is a `#[pymethods] impl GameState` method in
+        // `state_ops_cleanup.rs` and is private to that impl block;
+        // the per-slice file-iso rule keeps it from being made
+        // public solely to be called here. The grant body (~10
+        // lines) is inlined per the cycle-1 doc's "Cycle 4 mints
+        // the override from Mutinous-Massacre" plan + the closed
+        // siblings' precedent of inlining shared cross-file primitives
+        // (e.g. the inlined `draw_card`-pop body in `DrawCards`'s
+        // arm at `:2274` per round-7's counterspell agent inline).
+        // The cross-engine probe pins the override value byte-equal
+        // with Python's `effective_controller` walk — the inlining
+        // is observable-equivalent.
+        Effect::MutinousMassacreEffect => {
+            let _ = source_obj_id; // wrath shape — source not relevant
+            // Source-controller resolution (the `Effect::Close
+            // EncounterEffect` `:9741` precedent — prefer the
+            // transient `current_resolve_source_controller` swap, fall
+            // back to `state.active_player` for back-compat with
+            // direct `apply_effect_pub` callers).
+            let caster = state
+                .current_resolve_source_controller
+                .unwrap_or(state.active_player);
+            let pick: u8 = 0; // pick=0 / odd (no-agent default).
+            // ------------------------------------------------------ destroy
+            // Collect victims: creatures whose printed mana_cost.total
+            // parity matches the picked quality, indestructible
+            // skipped (CR 701.7c). Walk in ETB-timestamp order
+            // (`Effect::DestroyAllCreatures` precedent) so the
+            // destroy-then-grant sequence is byte-equal to the
+            // Python `for o in list(state.battlefield)` walk + the
+            // observer-order-bound test pins.
+            let victims: Vec<(usize, u32)> =
+                crate::bf_iter::bf_iter_etb_sorted(state)
+                    .into_iter()
+                    .filter_map(|obj| {
+                        let printing =
+                            state.registry.lookup(obj.printing_id)?;
+                        if !printing
+                            .card_types
+                            .iter()
+                            .any(|t| t == "Creature")
+                        {
+                            return None;
+                        }
+                        if printing
+                            .keywords
+                            .iter()
+                            .any(|k| k == "indestructible")
+                        {
+                            return None;
+                        }
+                        let mc = &printing.mana_cost;
+                        let mv: u32 = mc.generic as u32
+                            + mc.white as u32
+                            + mc.blue as u32
+                            + mc.black as u32
+                            + mc.red as u32
+                            + mc.green as u32;
+                        let matches_parity = if pick == 0 {
+                            // odd: mv % 2 == 1
+                            mv % 2 == 1
+                        } else {
+                            // even (including zero)
+                            mv % 2 == 0
+                        };
+                        if !matches_parity {
+                            return None;
+                        }
+                        Some((obj.controller as usize, obj.id))
+                    })
+                    .collect();
+            for (pidx, victim_id) in victims {
+                let bf_mut: &mut Vec<GameObject> = Arc::make_mut(
+                    &mut state.players[pidx].battlefield,
+                );
+                let pos = match bf_mut
+                    .iter()
+                    .position(|o| o.id == victim_id)
+                {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let mut obj = bf_mut.remove(pos);
+                obj.zone = ZONE_GRAVEYARD;
+                obj.tapped = false;
+                obj.damage = 0;
+                // R77-CFI1: counters are NOT cleared on the dead
+                // object (the established byte-equal contract —
+                // `Effect::DestroyAllCreatures` precedent).
+                obj.attached_to = None;
+                obj.exiled_with_source = None;
+                let leaving_printing_id = obj.printing_id;
+                let leaving_obj_id = obj.id;
+                Arc::make_mut(&mut state.players[pidx].graveyard)
+                    .push(obj);
+                // Victims are all creatures by the destroy filter, so
+                // the DIES dispatch fires unconditionally (CR 700.4 —
+                // a creature death fires DIES).
+                state.pending_dies_dispatches.push(leaving_obj_id);
+                // LEAVES fan-out (every bf-exit fires LEAVES, the
+                // Slice-10 deferred-drain pattern). Mark the leaving
+                // void-flag through the centralized helper.
+                mark_left_battlefield_if_nonland(
+                    state,
+                    leaving_printing_id,
+                );
+                state
+                    .pending_leaves_dispatches
+                    .push(leaving_obj_id);
+                // Round-55: token-cease sibling of the LEAVES push.
+                crate::state_ops_zones::queue_token_cease(
+                    state,
+                    leaving_obj_id,
+                );
+            }
+            // ----------------------------------------------- grant + untap + haste
+            // Re-walk surviving creatures in ETB-timestamp order.
+            // Each surviving creature: grant control UEOT (if not
+            // already the caster's), untap, push haste UEOT modifier.
+            // The grant is the live mint site — first call site that
+            // stamps `controller_override` from inside the Rust
+            // engine. Inlined `grant_control_change_ueot` body per
+            // the field-iso note above (the Cycle-1 helper is a
+            // `#[pymethods]` private method).
+            let survivor_ids: Vec<u32> =
+                crate::bf_iter::bf_iter_etb_sorted(state)
+                    .into_iter()
+                    .filter_map(|obj| {
+                        let printing =
+                            state.registry.lookup(obj.printing_id)?;
+                        if printing
+                            .card_types
+                            .iter()
+                            .any(|t| t == "Creature")
+                        {
+                            Some(obj.id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            for survivor_id in survivor_ids {
+                // Locate the survivor's home player (controller may
+                // be either side; the physical zone is keyed on
+                // owner, but our iterator walks both bfs so we use
+                // bf-position to find which player's Vec holds the
+                // object).
+                let owner_idx_opt: Option<usize> = (0..state
+                    .players
+                    .len())
+                    .find(|&pidx| {
+                        state.players[pidx]
+                            .battlefield
+                            .iter()
+                            .any(|o| o.id == survivor_id)
+                    });
+                let Some(owner_idx) = owner_idx_opt else {
+                    continue; // defensively skip — should never miss
+                };
+                // Read the current effective controller before
+                // mutation. Idempotent same-controller short-circuit
+                // mirrors the Cycle-1 helper at
+                // `state_ops_cleanup.rs:372` so the override is only
+                // stamped when it actually changes the answer.
+                let current_effective: u8 = state.players[owner_idx]
+                    .battlefield
+                    .iter()
+                    .find(|o| o.id == survivor_id)
+                    .map(|o| {
+                        crate::state_ops_cleanup::effective_controller_id(o)
+                    })
+                    .unwrap_or(0);
+                let needs_grant = current_effective != caster;
+                let zone: &mut Vec<GameObject> = Arc::make_mut(
+                    &mut state.players[owner_idx].battlefield,
+                );
+                for obj in zone.iter_mut() {
+                    if obj.id != survivor_id {
+                        continue;
+                    }
+                    if needs_grant {
+                        obj.controller_override = Some(caster);
+                    }
+                    // Untap and grant haste UEOT regardless of
+                    // whether the survivor was already controlled by
+                    // the caster — Python's
+                    // `test_mutinous_massacre_own_creatures_untap_and
+                    // _haste` pins the own-creature path explicitly.
+                    obj.tapped = false;
+                    obj.ueot_modifiers.push(UeotModifier::GrantKeyword {
+                        keyword: "haste".to_string(),
+                    });
+                    break;
+                }
+            }
+        }
         // DestroyTargetLand. CR 701.7 with Land filter — Dust Bowl /
         // Petrified Field pattern. Walks BOTH players' battlefield
         // in ETB-timestamp order via the shared
