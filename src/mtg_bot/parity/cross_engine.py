@@ -5721,6 +5721,57 @@ def _ta_dict_to_python_effect(eff_dict: dict):
             TargetOpponentLookHandMayDiscard,
         )
         return TargetOpponentLookHandMayDiscard()
+    if kind == "target_opponent_sacrifices_creature_other_than_enchanted":
+        # **Sporogenic Infection — Cycle 1 (2026-05-22) — dict→Python
+        # bridge arm.** Rust substrate
+        # ``Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted``
+        # (cards.rs unit variant; parse arm at
+        # ``"target_opponent_sacrifices_creature_other_than_enchanted"``;
+        # resolve arm in ``state_ops_resolve.rs`` next to the sibling
+        # ``TargetOpponentLookHandMayDiscard`` arm; to_dict at
+        # cards.rs). This arm closes the cross-engine bridge so
+        # Sporogenic Infection's ETB trigger can round-trip through
+        # both engines.
+        #
+        # **Unit variant.** No fields beyond ``kind``. Mirrors Rust's
+        # parse_effect arm — silent-drop convention for unrecognized
+        # keys (extra dict fields are ignored).
+        #
+        # **Field shape.** Python's
+        # ``TargetOpponentSacrificesCreatureOtherThanEnchanted``
+        # (effects/generic/opponent_punishers.py:68-145) is a
+        # field-free ``@dataclass(frozen=True)`` ``Effect`` subclass.
+        # The bridge constructs the class with no args.
+        #
+        # **Resolve semantics (parity-relevant).** Rust's resolve at
+        # state_ops_resolve.rs walks the 5-zone+stack source-finder,
+        # reads ``source.attached_to`` off the bf source, takes
+        # ``opponent_idx = 1 - controller``, scans the opponent's bf
+        # for creatures excluding the attached_to host, and pushes
+        # ``PendingDecision::OpponentSacrificesCreatureChoice`` onto
+        # the queue (skipping the push when candidates is empty —
+        # Python parity at opponent_punishers.py:128
+        # ``if not legal: return``). The opponent's agent drains via
+        # ``submit_opponent_sacrifices_creature_decision(id)`` —
+        # forced sacrifice, no decline (printed text "sacrifices a
+        # creature of their choice" forces the sac). Auto-resolve
+        # ``"default"`` picks ``candidates[0]`` (deterministic-first).
+        # The new PendingDecision variant is an OPPONENT-decision
+        # shape (the target opponent picks, not the controller),
+        # distinct from sibling controller-decision variants like
+        # ``TapPermanentChoice`` / ``LookAtOpponentHandMayDiscard``.
+        #
+        # **Real EoE consumers** unblocked: 1 EoE card via the oracle
+        # parser — Sporogenic Infection (ETB target-opponent-
+        # sacrifices half of the Aura's two-trigger composition;
+        # DEALT_DAMAGE + DestroyEnchantedPermanent half already shipped
+        # via Cracked Skull C2). Cross-engine end-to-end probe lands
+        # in ``test_sporogenic_infection_parity.py`` alongside the
+        # Aura-S4 multi-trigger admit-gate widen.
+        from mtg_bot.effects.generic.opponent_punishers import (
+            TargetOpponentSacrificesCreatureOtherThanEnchanted,
+        )
+        return TargetOpponentSacrificesCreatureOtherThanEnchanted()
     if kind == "lose_life":
         # **Round-24 BLOCKED-BRIDGE-ARM slice -- "you lose N life"
         # (LoseLife family).** Rust substrate

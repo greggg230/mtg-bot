@@ -9327,8 +9327,17 @@ also documented are NOT touched by this closure:
 * Chorale of the Void — still declined at the
   `ReanimateTargetCreatureCardFromDefendersGraveyard` trigger
   gate (separate `Effect` variant slice).
-* Cracked Skull / Sporogenic Infection — still declined at
-  their respective multi-gated trigger shapes.
+* Cracked Skull / Sporogenic Infection — **flipped PROBED**
+  (Cracked Skull C2 — `feature/cracked-skull-cycle-2-p1`,
+  d0ddd76c — and Sporogenic Infection Cycle 1 —
+  `feature/sporogenic-infection-cycle-1-p1`). The two-trigger
+  composition (ENTERS half + DEALT_DAMAGE host-event destroy half)
+  now rides the Phase-3 safe-trigger admit-set widen for both
+  cards; Cracked Skull added shapes 4+5
+  (TargetOpponentLookHandMayDiscard +
+  DestroyEnchantedPermanent), Sporogenic Infection adds shape 6
+  (TargetOpponentSacrificesCreatureOtherThanEnchanted; reuses
+  shape 5 for the DEALT_DAMAGE half).
 
 The closure is scoped to the S3 replacement-rider lane only; the
 broader Phase-4 follow-ups are untouched.
@@ -10431,6 +10440,117 @@ Source files updated this cycle:
   `submit_look_at_opponent_hand_may_discard_decision` dispatcher,
   `push_look_at_opponent_hand_may_discard_choice` synthetic helper,
   strategy-name validation widened.
+
+---
+
+## Sporogenic Infection — target-opponent-sacrifices substrate (Rust side)
+
+**Status (2026-05-22): Cycle 1 LANDED. Sporogenic Infection PROBED
+end-to-end on `feature/sporogenic-infection-cycle-1-p1` (full
+PROBED-flip in one cycle — the DEALT_DAMAGE half rode the existing
+Cracked Skull C2 admit shape).**
+
+Sporogenic Infection (`{1}{B}` Enchantment — Aura, EoE pool) prints
+two trigger halves on its Aura body:
+
+1. ETB (ENTERS): "Target opponent sacrifices a creature of their
+   choice other than enchanted creature."
+2. DEALT_DAMAGE (host-damage): "When enchanted creature is dealt
+   damage, destroy it." — already shipped via
+   `Effect::DestroyEnchantedPermanent` + `Predicate::IsHost` + the
+   Phase-3 safe-trigger shape 5 (added by Cracked Skull C2).
+
+The ETB half is the new substrate. The Python effect class
+`TargetOpponentSacrificesCreatureOtherThanEnchanted` at
+`src/mtg_bot/effects/generic/opponent_punishers.py:68-145` mints a
+forced sacrifice routed through the TARGET OPPONENT's
+`agent.choose_sacrifice` hook (distinct from Cracked Skull's
+may-gate: the printed text "sacrifices a creature OF THEIR CHOICE"
+forces the sacrifice — there is no may-gate, just a forced choice
+made by the opponent, not the controller).
+
+**Single-cycle lane.**
+
+* **Cycle 1 (LANDED, 2026-05-22).** Full closure: new
+  `Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted`
+  unit variant on `rust/src/cards.rs` (parse +
+  to_pydict + resolve arms), new
+  `PendingDecision::OpponentSacrificesCreatureChoice
+  {source_obj_id, target_player, candidates}` variant on
+  `rust/src/state.rs` (the FIRST opponent-decision substrate
+  on Rust — distinct from sibling controller-decision variants
+  like `TapPermanentChoice` / `LookAtOpponentHandMayDiscard`;
+  the variant carries `target_player` instead of `controller`
+  because the decision-maker is the opponent, not the
+  controller-of-trigger), dispatcher
+  `submit_opponent_sacrifices_creature_decision(chosen_id)` in
+  `state_ops_decisions.rs` (forced-choice — the dispatcher
+  takes a REQUIRED `u32` chosen_id, not `Option<u32>`; there is
+  no decline path), `push_opponent_sacrifices_creature_choice`
+  synthetic-test helper, auto-resolve arm (default picks
+  `candidates[0]`), fingerprint serialization, cross-engine
+  bridge arm
+  `target_opponent_sacrifices_creature_other_than_enchanted`
+  in `cross_engine.py::_ta_dict_to_python_effect`, Phase-3
+  safe-trigger admit-set widen for shape 6
+  (`ENTERS+IsSelf+TargetOpponentSacrificesCreatureOtherThan
+  Enchanted`; reuses Cracked Skull C2's shape 5 for the
+  DEALT_DAMAGE half), matching emitter arm in
+  `_python_ta_to_safe_dict_aura_phase3`, and 19 tests at
+  `tests/test_sporogenic_infection_parity.py` pinning the closure
+  end-to-end (parser SoT + serializer round-trip + admit-gate
+  flip + cast_aura + ETB-trigger fires + host-exclusion +
+  creature-filter + push-then-submit + auto-resolve-default +
+  cross-engine real-EoE probe).
+
+  **Resolve arm details.** The arm walks the 5-zone+stack
+  source-finder (mirrors the Cracked Skull C2 arm verbatim),
+  ALSO reading `source.attached_to` off the bf object when
+  found (the printed "other than enchanted creature" exclusion
+  needs the attached-to host id). Then it computes
+  `target_idx = 1 - controller`, scans the target opponent's
+  battlefield for creatures EXCLUDING the attached_to host, and
+  pushes `OpponentSacrificesCreatureChoice` if the candidate set
+  is non-empty (empty → silent no-op, Python parity at
+  `opponent_punishers.py:128` "if not legal: return"). Tokens
+  are NOT filtered (printed text "a creature", not "a nontoken
+  creature" — Python parity at `opponent_punishers.py:84-86`).
+
+**Opponent-decision substrate precedent.** The new
+`OpponentSacrificesCreatureChoice` variant is the first Rust
+PendingDecision where the decision seat is the OPPONENT, not the
+controller-of-trigger. The variant drops the `controller` field
+that sibling variants carry; the submit dispatcher routes the
+sacrifice via the existing `sacrifice_source_for_tap_decline`
+helper (which takes a player_idx + obj_id pair and works on any
+seat, not just the source's controller). Future opponent-decision
+shapes (e.g. "target opponent chooses a card from their hand to
+exile") can reuse this substrate-shape — payload is
+`{source_obj_id, target_player, candidates}`, submit takes a
+required chosen_id (forced) or an Option (may-gate), auto-resolve
+picks `candidates[0]`. The opponent-decision-seat invariant is the
+load-bearing structural difference; sibling reuse is appropriate
+only when the decision seat is the controller.
+
+Source files updated this cycle:
+* `rust/src/cards.rs` — append
+  `TargetOpponentSacrificesCreatureOtherThanEnchanted` variant
+  onto `enum Effect` + parse arm + to_pydict arm.
+* `rust/src/state.rs` — append
+  `OpponentSacrificesCreatureChoice` variant onto
+  `enum PendingDecision`.
+* `rust/src/state_ops_resolve.rs` — Effect resolve arm
+  (5-zone+stack source-finder + attached_to lookup +
+  creature filter + host exclusion + decision push).
+* `rust/src/state_ops_decisions.rs` — dict snapshot,
+  auto-resolve arm,
+  `submit_opponent_sacrifices_creature_decision` dispatcher,
+  `push_opponent_sacrifices_creature_choice` synthetic helper.
+* `rust/src/state_ops_fingerprint.rs` — `Value::Array` arm.
+* `src/mtg_bot/parity/cross_engine.py` — dict→Python bridge arm.
+* `src/mtg_bot/parity/trajectory.py` —
+  `_aura_triggers_are_phase3_safe` shape-6 admit +
+  `_python_ta_to_safe_dict_aura_phase3` emitter arm.
 
 ---
 

@@ -623,6 +623,29 @@ impl GameState {
                             candidates.iter().map(|id| json!(*id)).collect(),
                         ),
                     ]),
+                    // **Sporogenic Infection — Cycle 1 (2026-05-22).**
+                    // Source-id + target_player + candidate ids
+                    // determine the pending-state shape. The variant
+                    // has no `controller` slot — the controller of
+                    // the trigger doesn't make any choice in this
+                    // shape, only the target opponent does. Shape
+                    // mirrors `TapPermanentChoice`'s flat u32 list,
+                    // with the `target_player` slot replacing
+                    // `controller`.
+                    PendingDecision::OpponentSacrificesCreatureChoice {
+                        source_obj_id,
+                        target_player,
+                        candidates,
+                    } => Value::Array(vec![
+                        Value::String(
+                            "OpponentSacrificesCreatureChoice".to_string(),
+                        ),
+                        json!(*source_obj_id),
+                        json!(*target_player),
+                        Value::Array(
+                            candidates.iter().map(|id| json!(*id)).collect(),
+                        ),
+                    ]),
                 })
                 .collect();
             parts_vec.push(Value::Array(pds));

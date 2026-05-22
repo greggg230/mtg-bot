@@ -14756,6 +14756,133 @@ fn apply_effect(
         // equal because neither engine reads `revealed_to` for any
         // subsequent state mutation. Documented honest-stop in
         // `docs/SEARCH_LIMITATIONS.md`.
+        // **Sporogenic Infection — Cycle 1 (2026-05-22).** Mirrors
+        // Python's `TargetOpponentSacrificesCreatureOtherThanEnchanted
+        // .resolve` (`effects/generic/opponent_punishers.py:100-138`)
+        // — Sporogenic Infection's Aura ETB trigger half.
+        //
+        // **Resolve steps (mirror Python).**
+        // 1. Source-finder: walk all players' battlefields for the
+        //    Aura source (the trigger only fires for an Aura on bf;
+        //    if the source has LTB'd between trigger queueing and
+        //    resolve, silent fizzle — defensive).
+        // 2. Read `excluded_host_id = source.attached_to` (the Aura's
+        //    enchanted creature; may be None on a stale Aura).
+        // 3. 2-player "target opponent" reduces to the one opponent:
+        //    `opponent_idx = (1 - controller) as usize`.
+        // 4. Build candidates: every creature on the target opponent's
+        //    battlefield EXCLUDING the attached-to host
+        //    (`o.controller_id == target_idx && o.printing.is_creature
+        //    && o.id != excluded_id`), bf-iteration order. Mirrors
+        //    Python's list comprehension at
+        //    `opponent_punishers.py:122-127`.
+        // 5. Empty candidates: silent no-op (Python parity at
+        //    `opponent_punishers.py:128`: `if not legal: return`).
+        // 6. Non-empty candidates: push
+        //    `PendingDecision::OpponentSacrificesCreatureChoice
+        //    {source_obj_id, target_player, candidates}` onto the
+        //    queue. The opponent's agent drains via
+        //    `submit_opponent_sacrifices_creature_decision(id)`.
+        //
+        // **Forced-choice shape (no decline path).** Unlike Cracked
+        // Skull's may-gate, the printed text "sacrifices a creature
+        // of their choice" forces the sacrifice — the submit
+        // dispatcher takes a required `chosen_id: u32` (not
+        // `Option<u32>`).
+        //
+        // **`token` filter NOT applied.** Python's
+        // `EachOpponentSacrificesCreature` ships a nontoken filter on
+        // a different shape; Sporogenic's printed text says "a
+        // creature" (not "a nontoken creature"), so tokens are
+        // eligible candidates here. Python parity at
+        // `opponent_punishers.py:84-86`.
+        Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted => {
+            // 1. Source-controller + attached_to resolution: 5-zone
+            //    walk + stack scan (mirrors the sibling
+            //    Effect::TargetOpponentLookHandMayDiscard arm verbatim
+            //    on the source-finder shape; while the Aura should be
+            //    on bf when the ETB fires, the source-finder defends
+            //    against the source-LTB'd-between-trigger-queue-and-
+            //    resolve edge case and reads `attached_to` from the
+            //    bf object when present).
+            let mut source_controller: Option<u8> = None;
+            let mut excluded_host_id: Option<u32> = None;
+            'outer: for player in state.players.iter() {
+                for (zone_idx, zone) in [
+                    &player.hand,
+                    &player.library,
+                    &player.battlefield,
+                    &player.graveyard,
+                    &player.exile,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    for obj in zone.iter() {
+                        if obj.id == source_obj_id {
+                            source_controller = Some(obj.controller);
+                            // `attached_to` only meaningful on bf; we
+                            // could read it off any zone, but the field
+                            // is only non-None for an Aura on bf.
+                            if zone_idx == 2 {
+                                // 2 == battlefield in the array above
+                                excluded_host_id = obj.attached_to;
+                            }
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if source_controller.is_none() {
+                if let Some(item) = state
+                    .stack
+                    .iter()
+                    .find(|i| i.source_obj_id == source_obj_id)
+                {
+                    source_controller = Some(item.controller);
+                }
+            }
+            let Some(src_controller) = source_controller else {
+                return Ok(()); // source not found → silent fizzle
+            };
+            // 2. 2-player "target opponent" reduces to the one
+            //    opponent.
+            let target_idx = (1 - src_controller) as usize;
+            // 3. Build candidate set: every creature on target
+            //    opponent's bf EXCLUDING the attached-to host
+            //    (filtered out even when the host is a creature on
+            //    the same opponent's bf). Token creatures are NOT
+            //    filtered (printed text "a creature", not "a nontoken
+            //    creature").
+            let candidates: Vec<u32> = state.players[target_idx]
+                .battlefield
+                .iter()
+                .filter_map(|o| {
+                    let printing = state.registry.lookup(o.printing_id)?;
+                    if !printing.card_types.iter().any(|t| t == "Creature") {
+                        return None;
+                    }
+                    if Some(o.id) == excluded_host_id {
+                        return None;
+                    }
+                    Some(o.id)
+                })
+                .collect();
+            // 4. Empty candidates: silent no-op (Python parity).
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            // 5. Non-empty: push the decision. The opponent (target
+            //    player) is the decision-maker; the variant carries
+            //    no `controller` field by design.
+            state.pending_decisions.push(
+                crate::state::PendingDecision::OpponentSacrificesCreatureChoice {
+                    source_obj_id,
+                    target_player: target_idx as u8,
+                    candidates,
+                },
+            );
+        }
         Effect::TargetOpponentLookHandMayDiscard => {
             // 1. Source-controller resolution: 5-zone walk + stack
             //    scan. Mirrors round-24 EachOpponentDiscards /

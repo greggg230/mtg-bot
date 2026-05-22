@@ -489,12 +489,11 @@ The 7-card subsystem-gated row's residue:
   replacement-effect substrate consumer wire-up — substrate landed at
   `7b2f62f0`; the host-as-token swap mechanism is the remaining
   honest-stop and gates the loader admit widen.**
-* **Multi-gated 2 (post-Cracked-Skull-C2 closure, 2026-05-22):**
-  Chorale of the Void, Sporogenic Infection — both S4-shape, both
-  multi-gated with effect-uncovered + nonsafe-trig + Aura. Phase 3
-  S4 substrate (`35ede8b0`) is the Aura half; per-card Effect-
-  uncovered closures + nonsafe-trigger event bridges are the
-  remaining halves.
+* **Multi-gated 1 (post-Sporogenic-Infection closure, 2026-05-22):**
+  Chorale of the Void — S4-shape, multi-gated with effect-uncovered
+  + nonsafe-trig + Aura. Phase 3 S4 substrate (`35ede8b0`) is the
+  Aura half; per-card Effect-uncovered closures + nonsafe-trigger
+  event bridges are the remaining halves.
 * **Cracked Skull (PROBED, 2026-05-22, `feature/cracked-skull-
   cycle-2-p1`):** the first Aura-S4 multi-gate-composition card to
   flip end-to-end. Cycle 2 ships
@@ -504,6 +503,21 @@ The 7-card subsystem-gated row's residue:
   destroy-host). 20 parity tests at
   `tests/test_cracked_skull_parity.py`; full closure entry at
   `docs/SEARCH_LIMITATIONS.md` (Cracked Skull section).
+* **Sporogenic Infection (PROBED, 2026-05-22,
+  `feature/sporogenic-infection-cycle-1-p1`):** the second Aura-S4
+  multi-gate-composition card to flip end-to-end, ships the SAME
+  two-trigger-composition framework Cracked Skull's C2 closure
+  established. Cycle 1 ships
+  `Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted` +
+  new `PendingDecision::OpponentSacrificesCreatureChoice` substrate
+  (the first opponent-decision PendingDecision on Rust — distinct
+  from sibling controller-decision variants) + cross-engine bridge
+  arm + Phase-3 admit shape 6
+  (ENTERS+IsSelf+TargetOpponentSacrificesCreatureOtherThanEnchanted;
+  reuses Cracked Skull C2's shape 5 for the DEALT_DAMAGE half).
+  19 parity tests at `tests/test_sporogenic_infection_parity.py`;
+  full closure entry at `docs/SEARCH_LIMITATIONS.md` (Sporogenic
+  Infection section).
 
 Sibling lane 3 (`feature/aura-phase-4`) shipped Phase 4 first
 deliverable at `6fa5ac9c` (Effect::SacrificeSelfUnlessVoidActive
@@ -948,6 +962,20 @@ sub-gates that the original `ce564786` inventory didn't surface:
   Skull / Sporogenic Infection each need their Aura half (shipped
   `35ede8b0`) + Effect-uncovered closure + nonsafe-trigger event bridge.
   These are now exactly that cleanly-decomposed.
+  **Cracked Skull flipped PROBED 2026-05-22 on `feature/cracked-skull-
+  cycle-2-p1`** with the C1 substrate (`cc218118`,
+  `PendingDecision::LookAtOpponentHandMayDiscard` runtime substrate)
+  → C2 closure (`d0ddd76c`, `Effect::TargetOpponentLookHandMayDiscard`
+  + bridge + Phase-3 admit shapes 4+5). **Sporogenic Infection
+  flipped PROBED 2026-05-22 on `feature/sporogenic-infection-cycle-1-p1`**
+  with a single-cycle full closure
+  (`Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted` +
+  new opponent-decision `PendingDecision::OpponentSacrificesCreature
+  Choice` substrate + bridge + Phase-3 admit shape 6; the
+  DEALT_DAMAGE half rode Cracked Skull C2's shape 5 verbatim).
+  The remaining Aura-S4 carrier — Chorale of the Void — has its own
+  per-card closure ahead of it (the `SacrificeSelfUnlessVoidActive`
+  end-step rider is the long pole there).
 * **warp_cost Phase 3 — CLOSED round-83 (2026-05-20).** The 3 Phase-3
   carriers (Bygone Colossus, Red Tiger Mechan, Timeline Culler) flipped
   to PROBED on `feature/warp-cost-phase-3`. The Phase 1/1.5/2 substrate

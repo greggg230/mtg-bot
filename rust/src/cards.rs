@@ -5637,6 +5637,96 @@ pub enum Effect {
     /// scope difference is documented honest-stop in
     /// `docs/SEARCH_LIMITATIONS.md`.
     TargetOpponentLookHandMayDiscard,
+    /// **Sporogenic Infection — Cycle 1 (2026-05-22) — Aura ETB
+    /// opponent-sacrifice trigger half.** "Target opponent sacrifices
+    /// a creature of their choice other than enchanted creature."
+    /// Sporogenic Infection's ETB trigger; the second trigger
+    /// (DEALT_DAMAGE + IsHost + `DestroyEnchantedPermanent`) is
+    /// already Rust-bridged (Cracked Skull C2 shipped the admit/emit
+    /// for `DestroyEnchantedPermanent`; the Rust resolve arm was
+    /// pre-existing). Python class:
+    /// `TargetOpponentSacrificesCreatureOtherThanEnchanted` (no
+    /// fields) at `src/mtg_bot/effects/generic/opponent_punishers.py`
+    /// (lines 68-145).
+    ///
+    /// **Field-free unit variant on both engines.** Python's
+    /// `@dataclass(frozen=True)` carries no slots; the controller of
+    /// the trigger (the Aura's controller), the target opponent (the
+    /// only opponent in 2-player), and the attached-to host (read off
+    /// the Aura source) are all resolved at resolve time.
+    ///
+    /// **Resolve semantics (mirrors `opponent_punishers.py:100-138`).**
+    /// 1. Source-finder: walk `state.players[*].battlefield` for the
+    ///    Aura source (the source must be on the battlefield for the
+    ///    ETB trigger to have fired; if it has LTB'd between the
+    ///    trigger queueing and resolve, silent fizzle).
+    /// 2. Excluded host id = `source.attached_to` (the Aura's enchanted
+    ///    creature, if any). When the Aura is enchanting a creature
+    ///    the target opponent controls (Sporogenic's usual case), the
+    ///    host is filtered out of the sac options. When the Aura is
+    ///    on a controller-owned creature, the target opponent's
+    ///    creatures are unaffected by the exclusion (no overlap).
+    /// 3. 2-player "target opponent" reduces to the one opponent:
+    ///    `opponent_idx = (1 - controller) as usize`.
+    /// 4. Build candidates: every creature on the target opponent's
+    ///    battlefield EXCLUDING the host (`o.controller == target_idx
+    ///    && o.printing.is_creature && o.id != excluded_id`),
+    ///    bf-iteration order (matches Python's list comprehension at
+    ///    `opponent_punishers.py:122-127`). Token creatures are NOT
+    ///    excluded — the printed text reads "a creature of their
+    ///    choice", not "a nontoken creature" (Python parity at
+    ///    `opponent_punishers.py:84-86`).
+    /// 5. Empty candidates → silent no-op (Python parity at
+    ///    `opponent_punishers.py:128`: `if not legal: return`). The
+    ///    decision is NOT pushed.
+    /// 6. Non-empty candidates → push
+    ///    `PendingDecision::OpponentSacrificesCreatureChoice
+    ///    { source_obj_id, target_player, candidates }` onto the
+    ///    queue. **Note the decision-maker is the OPPONENT
+    ///    (`target_player`), not the controller** — the printed text
+    ///    is "target opponent sacrifices a creature OF THEIR CHOICE";
+    ///    the opponent picks via their own agent's `choose_sacrifice`
+    ///    (Python parity at `opponent_punishers.py:128-132`). The
+    ///    PendingDecision variant therefore drops the `controller`
+    ///    field (no controller-decision in this shape) and carries
+    ///    only the seat of the player who makes the choice
+    ///    (`target_player`).
+    ///
+    /// The opponent's agent drains via
+    /// `submit_opponent_sacrifices_creature_decision(chosen_id)`
+    /// (sacrifice the chosen creature; mirrors Python's
+    /// `_sacrifice(state, obj)` at `opponent_punishers.py:138`).
+    /// Unlike the Cracked Skull may-gate, there is NO decline path —
+    /// the opponent MUST sacrifice one (the trigger forces it; the
+    /// printed text is "sacrifices a creature OF THEIR CHOICE", not
+    /// "you MAY sacrifice"). Auto-resolve `"default"` picks
+    /// `candidates[0]` (the deterministic-first creature in bf-
+    /// iteration order; mirrors Python's no-agent-seated fallback at
+    /// `opponent_punishers.py:128-129` — `if target.agent is None:
+    /// return`, but that path leaves the opponent without making a
+    /// choice; the cross-engine probe seats agents on both sides so
+    /// the deterministic-first auto-resolve is the parity bridge).
+    ///
+    /// **Schema parity with Python.** Unit variant on both sides — no
+    /// fields. The bridge translates this Rust variant to
+    /// `TargetOpponentSacrificesCreatureOtherThanEnchanted()` (field-
+    /// free construction). The source identity is read from
+    /// `source_obj_id` (the Rust resolve-arm signature carries it
+    /// directly — no `state.resolving_source` analog needed, the id
+    /// IS the resolving source's id).
+    ///
+    /// **Why a new PendingDecision variant (not sibling reuse).** The
+    /// Cracked Skull C1 `LookAtOpponentHandMayDiscard` substrate has a
+    /// controller-decision shape (the caster makes the may-gate
+    /// pick). Sporogenic's sacrifice-of-their-choice is an OPPONENT-
+    /// decision shape (the target opponent picks which of THEIR
+    /// creatures to sacrifice). Distinct seat → distinct variant; the
+    /// sibling pattern would be misleading. The new variant
+    /// `OpponentSacrificesCreatureChoice` reuses the candidate-id-list
+    /// idiom (`Vec<u32>` of legal sacrifice targets) but routes the
+    /// submit to `target_player`'s sacrifice path, not
+    /// `controller`'s.
+    TargetOpponentSacrificesCreatureOtherThanEnchanted,
 }
 
 /// **BBB downstream complement — 7th Rust slice.**
@@ -9033,6 +9123,17 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
             // `@dataclass(frozen=True)`; the bridge constructs
             // `TargetOpponentLookHandMayDiscard()` with no args.
             Ok(Effect::TargetOpponentLookHandMayDiscard)
+        }
+        "target_opponent_sacrifices_creature_other_than_enchanted" => {
+            // **Sporogenic Infection — Cycle 1 (2026-05-22).** Unit
+            // variant; no payload fields beyond `kind`. Mirrors the
+            // sibling `target_opponent_look_hand_may_discard` parse
+            // arm shape verbatim. Python's
+            // `TargetOpponentSacrificesCreatureOtherThanEnchanted`
+            // (`effects/generic/opponent_punishers.py:68-145`) is a
+            // field-free `@dataclass(frozen=True)`; the bridge
+            // constructs the field-free Python class.
+            Ok(Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted)
         }
         "put_stun_counter_on_tapped_creature" => {
             // Unit variant; no fields. Mirrors Python's
@@ -12806,6 +12907,16 @@ pub(crate) fn effect_to_pydict<'py>(
             // shape consistency (slice-19 / slice-20 unit-variant
             // precedent).
             d.set_item("kind", "target_opponent_look_hand_may_discard")?;
+        }
+        Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted => {
+            // **Sporogenic Infection — Cycle 1 (2026-05-22) — to_pydict.**
+            // Unit variant; no payload fields beyond `kind`.
+            // Round-trip dict-shape consistency with the sibling
+            // `target_opponent_look_hand_may_discard` arm.
+            d.set_item(
+                "kind",
+                "target_opponent_sacrifices_creature_other_than_enchanted",
+            )?;
         }
         Effect::PutStunCounterOnTappedCreature => {
             // Round-30 stun-counter substrate. Unit variant; no

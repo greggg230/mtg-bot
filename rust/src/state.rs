@@ -2076,6 +2076,74 @@ pub enum PendingDecision {
         target_player: u8,
         candidates: Vec<u32>,
     },
+    /// **Sporogenic Infection — Cycle 1 (2026-05-22).** "Target
+    /// opponent sacrifices a creature of their choice other than
+    /// enchanted creature." Pushed by
+    /// `Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted`
+    /// (Sporogenic Infection's Aura ETB trigger half).
+    ///
+    /// **Opponent-decision shape (distinct from sibling controller-
+    /// decision variants).** Unlike `TapPermanentChoice` /
+    /// `LookAtOpponentHandMayDiscard` (where the source's controller
+    /// makes the pick), this variant routes the choice to the TARGET
+    /// OPPONENT — the printed text reads "target opponent sacrifices
+    /// a creature OF THEIR CHOICE". The submit dispatcher therefore
+    /// consults `state.players[target_player].agent`, not the
+    /// controller's agent.
+    ///
+    /// **Why no `controller` field.** The controller-of-trigger
+    /// (Sporogenic's caster) does NOT make any choice in this
+    /// resolve; only the target opponent does. Including a
+    /// `controller` field would carry unused state into the
+    /// fingerprint (parity-sensitive). The source identity is
+    /// preserved via `source_obj_id` (log-correlation only; not used
+    /// in routing).
+    ///
+    /// **Payload.** Carries:
+    ///   * `source_obj_id` — the Aura on bf whose ETB triggered
+    ///     (recorded for log-correlation; not used in routing).
+    ///   * `target_player` — the opponent whose sacrifice fires; the
+    ///     player who picks the creature.
+    ///   * `candidates` — flat list of creature ids currently on
+    ///     `target_player.battlefield` EXCLUDING the attached-to host
+    ///     (filtered at push time per the printed "other than
+    ///     enchanted creature" qualifier; the host id is read off
+    ///     `source.attached_to` by the Effect arm), in bf-iteration
+    ///     order (matches Python's list-comprehension order at
+    ///     `effects/generic/opponent_punishers.py:122-127`).
+    ///
+    /// **Submit.**
+    /// `submit_opponent_sacrifices_creature_decision(chosen_id)`
+    /// routes `chosen_id` from `target_player.battlefield` →
+    /// `target_player.graveyard` via the standard sacrifice path
+    /// (mirrors Python's `_sacrifice(state, obj)` at
+    /// `opponent_punishers.py:138`). `chosen_id` MUST be one of the
+    /// candidate ids; an unknown id raises `ValueError`
+    /// transactionally. **There is NO decline path** — the printed
+    /// text forces the sacrifice ("sacrifices a creature of their
+    /// choice", not "you MAY sacrifice").
+    ///
+    /// **Auto-resolve default.** `"default"` /
+    /// `"opponent_sacrifices_first"` picks `candidates[0]` (the
+    /// deterministic-first creature in bf-iteration order). Python's
+    /// no-agent-seated fallback at `opponent_punishers.py:128-129`
+    /// silently no-ops, but the cross-engine parity path seats
+    /// agents on both sides (the only realistic real-game scenario);
+    /// the auto-resolve thus tracks the deterministic-first agent
+    /// pick that the Python `_PickFirstLegalTargetAgent` bench
+    /// convention uses (the same precedent every cast-time picker
+    /// rides — see `state_ops_cast.rs:1614-1714`).
+    ///
+    /// **Empty candidate set is impossible.** The Effect arm only
+    /// pushes this decision when candidates is non-empty (the
+    /// empty-set case silently no-ops at the Effect-arm without ever
+    /// queuing a decision — Python parity, `opponent_punishers.py:128`
+    /// `if not legal: return`).
+    OpponentSacrificesCreatureChoice {
+        source_obj_id: u32,
+        target_player: u8,
+        candidates: Vec<u32>,
+    },
 }
 
 /// `GameState` carries an `Arc<RegistryData>` so every clone shares

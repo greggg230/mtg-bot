@@ -593,14 +593,26 @@ def test_predicate_admits_cracked_skull_post_cycle2_closure():
     assert _printing_is_bridge_simple_aura(p) is True
 
 
-def test_predicate_declines_sporogenic_infection():
-    """Sporogenic Infection has ENTERS + TargetOpponentSacrifices...
-    + DEALT_DAMAGE + DestroyEnchantedPermanent — neither in safe set."""
+def test_predicate_admits_sporogenic_infection_post_cycle1_closure():
+    """**Updated 2026-05-22 — Sporogenic Infection Cycle 1 closure
+    landed.** Sporogenic Infection is now bench-loader-ADMITTED: the
+    two-trigger composition
+    (``ENTERS+IsSelf+TargetOpponentSacrificesCreatureOtherThan
+    Enchanted`` + ``DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent``)
+    is now Phase-3-safe via this lane's widen of
+    :func:`_aura_triggers_are_phase3_safe` (the Cycle 1 Effect arm +
+    cross-engine bridge arm + admit-set widen landed in
+    ``feature/sporogenic-infection-cycle-1-p1``). Pre-Cycle 1's pin
+    (Sporogenic Infection declined) is reversed here; the canonical
+    PROBED-flip test lives at
+    ``tests/test_sporogenic_infection_parity.py::
+    test_predicate_admits_live_sporogenic_infection_printing``.
+    """
     from mtg_bot.cards.source import get_active_source
 
     p = get_active_source().get_printings()["Sporogenic Infection"]
     assert p.is_aura is True
-    assert _printing_is_bridge_simple_aura(p) is False
+    assert _printing_is_bridge_simple_aura(p) is True
 
 
 def test_predicate_declines_meltstriders_resolve():

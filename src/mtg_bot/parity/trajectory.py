@@ -5270,6 +5270,9 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
     from mtg_bot.effects.generic.discard import (
         TargetOpponentLookHandMayDiscard,
     )
+    from mtg_bot.effects.generic.opponent_punishers import (
+        TargetOpponentSacrificesCreatureOtherThanEnchanted,
+    )
     from mtg_bot.effects.generic.tap import TapEnchantedPermanent
 
     if not triggered_abilities:
@@ -5342,6 +5345,28 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
             and isinstance(ta.effect, DestroyEnchantedPermanent)
         ):
             continue
+        # **Sporogenic Infection — Cycle 1 (2026-05-22) — admit shape
+        # 6: Aura ETB → target opponent sacrifices creature.**
+        # ``ENTERS+IsSelf(None)+
+        # TargetOpponentSacrificesCreatureOtherThanEnchanted`` —
+        # Sporogenic Infection's first trigger. The full Rust
+        # substrate (Effect variant + parse arm + resolve arm +
+        # to_pydict arm + bridge arm + new
+        # ``PendingDecision::OpponentSacrificesCreatureChoice`` sub-
+        # variant for the OPPONENT-decision shape) lands together in
+        # this same lane. Pairs with shape 5 (DEALT_DAMAGE+IsHost+
+        # DestroyEnchantedPermanent) — Sporogenic Infection rides the
+        # same two-trigger composition framework Cracked Skull's C2
+        # closure established at d0ddd76c.
+        if (
+            ta.event is Event.ENTERS
+            and isinstance(ta.predicate, IsSelf)
+            and ta.predicate.subject is None
+            and isinstance(
+                ta.effect, TargetOpponentSacrificesCreatureOtherThanEnchanted
+            )
+        ):
+            continue
         return False
     return True
 
@@ -5399,6 +5424,9 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
     from mtg_bot.effects.generic.destroy import DestroyEnchantedPermanent
     from mtg_bot.effects.generic.discard import (
         TargetOpponentLookHandMayDiscard,
+    )
+    from mtg_bot.effects.generic.opponent_punishers import (
+        TargetOpponentSacrificesCreatureOtherThanEnchanted,
     )
     from mtg_bot.effects.generic.tap import TapEnchantedPermanent
 
@@ -5459,6 +5487,23 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
             "event": "dealt_damage",
             "predicate": {"kind": "is_host"},
             "effect": {"kind": "destroy_enchanted_permanent"},
+            "once_per_turn": False,
+        }
+    if isinstance(ta.effect, TargetOpponentSacrificesCreatureOtherThanEnchanted):
+        # **Sporogenic Infection — Cycle 1 (2026-05-22) — shape 6:
+        # ENTERS+IsSelf+TargetOpponentSacrificesCreatureOtherThan
+        # Enchanted.** Sporogenic Infection's ETB trigger half. Rust
+        # kind ``target_opponent_sacrifices_creature_other_than_
+        # enchanted`` (cards.rs unit variant + cross_engine.py bridge
+        # arm landed in this slice). Pairs with shape 5
+        # (DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent) for
+        # Sporogenic Infection's two-trigger composition.
+        return {
+            "event": "enters",
+            "predicate": {"kind": "source_is_self"},
+            "effect": {
+                "kind": "target_opponent_sacrifices_creature_other_than_enchanted"
+            },
             "once_per_turn": False,
         }
     # Should be unreachable when pre-gated by

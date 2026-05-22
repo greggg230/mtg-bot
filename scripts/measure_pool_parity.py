@@ -846,6 +846,34 @@ PROBE_MODULES: tuple[Path, ...] = (
     # DEALT_DAMAGE host-event — to land end-to-end on the bench
     # loader).
     REPO_ROOT / "tests" / "test_cracked_skull_parity.py",
+    # **sporogenic-infection-cycle-1-p1 (2026-05-22):** Sporogenic
+    # Infection Cycle 1 closure — full PROBED flip in one cycle (the
+    # ENTERS half's ``TargetOpponentSacrificesCreatureOtherThanEnchanted``
+    # Effect + new ``OpponentSacrificesCreatureChoice`` PendingDecision
+    # substrate landed together; the DEALT_DAMAGE half rode the existing
+    # Cracked Skull C2 destroy-enchanted-permanent Phase-3 admit shape).
+    # Ships ``Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted``
+    # on the Rust side (parse + to_pydict + resolve arm), a new
+    # ``PendingDecision::OpponentSacrificesCreatureChoice`` variant +
+    # dispatcher (the FIRST opponent-decision substrate — distinct from
+    # the sibling controller-decision variants like
+    # ``LookAtOpponentHandMayDiscard`` / ``TapPermanentChoice``), the
+    # cross-engine bridge arm
+    # ``target_opponent_sacrifices_creature_other_than_enchanted`` in
+    # ``cross_engine.py::_ta_dict_to_python_effect``, and the Phase-3
+    # safe-trigger admit-set widen for Sporogenic Infection's two-
+    # trigger composition (``ENTERS+IsSelf+TargetOpponentSacrifices
+    # CreatureOtherThanEnchanted`` shape 6, pairs with Cracked Skull
+    # C2's shape 5 ``DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent``).
+    # The ``test_cross_engine_real_eoe_sporogenic_infection_enters_
+    # sacrifice_parity`` probe drives the genuine parsed Sporogenic
+    # Infection EoE printing through the bridge round-trip + Python-
+    # side resolve smoke, matching the Cracked-Skull / HHHH /
+    # Pain-for-All / Tractor-Beam canonical Aura-probe shape. Flips
+    # Sporogenic Infection BLOCKED-multi-gate → PROBED (the second Aura
+    # with a two-trigger composition — ETB + DEALT_DAMAGE host-event —
+    # to land end-to-end on the bench loader, alongside Cracked Skull).
+    REPO_ROOT / "tests" / "test_sporogenic_infection_parity.py",
 )
 
 # Tier keys (stable — the doc + test reference these verbatim).

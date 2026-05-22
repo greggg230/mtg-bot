@@ -593,6 +593,37 @@ pub(crate) fn auto_resolve_pending(
                 // Else: decline -> no mutation. Mirrors Python's
                 // no-agent-seated return-without-discarding.
             }
+            PendingDecision::OpponentSacrificesCreatureChoice {
+                source_obj_id: _,
+                target_player,
+                candidates,
+            } => {
+                // **Sporogenic Infection — Cycle 1 (2026-05-22) —
+                // auto-resolve.**
+                //
+                // "default" / "opponent_sacrifices_first" -> sacrifice
+                //   candidates[0] (the deterministic-first creature in
+                //   bf-iteration order). Mirrors the
+                //   `_PickFirstLegalTargetAgent` bench convention that
+                //   every cast-time picker rides. This is the forced-
+                //   choice shape — there is no decline path.
+                //
+                // The Effect arm guarantees `candidates` is non-empty
+                // at push time (empty-set case silent no-ops at the
+                // Effect arm before queuing); but the auto-resolve
+                // path defensively handles an empty Vec (synthetic-
+                // test push helpers that bypass the Effect arm could
+                // queue an empty candidate set, in which case the
+                // auto-resolve is a no-op rather than a panic).
+                if !candidates.is_empty() {
+                    crate::state_ops_resolve::sacrifice_source_for_tap_decline(
+                        state,
+                        target_player as usize,
+                        candidates[0],
+                    )?;
+                }
+                let _ = strategy; // every strategy maps to first-pick today
+            }
         }
     }
     Ok(())
@@ -1434,6 +1465,29 @@ impl GameState {
                     d.set_item("kind", "LookAtOpponentHandMayDiscard")?;
                     d.set_item("source_obj_id", *source_obj_id)?;
                     d.set_item("controller", *controller)?;
+                    d.set_item("target_player", *target_player)?;
+                    d.set_item("candidates", candidates.clone())?;
+                }
+                PendingDecision::OpponentSacrificesCreatureChoice {
+                    source_obj_id,
+                    target_player,
+                    candidates,
+                } => {
+                    // **Sporogenic Infection — Cycle 1 (2026-05-22).**
+                    // Surface dict for Sporogenic Infection's ETB
+                    // trigger: target opponent sacrifices a creature
+                    // of their choice other than enchanted creature.
+                    // `candidates` is the flat list of creature ids on
+                    // `target_player.battlefield` excluding the
+                    // attached-to host (Python parity:
+                    // `effects/generic/opponent_punishers.py:122-127`).
+                    // The opponent drains via
+                    // `submit_opponent_sacrifices_creature_decision(id)`
+                    // — forced sacrifice, no decline. No `controller`
+                    // slot (the controller of the trigger doesn't pick
+                    // — only the target opponent does).
+                    d.set_item("kind", "OpponentSacrificesCreatureChoice")?;
+                    d.set_item("source_obj_id", *source_obj_id)?;
                     d.set_item("target_player", *target_player)?;
                     d.set_item("candidates", candidates.clone())?;
                 }
@@ -2380,6 +2434,131 @@ impl GameState {
             }
             None => Ok(()),
         }
+    }
+
+    /// **Sporogenic Infection — Cycle 1 (2026-05-22).** Consume the
+    /// head `OpponentSacrificesCreatureChoice` on the pending-decisions
+    /// queue: `chosen_id` directs the target opponent to sacrifice
+    /// `chosen_id` from their battlefield → graveyard (mirrors
+    /// Python's `_sacrifice(state, obj)` at
+    /// `effects/generic/opponent_punishers.py:138`). There is NO
+    /// decline path — the printed text "sacrifices a creature of
+    /// their choice" forces the sacrifice; the dispatcher takes a
+    /// required `chosen_id: u32` (not `Option<u32>`).
+    ///
+    /// **Submit contract.** `chosen_id` MUST be one of the candidate
+    /// ids in the head's `candidates` Vec. An unknown id raises
+    /// `ValueError` transactionally — no mutation on failure, the
+    /// decision stays at the head of the queue. Mirrors the
+    /// `submit_look_at_opponent_hand_may_discard_decision` validation
+    /// shape.
+    ///
+    /// Raises `ValueError` if:
+    /// - the queue is empty
+    /// - the head is not an `OpponentSacrificesCreatureChoice`
+    /// - `chosen_id` is not in the candidate set
+    fn submit_opponent_sacrifices_creature_decision(
+        &mut self,
+        chosen_id: u32,
+    ) -> PyResult<()> {
+        if self.pending_decisions.is_empty() {
+            return Err(PyValueError::new_err(
+                "submit_opponent_sacrifices_creature_decision: \
+                 no pending decision",
+            ));
+        }
+        match &self.pending_decisions[0] {
+            PendingDecision::OpponentSacrificesCreatureChoice {
+                candidates,
+                ..
+            } => {
+                if !candidates.contains(&chosen_id) {
+                    return Err(PyValueError::new_err(format!(
+                        "submit_opponent_sacrifices_creature_decision: \
+                         chosen_id {chosen_id} is not one of the \
+                         candidate creature ids on target opponent's \
+                         battlefield {:?}",
+                        candidates
+                    )));
+                }
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "submit_opponent_sacrifices_creature_decision: \
+                     head of pending-decisions queue is not an \
+                     OpponentSacrificesCreatureChoice (got {:?}); call \
+                     the variant-specific submit_* dispatcher",
+                    std::mem::discriminant(other)
+                )));
+            }
+        }
+        // Validation passed — consume head and route.
+        let decision = self.pending_decisions.remove(0);
+        let target_player = match decision {
+            PendingDecision::OpponentSacrificesCreatureChoice {
+                target_player,
+                ..
+            } => target_player,
+            _ => unreachable!("validated above"),
+        };
+        crate::state_ops_resolve::sacrifice_source_for_tap_decline(
+            self,
+            target_player as usize,
+            chosen_id,
+        )
+    }
+
+    /// **Sporogenic Infection — Cycle 1 (2026-05-22) — synthetic-test
+    /// push helper.** Push a
+    /// `PendingDecision::OpponentSacrificesCreatureChoice` onto the
+    /// queue directly. Used by Cycle 1 tests to exercise the substrate
+    /// in isolation without an Effect-arm minting the decision; the
+    /// production mint site is the
+    /// `Effect::TargetOpponentSacrificesCreatureOtherThanEnchanted`
+    /// resolve arm in `state_ops_resolve.rs`.
+    ///
+    /// **Validation.** `target_player` MUST be 0 or 1. Every
+    /// candidate id MUST refer to a creature currently on
+    /// `state.players[target_player].battlefield` (no creature filter
+    /// applied here — the caller is responsible for filtering at push
+    /// time, mirroring the Effect arm's "is_creature && id != host"
+    /// scan). Raises `ValueError` transactionally on invalid input.
+    fn push_opponent_sacrifices_creature_choice(
+        &mut self,
+        source_obj_id: u32,
+        target_player: u8,
+        candidates: Vec<u32>,
+    ) -> PyResult<()> {
+        if target_player >= 2 {
+            return Err(PyValueError::new_err(format!(
+                "push_opponent_sacrifices_creature_choice: \
+                 target_player={target_player} is not a valid player \
+                 seat (must be 0 or 1)"
+            )));
+        }
+        let tidx = target_player as usize;
+        let bf_ids: std::collections::HashSet<u32> = self.players[tidx]
+            .battlefield
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        for id in &candidates {
+            if !bf_ids.contains(id) {
+                return Err(PyValueError::new_err(format!(
+                    "push_opponent_sacrifices_creature_choice: \
+                     candidate id {id} is not in \
+                     state.players[{target_player}].battlefield"
+                )));
+            }
+        }
+        self.pending_decisions.push(
+            PendingDecision::OpponentSacrificesCreatureChoice {
+                source_obj_id,
+                target_player,
+                candidates,
+            },
+        );
+        Ok(())
     }
 
     /// **Cracked Skull look-at-hand + may-discard substrate — Cycle 1
