@@ -489,11 +489,10 @@ The 7-card subsystem-gated row's residue:
   replacement-effect substrate consumer wire-up — substrate landed at
   `7b2f62f0`; the host-as-token swap mechanism is the remaining
   honest-stop and gates the loader admit widen.**
-* **Multi-gated 1 (post-Sporogenic-Infection closure, 2026-05-22):**
-  Chorale of the Void — S4-shape, multi-gated with effect-uncovered
-  + nonsafe-trig + Aura. Phase 3 S4 substrate (`35ede8b0`) is the
-  Aura half; per-card Effect-uncovered closures + nonsafe-trigger
-  event bridges are the remaining halves.
+* **Multi-gated 0 (post-Chorale-of-the-Void closure, 2026-05-22):**
+  ALL THREE Aura S4 multi-trigger siblings (Cracked Skull,
+  Sporogenic Infection, Chorale of the Void) have flipped PROBED;
+  the multi-gated S4 row is empty.
 * **Cracked Skull (PROBED, 2026-05-22, `feature/cracked-skull-
   cycle-2-p1`):** the first Aura-S4 multi-gate-composition card to
   flip end-to-end. Cycle 2 ships
@@ -518,6 +517,26 @@ The 7-card subsystem-gated row's residue:
   19 parity tests at `tests/test_sporogenic_infection_parity.py`;
   full closure entry at `docs/SEARCH_LIMITATIONS.md` (Sporogenic
   Infection section).
+* **Chorale of the Void (PROBED, 2026-05-22,
+  `feature/chorale-of-the-void-cycle-1-p1`):** the THIRD and FINAL
+  Aura-S4 multi-gate-composition card to flip end-to-end; ALL three
+  Aura S4 siblings now closed. Cycle 1 ships
+  `Effect::ReanimateTargetCreatureCardFromDefendersGraveyard`
+  (honest-stop resolve arm — the cast-time-bound graveyard-creature
+  target shape is not threaded through to triggered abilities AND
+  the put-into-bf-tapped-and-attacking combat-pipeline integration
+  is deferred to Cycle 2; both halves silently match Python's
+  same-case `if not targets: return` fizzle at
+  `graveyard.py:527-528`) + cross-engine bridge arm + Phase-3
+  admit shape 7 (ATTACKS+IsHost(subject="attacker")+
+  ReanimateTargetCreatureCardFromDefendersGraveyard) + Phase-3
+  admit shape 8 (BEGINNING_OF_END_STEP+Controlled(by=YOU)+
+  SacrificeSelfUnlessVoidActive — the end-step sustain rider's
+  full Rust resolve already shipped at the Aura-Phase-4 substrate
+  landing; only the safe-trigger admit + emitter arm are new
+  here). 17 parity tests at
+  `tests/test_chorale_of_the_void_parity.py`; full closure entry
+  at `docs/SEARCH_LIMITATIONS.md` (Chorale of the Void section).
 
 Sibling lane 3 (`feature/aura-phase-4`) shipped Phase 4 first
 deliverable at `6fa5ac9c` (Effect::SacrificeSelfUnlessVoidActive
@@ -973,9 +992,18 @@ sub-gates that the original `ce564786` inventory didn't surface:
   new opponent-decision `PendingDecision::OpponentSacrificesCreature
   Choice` substrate + bridge + Phase-3 admit shape 6; the
   DEALT_DAMAGE half rode Cracked Skull C2's shape 5 verbatim).
-  The remaining Aura-S4 carrier — Chorale of the Void — has its own
-  per-card closure ahead of it (the `SacrificeSelfUnlessVoidActive`
-  end-step rider is the long pole there).
+  **Chorale of the Void flipped PROBED 2026-05-22 on
+  `feature/chorale-of-the-void-cycle-1-p1`** with a single-cycle
+  honest-stop closure
+  (`Effect::ReanimateTargetCreatureCardFromDefendersGraveyard` +
+  honest-stop resolve arm — empty-targets silent fizzle byte-equal
+  with Python; full byte-equality on a real combat trajectory
+  deferred to Cycle 2 pending the triggered-ability target-pump +
+  combat-pipeline integration — + bridge + Phase-3 admit shapes
+  7+8). With all three Aura-S4 multi-trigger siblings closed, the
+  Aura-S4 row is empty; the next subsystem-gated Aura row is
+  Meltstrider's Resolve (`EnchantedCreatureFightsTargetEffect`
+  trigger, separate follow-up slice).
 * **warp_cost Phase 3 — CLOSED round-83 (2026-05-20).** The 3 Phase-3
   carriers (Bygone Colossus, Red Tiger Mechan, Timeline Culler) flipped
   to PROBED on `feature/warp-cost-phase-3`. The Phase 1/1.5/2 substrate

@@ -8846,6 +8846,50 @@ def _ta_dict_to_python_effect(eff_dict: dict):
             SacrificeSelfUnlessVoidActive,
         )
         return SacrificeSelfUnlessVoidActive()
+    if kind == "reanimate_target_creature_card_from_defenders_graveyard":
+        # **Chorale of the Void Cycle 1 (Aura S4 last sibling) --
+        # ReanimateTargetCreatureCardFromDefendersGraveyard bridge arm.**
+        # Rust's ``Effect::ReanimateTargetCreatureCardFromDefendersGraveyard``
+        # (cards.rs unit variant added in this lane; parse + to_pydict
+        # arms immediately after the SacrificeSelfUnlessVoidActive arm;
+        # resolve arm in ``state_ops_resolve.rs`` immediately after the
+        # SacrificeSelfUnlessVoidActive arm) mirrors Python's
+        # ``ReanimateTargetCreatureCardFromDefendersGraveyard``
+        # (``effects/generic/graveyard.py:473-554``).
+        #
+        # **Unit-variant bridge.** No fields to round-trip; the bare
+        # ``ReanimateTargetCreatureCardFromDefendersGraveyard()``
+        # reconstructs the Python @dataclass(frozen=True) (mirrors the
+        # sibling ``sacrifice_self_unless_void_active`` /
+        # ``enchanted_creature_fights_target`` / Pain for All
+        # unit-variant precedent).
+        #
+        # **Honest-stop status (substrate Cycle 1).** The Rust resolve
+        # arm silent no-ops because the cast-time-bound graveyard-
+        # creature target shape is not threaded through to the trigger-
+        # resolve site, AND the combat-pipeline integration (push the
+        # reanimated creature onto ``state.attackers`` mid-combat) is
+        # deferred to a Cycle 2 substrate slice. Python takes the same
+        # silent-fizzle in the no-targets / no-host-attached path
+        # (graveyard.py:527-528), so cross-engine state stays byte-equal
+        # on the empty-graveyard / no-host-attached probe shapes that
+        # the bench-loader exercises today.
+        #
+        # **Aura admit boundary.** Chorale of the Void's TWO triggers
+        # are: ATTACKS+IsHost("attacker")+ReanimateTargetCreatureCard
+        # FromDefendersGraveyard (this lane's new shape 7), and
+        # BEGINNING_OF_END_STEP+Controlled(YOU)+SacrificeSelfUnlessVoid
+        # Active (shape 8, the end-step sustain whose Rust resolve
+        # full-closure shipped at the Aura-Phase-4 substrate landing).
+        # With this bridge arm + the admit-set widen in this lane,
+        # Chorale flips BLOCKED-multi-gate → PROBED.
+        #
+        # **Real EoE consumer:** Chorale of the Void (2,783 17lands
+        # decks) -- the LAST Aura S4 sibling to close.
+        from mtg_bot.effects.generic.graveyard import (
+            ReanimateTargetCreatureCardFromDefendersGraveyard,
+        )
+        return ReanimateTargetCreatureCardFromDefendersGraveyard()
     if kind == "enchanted_creature_fights_target":
         # 19th Rust slice (honest-stop substrate landing) -- Meltstrider's
         # Resolve Aura ETB "fight" bridge arm. Rust's

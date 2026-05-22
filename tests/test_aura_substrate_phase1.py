@@ -314,15 +314,18 @@ def test_predicate_declines_non_aura():
 
 
 def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
-    """**Sporogenic Infection Cycle 1 closure (2026-05-22).** The
-    closure adds Sporogenic Infection to the admit set (the Phase-3
+    """**Chorale of the Void Cycle 1 closure (2026-05-22).** The
+    closure adds Chorale of the Void to the admit set (the Phase-3
     safe-trigger gate now admits its two-trigger composition
-    ``ENTERS+IsSelf+TargetOpponentSacrificesCreatureOtherThanEnchanted``
-    + ``DEALT_DAMAGE+IsHost+DestroyEnchantedPermanent``). Combined
-    with the Cracked Skull C2 closure (2026-05-22), the Phase 4 S3
-    closure (Moonlit Meditation, 2026-05-21) and the prior
-    Phase 1/Phase 2/Phase 3 first deliverable widenings, the
-    bench-loader admits EIGHT live EoE Auras:
+    ``ATTACKS+IsHost(subject="attacker")+
+    ReanimateTargetCreatureCardFromDefendersGraveyard`` +
+    ``BEGINNING_OF_END_STEP+Controlled(by=YOU)+
+    SacrificeSelfUnlessVoidActive``). With Chorale, ALL THREE Aura
+    S4 multi-trigger siblings (Cracked Skull, Sporogenic Infection,
+    Chorale of the Void) are now bench-loader-admitted. Combined
+    with the prior Phase 1/Phase 2/Phase 3/Phase 4 first
+    deliverable widenings, the bench-loader admits NINE live EoE
+    Auras:
 
       * Frantic Strength + Shardmage's Rescue (S1 — keyword + P/T),
       * Duskmourn's Domination (S2 — control + lose-abilities),
@@ -331,12 +334,13 @@ def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
       * Moonlit Meditation (S3 — replacement, Phase 4 S3 closure),
       * Cracked Skull (S4 — multi-trigger composition, C2 closure),
       * Sporogenic Infection (S4 — multi-trigger composition,
-        Sporogenic Infection Cycle 1 closure).
+        Sporogenic Infection Cycle 1 closure),
+      * Chorale of the Void (S4 — multi-trigger composition,
+        Chorale of the Void Cycle 1 closure).
 
-    Every remaining S4 carrier (Chorale of the Void) stays declined
-    on their non-Phase-3-safe trigger shape; Meltstrider's Resolve
-    stays declined on its ``EnchantedCreatureFightsTargetEffect``
-    trigger (separate follow-up slice).
+    Meltstrider's Resolve stays declined on its
+    ``EnchantedCreatureFightsTargetEffect`` trigger (separate
+    follow-up slice — distinct from the Aura S4 framework).
 
     This pin captures the exact admit set so a future Phase widen
     has to update it explicitly (verify-first discipline)."""
@@ -351,11 +355,12 @@ def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
             admitted.append(name)
         else:
             declined.append((name, "declined"))
-    # Sporogenic Infection Cycle 1 closure admit set: S1 carriers +
+    # Chorale of the Void Cycle 1 closure admit set: S1 carriers +
     # S2 Duskmourn-shape + Tractor Beam + Pain for All +
-    # Moonlit Meditation + Cracked Skull + Sporogenic Infection. If
-    # this set changes (parser drift, future widen), update both this
-    # pin AND the deck-count expectations in the plan.
+    # Moonlit Meditation + Cracked Skull + Sporogenic Infection +
+    # Chorale of the Void. If this set changes (parser drift,
+    # future widen), update both this pin AND the deck-count
+    # expectations in the plan.
     assert sorted(admitted) == sorted([
         "Frantic Strength",
         "Shardmage's Rescue",
@@ -365,8 +370,9 @@ def test_predicate_admits_live_eoe_s1_auras_post_phase_4_s3_closure():
         "Moonlit Meditation",
         "Cracked Skull",
         "Sporogenic Infection",
+        "Chorale of the Void",
     ]), (
-        f"Sporogenic Infection Cycle 1 closure expected eight carriers "
+        f"Chorale of the Void Cycle 1 closure expected nine carriers "
         f"to admit; got {sorted(admitted)!r}. If this is intentional "
         f"(a later Phase widen of the predicate's admit shape), update "
         f"this pin to assert the new expected admit list explicitly."
@@ -774,8 +780,20 @@ def test_loader_admits_at_least_one_live_eoe_aura_post_phase_2():
         "Sporogenic Infection Cycle 1 closure expected Sporogenic "
         "Infection to admit. Admitted set: %r" % (admitted_auras,)
     )
+    # Chorale of the Void Cycle 1 closure (2026-05-22): the
+    # two-trigger composition
+    # (ATTACKS+IsHost(subject="attacker")+
+    # ReanimateTargetCreatureCardFromDefendersGraveyard +
+    # BEGINNING_OF_END_STEP+Controlled(by=YOU)+
+    # SacrificeSelfUnlessVoidActive) is now Phase-3-safe; Chorale of
+    # the Void admits through the loader. All three Aura S4 siblings
+    # (Cracked Skull, Sporogenic Infection, Chorale of the Void) are
+    # bench-loader-admitted post this Cycle.
+    assert "Chorale of the Void" in admitted_auras, (
+        "Chorale of the Void Cycle 1 closure expected Chorale of the "
+        "Void to admit. Admitted set: %r" % (admitted_auras,)
+    )
     must_decline = {
-        "Chorale of the Void",       # S4 triggered_abilities (non-Phase-3-safe)
         "Meltstrider's Resolve",     # residue triggered_abilities (non-Phase-3-safe — Fight effect)
     }
     leaked = must_decline & set(admitted_auras)

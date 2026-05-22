@@ -4184,6 +4184,101 @@ pub enum Effect {
     /// fields. The bridge translates this Rust variant to
     /// `SacrificeSelfUnlessVoidActive()` (field-free construction).
     SacrificeSelfUnlessVoidActive,
+    /// **Chorale of the Void Cycle 1 (Aura S4 multi-trigger framework —
+    /// the LAST Aura S4 sibling) — ReanimateTargetCreatureCardFrom
+    /// DefendersGraveyard.** ATTACKS-triggered "put target creature card
+    /// from defending player's graveyard onto the battlefield under your
+    /// control tapped and attacking". Mirrors Python's
+    /// `ReanimateTargetCreatureCardFromDefendersGraveyard`
+    /// (`effects/generic/graveyard.py:473-554`) — the half of Chorale of
+    /// the Void (2,783 17lands decks — the highest deck-count remaining
+    /// Aura in the `blocked_subsystem_gated` tier per
+    /// `docs/AURA_ATTACHMENT_SUBSTRATE_PLAN.md` §1 sub-shape S4) that
+    /// fires when the enchanted creature attacks. The sibling end-step
+    /// trigger (`SacrificeSelfUnlessVoidActive`) already shipped its
+    /// full Rust closure at the Aura-Phase-4 substrate landing.
+    ///
+    /// **Unit variant on both sides.** Python's
+    /// `ReanimateTargetCreatureCardFromDefendersGraveyard` is a
+    /// `@dataclass(frozen=True)` with no fields — the target is a
+    /// cast-time-bound `target_kind=("graveyard_creature", id)` shape,
+    /// NOT a payload field. The Rust enum mirrors that.
+    ///
+    /// **Distinct from sibling ATTACKS triggers and reanimate effects.**
+    /// Two distinguishing axes from existing Rust precedent:
+    ///   1. **Trigger event = ATTACKS, not ETB / DEALT_DAMAGE.** The
+    ///      `Event::Attacks` dispatch fires per-attacker with the
+    ///      attacker as the dispatch `subject_id` (state_ops_combat.rs
+    ///      :1417). The Aura's trigger predicate (`IsHost(subject=
+    ///      "attacker")`) reads `find_object_attached_to(source)` and
+    ///      matches when the attached host == attacker — the existing
+    ///      Rust `IsHost` match arm at `cards.rs:6582-6612` already
+    ///      computes this correctly (the `subject` slot is informational
+    ///      only — the dispatch subject_id IS the attacker for ATTACKS).
+    ///   2. **Effect's target = card in DEFENDING player's graveyard
+    ///      (cross-player graveyard access).** New target shape
+    ///      `("graveyard_creature", id)` enumerated across the opponent
+    ///      (defender's) graveyards — NOT the controller's. Sibling
+    ///      precedent: existing `Effect::ReturnCreatureFromYourGraveyard
+    ///      ToBattlefield` walks own-graveyard at line 5706; the
+    ///      cross-player walk inverts the iteration.
+    ///
+    /// **Resolve semantics (mirrors `graveyard.py:521-547`).**
+    /// 1. Read cast-time-bound target — multi-target graveyard creature
+    ///    card with `target_kind = ("graveyard_creature", id)`.
+    /// 2. Re-validate per CR 608.2b: target is still in defending
+    ///    player's graveyard AND is a creature card; missing → silent
+    ///    no-op (Python parity: `if card is None: continue` →
+    ///    `if not targets: return` fall-through at
+    ///    `graveyard.py:527-528`).
+    /// 3. Reanimate: move card from opponent's graveyard → controller's
+    ///    battlefield under Chorale's controller per CR 110.1; reanimated
+    ///    creature ETBs **tapped AND already attacking the defender**
+    ///    (the new permanent rides the same defender as the triggering
+    ///    attacker; single-defender semantics).
+    /// 4. Set `obj.tapped = true`, `obj.summoning_sick = false`, push
+    ///    `state.attackers.push(obj.id)` so the new permanent participates
+    ///    in the in-progress combat damage step. (Python parity:
+    ///    `obj.tapped = True; obj.attacking = True;
+    ///    obj.summoning_sick = False` at `graveyard.py:544-546`.)
+    ///
+    /// **HONEST-STOP CLOSURE — substrate landed, full byte-equality
+    /// deferred.** The substrate Cycle 1 lands the Effect variant +
+    /// parse + to_pydict + bridge + admit-set widen + the resolve arm's
+    /// re-validation + cross-player graveyard walk. The
+    /// "put-into-bf-tapped-and-attacking primitive" — particularly the
+    /// `state.attackers.push` mid-combat integration — is the deferred
+    /// piece that would close full byte-equality with Python on a
+    /// real combat trajectory. Today the resolve arm walks the defending
+    /// player's graveyard, picks the first creature card, moves it to
+    /// the controller's bf tapped (NO summoning sickness), but does NOT
+    /// register it as an attacker (the combat pipeline is mid-damage at
+    /// this dispatch point; pushing onto `state.attackers` requires
+    /// integration with the attacker-damage-assignment phase that hasn't
+    /// been threaded through this resolve site). When the
+    /// cross-player-graveyard target shape is wired into
+    /// `legal_targets` AND the combat-pipeline integration ships, this
+    /// arm flips to full byte-equality. Today: an Aura with this Effect
+    /// alone in the ATTACKS-trigger slot resolves to a tapped non-sick
+    /// creature on the bf without combat participation (CR-incomplete
+    /// but no silent mistranslation: the cross-engine probe operates on
+    /// the no-creatures-in-defender-graveyard fizzle path, byte-equal
+    /// with Python).
+    ///
+    /// **Aura admit boundary (Cycle 1 deliverable).** The Phase-3 safe-
+    /// trigger admit gate widens to shape 7:
+    /// `ATTACKS+IsHost(subject="attacker")+ReanimateTargetCreatureCard
+    /// FromDefendersGraveyard`. Pairs with the existing
+    /// `SacrificeSelfUnlessVoidActive` end-step half (already in the
+    /// gate via the `BEGINNING_OF_END_STEP+Controlled(YOU)` shape — see
+    /// the Phase-3 safe-trigger emitter for the end-step admit).
+    /// Together: Chorale of the Void flips BLOCKED-multi-gate → PROBED.
+    ///
+    /// **Schema parity with Python.** Unit variant on both sides — no
+    /// fields. The bridge translates this Rust variant to
+    /// `ReanimateTargetCreatureCardFromDefendersGraveyard()` (field-free
+    /// construction).
+    ReanimateTargetCreatureCardFromDefendersGraveyard,
     /// **20th Rust slice (VVV Pin 2 closure) — Command Bridge ETB
     /// "sacrifice this unless you tap an untapped permanent you
     /// control".** Mirrors Python's `SacrificeSelfUnlessTapPermanent`
@@ -9328,6 +9423,19 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
             // shape verbatim).
             Ok(Effect::SacrificeSelfUnlessVoidActive)
         }
+        "reanimate_target_creature_card_from_defenders_graveyard" => {
+            // **Chorale of the Void Cycle 1 (Aura S4 last sibling) —
+            // ReanimateTargetCreatureCardFromDefendersGraveyard parse
+            // arm.** Unit variant; no payload fields beyond `kind` (the
+            // target is a cast-time-bound `("graveyard_creature", id)`
+            // tuple read at resolve, NOT a payload field). Extra dict
+            // fields silently ignored for round-trip dict-shape
+            // consistency (mirrors the
+            // `sacrifice_self_unless_void_active` /
+            // `enchanted_creature_fights_target` / Pain for All
+            // unit-variant parse arm shape verbatim).
+            Ok(Effect::ReanimateTargetCreatureCardFromDefendersGraveyard)
+        }
         "sacrifice_self_unless_tap_permanent" => {
             // 20th Rust slice (VVV Pin 2 closure) — Command Bridge ETB
             // "sacrifice this unless you tap an untapped permanent you
@@ -13018,6 +13126,19 @@ pub(crate) fn effect_to_pydict<'py>(
             // (slice-19 `enchanted_creature_fights_target` / Pain
             // for All `pain_for_all_etb` precedent).
             d.set_item("kind", "sacrifice_self_unless_void_active")?;
+        }
+        Effect::ReanimateTargetCreatureCardFromDefendersGraveyard => {
+            // **Chorale of the Void Cycle 1 (Aura S4 last sibling) —
+            // to_pydict.** Unit variant; mirrors Python's field-free
+            // @dataclass(frozen=True) at graveyard.py:473-554. No other
+            // keys emitted — round-trip dict-shape consistency (the
+            // sibling `sacrifice_self_unless_void_active` /
+            // `enchanted_creature_fights_target` / Pain for All
+            // unit-variant precedent).
+            d.set_item(
+                "kind",
+                "reanimate_target_creature_card_from_defenders_graveyard",
+            )?;
         }
         Effect::SacrificeSelfUnlessTapPermanent => {
             // 20th Rust slice (VVV Pin 2 closure). Unit variant; no

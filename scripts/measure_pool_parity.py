@@ -874,6 +874,36 @@ PROBE_MODULES: tuple[Path, ...] = (
     # with a two-trigger composition — ETB + DEALT_DAMAGE host-event —
     # to land end-to-end on the bench loader, alongside Cracked Skull).
     REPO_ROOT / "tests" / "test_sporogenic_infection_parity.py",
+    # **Chorale of the Void Cycle 1 (2026-05-22) — Aura S4 multi-trigger
+    # framework, the LAST Aura S4 sibling.** Chorale of the Void (2,783
+    # 17lands decks — the highest-deck-count remaining Aura in the
+    # `blocked_subsystem_gated` tier) ships its Effect-arm closure + the
+    # full PROBED flip:
+    # Ships ``Effect::ReanimateTargetCreatureCardFromDefendersGraveyard``
+    # on the Rust side (parse + to_pydict + honest-stop resolve arm —
+    # the cast-time-bound graveyard-creature target shape is not threaded
+    # through to triggered abilities AND the put-into-bf-tapped-and-
+    # attacking combat-pipeline integration is deferred to Cycle 2; both
+    # halves silently match Python's same-case ``if not targets: return``
+    # fizzle at ``effects/generic/graveyard.py:527-528``), the cross-
+    # engine bridge arm
+    # ``reanimate_target_creature_card_from_defenders_graveyard`` in
+    # ``cross_engine.py::_ta_dict_to_python_effect``, and the Phase-3
+    # safe-trigger admit-set widen for Chorale of the Void's two-trigger
+    # composition (``ATTACKS+IsHost(subject="attacker")+
+    # ReanimateTargetCreatureCardFromDefendersGraveyard`` shape 7 +
+    # ``BEGINNING_OF_END_STEP+Controlled(by=YOU)+
+    # SacrificeSelfUnlessVoidActive`` shape 8). The
+    # ``test_cross_engine_real_eoe_chorale_of_the_void_attacks_reanimate
+    # _parity`` probe drives the genuine parsed Chorale of the Void EoE
+    # printing through the bridge round-trip + Python-side resolve smoke,
+    # matching the Cracked-Skull / Sporogenic-Infection / HHHH /
+    # Pain-for-All / Tractor-Beam canonical Aura-probe shape. Flips
+    # Chorale of the Void BLOCKED-multi-gate → PROBED (the LAST Aura
+    # with a two-trigger composition — ATTACKS + BEGINNING_OF_END_STEP
+    # — to land end-to-end on the bench loader; all 3 sibling cards
+    # closed).
+    REPO_ROOT / "tests" / "test_chorale_of_the_void_parity.py",
 )
 
 # Tier keys (stable — the doc + test reference these verbatim).

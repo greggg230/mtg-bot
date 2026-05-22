@@ -563,15 +563,28 @@ def test_carddef_emits_pain_for_all_triggers_to_registry_dict():
 # ---------------------------------------------------------------------------
 
 
-def test_predicate_declines_chorale_of_the_void():
-    """Chorale of the Void has ATTACKS + Reanimate +
-    BEGINNING_OF_END_STEP + SacrificeSelfUnlessVoidActive triggers
-    — none in the Phase-3 safe set. Stays declined post-Phase-3."""
+def test_predicate_admits_chorale_of_the_void_post_cycle1_closure():
+    """**Updated 2026-05-22 — Chorale of the Void Cycle 1 closure
+    landed.** Chorale of the Void is now bench-loader-ADMITTED: the
+    two-trigger composition
+    (``ATTACKS+IsHost(subject="attacker")+
+    ReanimateTargetCreatureCardFromDefendersGraveyard`` +
+    ``BEGINNING_OF_END_STEP+Controlled(by=YOU)+
+    SacrificeSelfUnlessVoidActive``) is now Phase-3-safe via the
+    Cycle 1 widen of :func:`_aura_triggers_are_phase3_safe`. With this
+    closure, ALL THREE Aura S4 multi-trigger siblings (Cracked Skull,
+    Sporogenic Infection, Chorale of the Void) are admitted; the
+    Aura S4 framework progression is complete. Pre-Cycle 1's pin
+    (Chorale of the Void declined) is reversed here; the canonical
+    PROBED-flip test lives at
+    ``tests/test_chorale_of_the_void_parity.py::
+    test_predicate_admits_live_chorale_of_the_void_printing``.
+    """
     from mtg_bot.cards.source import get_active_source
 
     p = get_active_source().get_printings()["Chorale of the Void"]
     assert p.is_aura is True
-    assert _printing_is_bridge_simple_aura(p) is False
+    assert _printing_is_bridge_simple_aura(p) is True
 
 
 def test_predicate_admits_cracked_skull_post_cycle2_closure():

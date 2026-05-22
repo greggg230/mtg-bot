@@ -5261,7 +5261,14 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
     tests).
     """
     from mtg_bot.effects.base import TriggeredAbility
-    from mtg_bot.effects.predicates import Event, IsHost, IsSelf
+    from mtg_bot.effects.combinators import SacrificeSelfUnlessVoidActive
+    from mtg_bot.effects.predicates import (
+        Controlled,
+        Event,
+        IsHost,
+        IsSelf,
+        _Controller,
+    )
     from mtg_bot.effects.bespoke import (
         PainForAllDamageEchoEffect,
         PainForAllETBEffect,
@@ -5269,6 +5276,9 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
     from mtg_bot.effects.generic.destroy import DestroyEnchantedPermanent
     from mtg_bot.effects.generic.discard import (
         TargetOpponentLookHandMayDiscard,
+    )
+    from mtg_bot.effects.generic.graveyard import (
+        ReanimateTargetCreatureCardFromDefendersGraveyard,
     )
     from mtg_bot.effects.generic.opponent_punishers import (
         TargetOpponentSacrificesCreatureOtherThanEnchanted,
@@ -5367,6 +5377,54 @@ def _aura_triggers_are_phase3_safe(triggered_abilities) -> bool:
             )
         ):
             continue
+        # **Chorale of the Void Cycle 1 (2026-05-22) — admit shape 7:
+        # Aura ATTACKS → reanimate target creature from defending
+        # player's graveyard.** ``ATTACKS+IsHost(subject="attacker")+
+        # ReanimateTargetCreatureCardFromDefendersGraveyard`` —
+        # Chorale of the Void's first trigger (the half that fires
+        # when the enchanted creature attacks). The full Rust
+        # substrate (Effect variant + parse arm + resolve arm +
+        # to_pydict arm + bridge arm) lands together in this same
+        # lane. Pairs with shape 8 (Chorale's BEGINNING_OF_END_STEP
+        # sustain) for the two-trigger composition.
+        #
+        # **IsHost subject slot.** ``IsHost(subject="attacker")``
+        # carries the ``"attacker"`` slot per Python's
+        # `predicates.py:439-467`; Rust's `Predicate::IsHost { subject
+        # }` already supports the optional slot (cards.rs:12021-12031
+        # parse arm — no widen needed). The slot is informational at
+        # match-time for the dispatched ATTACKS event because the
+        # dispatched subject_id IS the attacker (state_ops_combat.rs
+        # :1417 per-attacker Event::Attacks dispatch).
+        if (
+            ta.event is Event.ATTACKS
+            and isinstance(ta.predicate, IsHost)
+            and ta.predicate.subject == "attacker"
+            and isinstance(
+                ta.effect, ReanimateTargetCreatureCardFromDefendersGraveyard
+            )
+        ):
+            continue
+        # **Chorale of the Void Cycle 1 (2026-05-22) — admit shape 8:
+        # Aura BEGINNING_OF_END_STEP → sacrifice self unless Void is
+        # active.** ``BEGINNING_OF_END_STEP+Controlled(by=YOU,
+        # subject=None)+SacrificeSelfUnlessVoidActive`` — Chorale of
+        # the Void's second trigger (the end-step sustain). The Rust
+        # closure (Effect variant + parse + to_pydict + bridge +
+        # resolve arm with full byte-equal sacrifice semantics)
+        # (cards.rs:4186 Effect arm + state_ops_resolve.rs:14600
+        # resolve arm + cross_engine.py:8805 bridge arm) already
+        # landed at the Aura-Phase-4 substrate landing; only the
+        # safe-trigger admit + the matching emitter arm are new
+        # here.
+        if (
+            ta.event is Event.BEGINNING_OF_END_STEP
+            and isinstance(ta.predicate, Controlled)
+            and ta.predicate.by is _Controller.YOU
+            and ta.predicate.subject is None
+            and isinstance(ta.effect, SacrificeSelfUnlessVoidActive)
+        ):
+            continue
         return False
     return True
 
@@ -5416,7 +5474,14 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
     effect-kind allowlist would force the creature gate to admit
     Aura-only effects per the "no fallback hybrid" discipline.
     """
-    from mtg_bot.effects.predicates import IsHost, IsSelf, Event
+    from mtg_bot.effects.combinators import SacrificeSelfUnlessVoidActive
+    from mtg_bot.effects.predicates import (
+        Controlled,
+        Event,
+        IsHost,
+        IsSelf,
+        _Controller,
+    )
     from mtg_bot.effects.bespoke import (
         PainForAllDamageEchoEffect,
         PainForAllETBEffect,
@@ -5424,6 +5489,9 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
     from mtg_bot.effects.generic.destroy import DestroyEnchantedPermanent
     from mtg_bot.effects.generic.discard import (
         TargetOpponentLookHandMayDiscard,
+    )
+    from mtg_bot.effects.generic.graveyard import (
+        ReanimateTargetCreatureCardFromDefendersGraveyard,
     )
     from mtg_bot.effects.generic.opponent_punishers import (
         TargetOpponentSacrificesCreatureOtherThanEnchanted,
@@ -5504,6 +5572,47 @@ def _python_ta_to_safe_dict_aura_phase3(ta) -> dict:
             "effect": {
                 "kind": "target_opponent_sacrifices_creature_other_than_enchanted"
             },
+            "once_per_turn": False,
+        }
+    if isinstance(ta.effect, ReanimateTargetCreatureCardFromDefendersGraveyard):
+        # **Chorale of the Void — Cycle 1 (2026-05-22) — shape 7:
+        # ATTACKS+IsHost(subject="attacker")+
+        # ReanimateTargetCreatureCardFromDefendersGraveyard.** Chorale
+        # of the Void's first trigger half (the "when enchanted creature
+        # attacks, reanimate from defender's graveyard" half). Rust kind
+        # ``reanimate_target_creature_card_from_defenders_graveyard``
+        # (cards.rs unit variant + cross_engine.py bridge arm landed in
+        # this lane). The ``IsHost`` ``subject`` slot threads through
+        # the round-trip dict: Python carries ``subject="attacker"``,
+        # the Rust ``Predicate::IsHost { subject: Option<String> }``
+        # variant (cards.rs:12021-12031) parses it back identically.
+        pred_dict: dict = {"kind": "is_host"}
+        if isinstance(ta.predicate, IsHost) and ta.predicate.subject is not None:
+            pred_dict["subject"] = ta.predicate.subject
+        return {
+            "event": "attacks",
+            "predicate": pred_dict,
+            "effect": {
+                "kind": "reanimate_target_creature_card_from_defenders_graveyard"
+            },
+            "once_per_turn": False,
+        }
+    if isinstance(ta.effect, SacrificeSelfUnlessVoidActive):
+        # **Chorale of the Void — Cycle 1 (2026-05-22) — shape 8:
+        # BEGINNING_OF_END_STEP+Controlled(by=YOU,subject=None)+
+        # SacrificeSelfUnlessVoidActive.** Chorale of the Void's second
+        # trigger half (the "at the beginning of your end step,
+        # sacrifice this aura unless the Void is active" sustain). Rust
+        # kind ``sacrifice_self_unless_void_active`` (cards.rs unit
+        # variant + cross_engine.py bridge arm shipped at the Aura-
+        # Phase-4 substrate landing; only the safe-trigger admit + this
+        # emitter arm are new in the Chorale lane). The
+        # ``Controlled(by=YOU)`` predicate maps to Rust's
+        # ``Predicate::ControlledByYou`` kind = ``"controlled_by_you"``.
+        return {
+            "event": "beginning_of_end_step",
+            "predicate": {"kind": "controlled_by_you"},
+            "effect": {"kind": "sacrifice_self_unless_void_active"},
             "once_per_turn": False,
         }
     # Should be unreachable when pre-gated by

@@ -90,14 +90,16 @@ admit lands until the sibling reanimate substrate ships.
   * ``test_sacrifice_self_unless_void_active_python_parity`` —
     Python's ``SacrificeSelfUnlessVoidActive.resolve`` mirrors the
     Rust arm: Void inactive → sacrifice; Void active → no-op.
-  * ``test_chorale_of_the_void_loader_still_declined`` — negative
-    pin: Chorale carries the unbridged
-    ``ReanimateTargetCreatureCardFromDefendersGraveyard``, so the
-    bench-loader admit gate refuses it. The
-    SacrificeSelfUnlessVoidActive arm is bridged but not yet
-    Phase-3-safe-listed in the trigger gate (admitting would let
-    other triggers shadow-mistranslate; the gate stays narrow until
-    the reanimate substrate lands).
+  * ``test_chorale_of_the_void_loader_admits_post_cycle1_closure`` —
+    UPDATED 2026-05-22 (Chorale of the Void Cycle 1 closure landed).
+    Reverses the pre-Cycle-1 ``test_chorale_of_the_void_loader_still
+    _declined`` pin: Chorale now admits at the bench loader because
+    the ATTACKS-event ``ReanimateTargetCreatureCardFromDefenders
+    Graveyard`` trigger has Rust Effect parity (honest-stop resolve
+    arm — empty-targets silent fizzle byte-equal vs Python), and the
+    ``_aura_triggers_are_phase3_safe`` gate widens to shape 7
+    (Chorale's ATTACKS half) + shape 8 (Chorale's BEGINNING_OF_END
+    _STEP half).
   * ``test_moonlit_meditation_loader_still_declined`` — negative
     pin: Moonlit's ``replaces_first_tokens_with_copies`` keeps it
     declined at the S3 predicate check.
@@ -346,16 +348,24 @@ def test_sacrifice_self_unless_void_active_python_parity():
 # ---------------------------------------------------------------------
 
 
-def test_chorale_of_the_void_loader_still_declined():
-    """**Chorale of the Void stays declined at the bench loader.**
+def test_chorale_of_the_void_loader_admits_post_cycle1_closure():
+    """**Updated 2026-05-22 — Chorale of the Void Cycle 1 closure
+    landed.** Chorale of the Void is now bench-loader-ADMITTED post-
+    Cycle 1: the ATTACKS-event ``ReanimateTargetCreatureCardFrom
+    DefendersGraveyard`` trigger has Rust Effect parity as of this
+    lane (cards.rs unit variant + parse + to_pydict + bridge arm in
+    cross_engine.py + admit-set widen shape 7 in
+    ``_aura_triggers_are_phase3_safe``). The Rust resolve arm is an
+    honest-stop silent no-op today (the cast-time-bound graveyard-
+    creature target is not threaded through to triggered abilities;
+    Python takes the same silent-fizzle on the empty-targets path),
+    so cross-engine state stays byte-equal on the no-target / empty-
+    graveyard probe shapes the bench-loader exercises.
 
-    Even with ``SacrificeSelfUnlessVoidActive`` now Rust-bridged,
-    Chorale's OTHER triggered ability —
-    ``ReanimateTargetCreatureCardFromDefendersGraveyard`` on
-    ATTACKS — needs targeted-graveyard substrate not yet in Rust.
-    The ``_aura_triggers_are_phase3_safe`` gate is all-or-nothing:
-    every trigger must be safe-shape, else the entire Aura is
-    refused. Chorale stays declined here.
+    With this closure, ALL THREE Aura S4 multi-trigger siblings
+    (Cracked Skull, Sporogenic Infection, Chorale of the Void) are
+    bench-loader-admitted; the canonical PROBED-flip test lives at
+    ``tests/test_chorale_of_the_void_parity.py``.
     """
     from mtg_bot.cards.source import OracleParserCardSource
     from mtg_bot.parity.trajectory import _printing_is_bridge_simple_aura
@@ -369,13 +379,12 @@ def test_chorale_of_the_void_loader_still_declined():
     assert printing.is_aura, (
         "Pre-condition: Chorale of the Void must parse to is_aura=True."
     )
-    assert _printing_is_bridge_simple_aura(printing) is False, (
-        "Phase 4 honest-stop: Chorale of the Void must STAY declined "
-        "at the bench loader — the ATTACKS-event "
-        "ReanimateTargetCreatureCardFromDefendersGraveyard trigger "
-        "has no Rust Effect parity yet. Admitting Chorale here "
-        "would silently mistranslate that trigger to an effectless "
-        "no-op on Rust while Python reanimates."
+    assert _printing_is_bridge_simple_aura(printing) is True, (
+        "Chorale of the Void Cycle 1 closure: Chorale must ADMIT at "
+        "the bench loader. The ATTACKS-event Reanimate effect now has "
+        "Rust Effect parity (honest-stop resolve arm — empty-targets "
+        "silent fizzle matches Python byte-equal); the safe-trigger "
+        "gate's shape 7 admit closes the loader path."
     )
 
 

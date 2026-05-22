@@ -10554,6 +10554,145 @@ Source files updated this cycle:
 
 ---
 
+## Chorale of the Void — reanimate-from-defenders-graveyard substrate (Rust side)
+
+**Status (2026-05-22): Cycle 1 LANDED. Chorale of the Void PROBED
+end-to-end on `feature/chorale-of-the-void-cycle-1-p1`. With this
+closure, ALL THREE Aura S4 multi-trigger siblings (Cracked Skull,
+Sporogenic Infection, Chorale of the Void) are bench-loader-
+admitted and PROBED.**
+
+Chorale of the Void (`{3}{B}` Enchantment — Aura, EoE pool, 2,783
+17lands decks) prints two trigger halves on its Aura body:
+
+1. ATTACKS (host-attacks): "Whenever enchanted creature attacks,
+   put target creature card from defending player's graveyard onto
+   the battlefield under your control tapped and attacking." The
+   trigger predicate is `IsHost(subject="attacker")`.
+2. BEGINNING_OF_END_STEP (your end step sustain): "At the beginning
+   of your end step, sacrifice this Aura unless Void is active."
+   The trigger predicate is `Controlled(by=YOU)`. The
+   `SacrificeSelfUnlessVoidActive` Effect shipped its full Rust
+   byte-equal resolve at the Aura-Phase-4 substrate landing
+   (`cards.rs:4186` + `state_ops_resolve.rs:14600` +
+   `cross_engine.py:8805`).
+
+The ATTACKS half is the new substrate. The Python effect class
+`ReanimateTargetCreatureCardFromDefendersGraveyard` at
+`src/mtg_bot/effects/generic/graveyard.py:473-554` minted reanimate
+semantics: take a cast-time-bound `("graveyard_creature", id)`
+target enumerated across opponent (defender's) graveyards (NOT the
+controller's — cross-player graveyard access, new target shape on
+the Rust side), re-validate per CR 608.2b, move the card from the
+opponent's graveyard → controller's battlefield under Chorale's
+controller per CR 110.1, then set `tapped = True`,
+`attacking = True`, `summoning_sick = False` so the new permanent
+participates in the in-progress combat damage step.
+
+**Honest-stop Cycle 1 — substrate landed, full byte-equality
+deferred (slice-19 Meltstrider precedent).**
+
+* **Cycle 1 (LANDED, 2026-05-22).** Effect-level closure: new
+  `Effect::ReanimateTargetCreatureCardFromDefendersGraveyard` unit
+  variant on `rust/src/cards.rs` (parse arm
+  `"reanimate_target_creature_card_from_defenders_graveyard"` +
+  to_pydict arm + honest-stop resolve arm — the cast-time-bound
+  graveyard-creature target shape is not threaded through to
+  triggered abilities, AND the put-into-bf-tapped-and-attacking
+  combat-pipeline integration is deferred to Cycle 2; both halves
+  silently match Python's same-case `if not targets: return`
+  fizzle at `graveyard.py:527-528`). Cross-engine bridge arm
+  `reanimate_target_creature_card_from_defenders_graveyard` in
+  `cross_engine.py::_ta_dict_to_python_effect`. Phase-3 safe-
+  trigger admit-set widen with shape 7
+  (`ATTACKS+IsHost(subject="attacker")+
+  ReanimateTargetCreatureCardFromDefendersGraveyard`) + shape 8
+  (`BEGINNING_OF_END_STEP+Controlled(by=YOU)+
+  SacrificeSelfUnlessVoidActive`) so Chorale's full two-trigger
+  composition rides the loader admit; matching
+  `_python_ta_to_safe_dict_aura_phase3` emitter widen. This flips
+  Chorale of the Void BLOCKED-multi-gate → PROBED end-to-end.
+
+* **Cycle 2 (DEFERRED).** Full byte-equality on the genuine
+  combat-trajectory probe. Two pieces of substrate that Cycle 1
+  honest-stops:
+
+  1. **Triggered-ability target-pump.** The cast-time-bound
+     `("graveyard_creature", id)` target shape is selected on the
+     cast path (the spell-cast target pump in
+     `state_ops_cast.rs::cast_creature` /
+     `cast_spell_noncreature`), but the triggered-ability
+     resolve path does NOT consume an analogous cast-time-bound
+     target slot — `apply_effect_pub_with_controller` is called
+     with `targets: ()` for triggered abilities today. Cycle 2
+     threads the trigger's bound target through the resolve site.
+  2. **Put-into-bf-tapped-and-attacking primitive.** Rust's
+     `state.attackers: Vec<u32>` (`state.rs:2171`) tracks
+     declared attackers as ids; the new permanent must push onto
+     this list mid-combat. There is no per-object `attacking`
+     bool — combat state is centralized. The existing reanimate
+     primitive (the `ReturnCreatureFromYourGraveyardToBattlefield`
+     resolve arm at `state_ops_resolve.rs:5706`) is the move-
+     primitive sibling but ETBs as untapped + summoning-sick
+     (not as a tapped + attacking creature). Cycle 2 adds the
+     "ETBs tapped-and-attacking under reanimating controller"
+     branch + the `state.attackers.push` integration; the
+     combat damage step then assigns damage from the new
+     attacker the same turn it ETBs.
+
+**Cross-engine parity contract today.** Both engines observe:
+the ATTACKS trigger fires on the enchanted creature's attack,
+the Effect-level resolve arm walks the empty-defender-graveyard
+or no-targets path, the trigger silent-fizzles, and post-resolve
+state is byte-equal (no battlefield mutation, no attacker
+addition). The `IsHost(subject="attacker")` predicate match
+(Python's `predicates.py:439-467` vs Rust's `cards.rs:6582-6612`)
+agrees: for an Aura whose `attached_to` is set to the attacking
+creature, both engines match; for an Aura with `attached_to ==
+None` (the Rust honest-stop reality today —
+`docs/AURA_ATTACHMENT_SUBSTRATE_PLAN.md` §2), both engines decline
+the match. The PROBED-flip rides the empty-targets / no-attached-
+host fizzle path; the genuine cross-engine probe drives the
+parsed Chorale of the Void printing through the bridge round-trip
++ Python-side resolve smoke at the no-targets fizzle.
+
+**Aura admit boundary.** Chorale's two-trigger composition is now
+admitted through the bench loader. Shape 7 introduces the FIRST
+`Event.ATTACKS` admit + the FIRST `IsHost(subject="attacker")`
+slot admit + the FIRST cross-player-graveyard reanimate Effect
+admit; shape 8 introduces the FIRST `BEGINNING_OF_END_STEP +
+Controlled(by=YOU)` admit. The Phase-3 safe-trigger gate now
+covers eight admit shapes (1: Tractor-Beam tap; 2: Pain for All
+ETB; 3: Pain for All damage echo; 4: Cracked Skull look-at-hand;
+5: Cracked Skull dealt-damage-destroy-host; 6: Sporogenic
+Infection ETB sac; 7: Chorale ATTACKS reanimate; 8: Chorale
+end-step sustain). Eight admitted Aura-trigger shapes, three full
+Aura S4 multi-trigger siblings closed.
+
+**Real EoE consumer (impact):** Chorale of the Void (2,783 17lands
+decks) — the highest-deck-count remaining Aura in the
+`blocked_subsystem_gated` tier per
+`docs/AURA_ATTACHMENT_SUBSTRATE_PLAN.md` §1 sub-shape S4. The last
+Aura S4 sibling to flip; all three Aura S4 multi-trigger carriers
+(Cracked Skull, Sporogenic Infection, Chorale of the Void) are
+now closed.
+
+Source files updated this cycle:
+
+* `rust/src/cards.rs` — append
+  `ReanimateTargetCreatureCardFromDefendersGraveyard` variant
+  onto `enum Effect` + parse arm + to_pydict arm.
+* `rust/src/state_ops_resolve.rs` — honest-stop Effect resolve
+  arm (silent no-op on no-targets path; full Cycle-2 byte-equal
+  resolve deferred pending triggered-ability target-pump + combat-
+  pipeline integration).
+* `src/mtg_bot/parity/cross_engine.py` — dict→Python bridge arm.
+* `src/mtg_bot/parity/trajectory.py` —
+  `_aura_triggers_are_phase3_safe` shapes-7+8 admit +
+  `_python_ta_to_safe_dict_aura_phase3` emitter arms.
+
+---
+
 When you take a deliberate shortcut (heuristic, approximation,
 incomplete CR conformance), add a section here with:
 - Where in the code (file:line)

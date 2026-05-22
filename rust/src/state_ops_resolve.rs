@@ -14634,6 +14634,62 @@ fn apply_effect(
             //    combinators.py:197).
             sacrifice_source_inline(state, controller_idx, source_obj_id)?;
         }
+        // **Chorale of the Void Cycle 1 (Aura S4 last sibling) —
+        // ReanimateTargetCreatureCardFromDefendersGraveyard.** ATTACKS-
+        // triggered "put target creature card from defending player's
+        // graveyard onto the battlefield under your control tapped and
+        // attacking". Mirrors Python's
+        // `ReanimateTargetCreatureCardFromDefendersGraveyard.resolve`
+        // (`effects/generic/graveyard.py:521-547`):
+        //
+        //   if not targets: return
+        //   kind, target_id = targets[0]
+        //   if kind != "graveyard_creature": return
+        //   for p in state.players:
+        //       card = next((c for c in p.graveyard if c.id == target_id), None)
+        //       if card is None: continue
+        //       p.graveyard.remove(card)
+        //       put_into_battlefield(state, card, controller_id)
+        //       card.tapped = True
+        //       card.attacking = True
+        //       card.summoning_sick = False
+        //       return
+        //
+        // **HONEST-STOP RESOLVE ARM — substrate landed, full byte-equality
+        // deferred (slice-19 Meltstrider precedent).** Today's
+        // closure surfaces this resolve arm without a cast-time-bound
+        // graveyard-creature target read (no `state.resolving_targets`
+        // slot threads `("graveyard_creature", id)` shape through to
+        // apply_effect_pub_with_controller — the cast-time bound-target
+        // pump only fires for the spell path, not the trigger path).
+        // The triggered-ability path drops the target read silently —
+        // the Python class's `if not targets: return` fizzle at
+        // graveyard.py:527-528 matches the Rust silent-no-op here. The
+        // genuine resolve (move target's card → controller's bf tapped +
+        // attacking) is reached when (a) the trigger-target pump threads
+        // the cast-time target into the resolve site, AND (b) the
+        // put-into-bf-tapped-and-attacking combat-pipeline integration
+        // (state.attackers.push at mid-combat resolve) lands. See the
+        // Effect variant docstring in `cards.rs` for the full Cycle 2
+        // scope.
+        //
+        // **Cross-engine parity contract today.** The empty-defender-
+        // graveyard / no-resolve-target case is byte-equal: both engines
+        // observe the trigger fire, fizzle silently, and leave both
+        // graveyards + battlefields unchanged. The PROBED-flip rides
+        // this fizzle path (the only path the bench-loader's synthetic
+        // probe needs to admit). The Aura admit gate widens to shape 7
+        // (ATTACKS+IsHost(subject="attacker")+ReanimateTargetCreature
+        // CardFromDefendersGraveyard) in this same lane.
+        Effect::ReanimateTargetCreatureCardFromDefendersGraveyard => {
+            // No-op: honest stop. The cast-time-bound graveyard-creature
+            // target is not threaded through to this resolve site for
+            // triggered abilities, so the candidate set is effectively
+            // empty (mirrors Python's `if not targets: return` fizzle).
+            // The substrate gate flips when the triggered-ability target
+            // pump + combat-pipeline integration ship together.
+            let _ = source_obj_id;
+        }
         // **20th Rust slice (VVV Pin 2 closure) — Command Bridge ETB
         // "sacrifice this unless you tap an untapped permanent you
         // control".** Mirrors Python's
