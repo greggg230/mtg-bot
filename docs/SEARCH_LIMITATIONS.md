@@ -9660,14 +9660,72 @@ per-card slice. Cycle list:
   helper (~200 LoC across 5+ files; high cross-cutting risk; the
   helper landed in Cycle 1 with `pub(crate)` visibility precisely
   to gate this).
-- **C3** — Bridge round-trip: cross-engine snapshot pin that
-  Python's `obj.controller_id` (which is Python's layer-2
-  write-through cache) and Rust's `effective_controller_id(obj_id)`
-  agree byte-for-byte on every battlefield permanent. Per-object
-  `controller_override` snapshot key (landed in Cycle 1) is the
-  primary surface; the bridge translates Python's layer-2
-  `"control_change"` registry entry presence to Rust's
-  `controller_override: Some(pid)` on import.
+- **C3 — LANDED (2026-05-21, `feature/control-change-ueot-cycle-3-p1`).**
+  Bridge round-trip plumbing — Python ↔ Rust closure for the per-
+  object `controller_override` field. Inbound (Python dict → Rust
+  state) was the missing direction (outbound was shipped Cycle 1
+  via `object_to_pydict`).
+  - **Rust inbound:** `register_and_inject_object` gains an
+    optional `controller_override: Option<u8>` keyword-only PyO3
+    kwarg (default `None`, back-compat byte-equal). When
+    `Some(pid)`, the freshly-injected object enters its target
+    zone with the override already stamped — mirroring a Python
+    state where the source `GameObject` had an active layer-2
+    `"control_change"` continuous-effect entry. Pid range is
+    validated against the same `{0, 1}` guard
+    `grant_control_change_ueot` enforces; out-of-range raises
+    `IndexError` BEFORE the registry extend (no partial-state
+    leak on reject).
+  - **Python-side reciprocal** (`src/mtg_bot/parity/cross_engine.py`):
+    `python_controller_override(state, obj)` reads a Python
+    `GameObject`'s layer-2 `"control_change"` entry from
+    `state.continuous_effects` (latest-timestamp wins; mirrors
+    `mtg_bot.game.effective_controller`'s walk) and returns the
+    override pid, or `None` for the same-controller short-circuit
+    (compared against `controller_id_before_any_aura_swap`
+    baseline — NOT `obj.controller_id`, which is Python's write-
+    through cache of the resolved controller).
+    `inject_object_with_controller_override(rust_state, ...)`
+    wraps the Rust inbound call so the cross-engine harness has
+    a single Python-side entry point for the round-trip mirror.
+    The `controller_override=None` default routes through the
+    pre-Cycle 3 PyO3 surface (no kwarg passed) — byte-equal back-
+    compat on every pre-Cycle 4 trajectory.
+  - **Round-trip pinned:** Rust → dict → Rust round-trip is
+    byte-identical for default-`None` objects AND survives byte-
+    equal for `grant_control_change_ueot`-set overrides (snapshot
+    override pid → re-injection kwarg → same override pid on the
+    mirror state). The Cycle 3 inbound kwarg path is semantically
+    equivalent to the inject-then-grant path (verified by a pin
+    test `test_round_trip_via_kwarg_matches_grant_call_path_byte_equal`).
+  - **Substrate-only invariant maintained:** no live call site
+    mints a non-None override yet (Cycle 4 wires the Mutinous
+    Massacre / Systems Override Effect arms). Every pre-Cycle 3
+    cross-engine trajectory stays byte-identical — the default-
+    None path is byte-equal to the pre-Cycle 1 shape; the override
+    field is NOT in the per-object fingerprint tuple (canary test
+    `test_inbound_override_stays_out_of_fingerprint_tuple`); the
+    cleanup-step drain composes uniformly across both mint paths
+    (inbound kwarg vs `grant_control_change_ueot` — drain count
+    is identical).
+  - **Tests:** `tests/test_control_change_ueot_cycle3.py` (17
+    tests) — inbound kwarg default + stamps + invalid-pid IndexError
+    + zone-agnostic; round-trip default-None + granted-override
+    survives + via-kwarg-matches-grant-path byte-equal; Python-side
+    reciprocal (`python_controller_override`) on no-entry + granted
+    + same-controller-short-circuit + latest-timestamp-wins; end-
+    to-end Python state → cross-engine helper → Rust state full
+    closure; cleanup drain composes; fingerprint canary.
+  - **Sanity gates:** 1466/1466 PASS on the broad sanity gate
+    (cycle 3 + cycle 1 + rust_engine_smoke + parity_smoke +
+    rust_bridge_parity + aura_substrate_phase_4_s3 +
+    tractor_beam_control + aura_substrate_phase1/3_s4/4 +
+    cross_engine_etb_triggers + 4 cross_engine_legal_set_* tests).
+    77/77 PASS on `tests/test_trajectory_parity.py`. Cycle 4
+    (Mutinous Massacre / Systems Override Effect mint sites) is
+    now unblocked — the round-trip plumbing carries the minted
+    override across the harness boundary so cross-engine probes
+    can pin behavioral parity end-to-end.
 - **C4** — `Effect::GrantControlOfTargetUntilEOT { ... }` parse +
   to_pydict + resolve arms; per-card slice for Systems Override
   (`{2}{R}` single-target sibling). Then

@@ -12421,6 +12421,153 @@ def rust_bf_object_attached_to(rust_state, obj_id: int) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Control-change-UEOT subsystem — Cycle 3 (2026-05-21)
+# Bridge round-trip plumbing for the per-object ``controller_override``
+# field. The outbound side (Rust → Python dict) shipped in Cycle 1
+# (``object_to_pydict`` emits ``controller_override`` as either Python
+# ``None`` or the override pid). This module closes the loop: the
+# Python-side cross-engine harness can now read the effective
+# control-change-UEOT override off a Python ``GameObject`` and
+# re-inject the same override into a freshly-constructed Rust
+# ``GameObject`` via ``register_and_inject_object``'s new
+# ``controller_override`` kwarg.
+#
+# Substrate-only — no live mint site yet. Cycle 4 (Mutinous Massacre /
+# Systems Override) wires the resolution arms that mint the override
+# from the Rust side; once Cycle 4 lands, this round-trip plumbing
+# carries the minted override across the harness boundary so cross-
+# engine probes can pin behavioral parity end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def python_controller_override(state, obj) -> Optional[int]:
+    """Return the active UEOT control-change override pid for a Python
+    ``GameObject``, or ``None`` if no override is active.
+
+    **Round-trip mirror for ``GameObject.controller_override``.** The
+    Rust side stores the override as a per-object ``Option<u8>``
+    field (``rust/src/state.rs``); the Python side stores it as a
+    layer-2 ``"control_change"`` entry in
+    ``state.continuous_effects`` whose ``params[0]`` is the new
+    controller id and whose ``expires_at == "cleanup"``. This helper
+    recovers the override pid from the Python representation in the
+    same shape Rust's ``object_to_pydict`` emits it (Python ``None``
+    for "no override", an ``int`` pid for "override active").
+
+    **Why a separate helper.** Python's
+    :func:`mtg_bot.game.effective_controller` returns the resolved
+    controller id (which may equal ``obj.controller_id`` even when
+    a control-change entry exists, if it grants to the same player).
+    The Rust ``controller_override`` field stores ``Some(pid)`` only
+    when ``grant_control_change_ueot`` actually minted an override
+    (same-controller short-circuit returns ``None``). To round-trip
+    byte-equal, the Python-side reader must reproduce the same
+    short-circuit shape — return ``None`` whenever there's no
+    layer-2 ``"control_change"`` entry, OR when the most-recent
+    entry's pid equals the printed ``obj.controller_id`` baseline
+    (no observable override).
+
+    Mirrors the same control-change resolution Python's
+    ``effective_controller`` walks in ``game.py:999``, with the
+    same "latest timestamp wins" semantics for chained Threaten /
+    Mutinous-Massacre / Systems-Override grants.
+    """
+    latest_pid: int | None = None
+    latest_ts: int = -1
+    for ce in state.continuous_effects:
+        if (
+            ce.layer == 2
+            and ce.kind == "control_change"
+            and ce.target_id == obj.id
+            and ce.timestamp > latest_ts
+        ):
+            latest_ts = ce.timestamp
+            latest_pid = ce.params[0]
+    if latest_pid is None:
+        return None
+    # **Same-controller short-circuit mirror.** Rust's
+    # ``grant_control_change_ueot`` skips minting the override when
+    # the request equals the current effective controller (idempotent
+    # no-op — see ``state_ops_cleanup.rs:339``); the Python-side
+    # equivalent on a parity-clean state would NEVER have written the
+    # layer-2 entry in that case, so this branch is paranoia, not
+    # expected reachable. But we keep it explicit for the round-trip
+    # invariant: ``None`` when no observable override is in effect.
+    #
+    # The baseline we compare against is the CAPTURED baseline
+    # ``controller_id_before_any_aura_swap`` (set the first time a
+    # control-grant landed) — NOT ``obj.controller_id``, which is
+    # Python's write-through cache of the layered-effects resolution
+    # (the cache equals the GRANTED pid after a successful
+    # ``grant_control_change_ueot`` call, not the printed baseline).
+    # When no baseline was ever captured, ``obj.controller_id`` is
+    # the printed baseline (no control-grant ever applied), so it's
+    # the right fallback.
+    baseline = (
+        obj.controller_id_before_any_aura_swap
+        if obj.controller_id_before_any_aura_swap is not None
+        else obj.controller_id
+    )
+    if latest_pid == baseline:
+        return None
+    return int(latest_pid)
+
+
+def inject_object_with_controller_override(
+    rust_state,
+    printing_dict,
+    controller: int,
+    target_zone: int,
+    controller_override: Optional[int] = None,
+) -> int:
+    """Inject a fresh GameObject into ``rust_state`` with an optional
+    ``controller_override`` pre-stamped on the freshly-injected
+    object. Returns the new object's id.
+
+    **Round-trip mirror for the per-object ``controller_override``
+    field.** Wraps Rust's ``register_and_inject_object(...,
+    controller_override=...)`` PyO3 entry point (the Cycle 3 inbound
+    side). When ``controller_override is None`` (the default), the
+    call is byte-equal to the pre-Cycle 3 ``register_and_inject_object(
+    printing_dict, controller, target_zone)`` shape — same id
+    allocation, same etb_timestamp stamping, same ETB-trigger
+    dispatch. When ``controller_override is Some(pid)``, the
+    freshly-injected object enters its target zone with the override
+    already in place, matching the shape Rust's snapshot bridge
+    emits via ``object_to_pydict``.
+
+    **Typical usage.** The cross-engine harness reconstructs Rust
+    state from a Python ``GameState`` by walking every Python
+    ``GameObject`` and mirroring it via ``register_and_inject_object``;
+    the override pid for the mirror call comes from
+    :func:`python_controller_override` on the source Python object.
+    Together, the two helpers close the Python → Rust round-trip
+    loop for the per-object ``controller_override`` field.
+
+    Substrate-only — Cycle 4 (Mutinous Massacre / Systems Override)
+    will mint the override from the Rust side; until then, every
+    pre-Cycle 4 cross-engine trajectory passes ``controller_override=
+    None`` and stays byte-identical to the pre-Cycle 3 path.
+    """
+    if controller_override is None:
+        # Pre-Cycle 3 byte-equal path: omit the kwarg entirely so the
+        # PyO3 default fires. This preserves the back-compat invariant
+        # that every existing call site (cross-engine harness probes,
+        # Aura S3 round-trip pins, ETB-trigger setup primitives)
+        # observes the same Rust-side path with or without Cycle 3
+        # plumbing.
+        return int(rust_state.register_and_inject_object(
+            printing_dict, controller, target_zone,
+        ))
+    return int(rust_state.register_and_inject_object(
+        printing_dict,
+        controller,
+        target_zone,
+        controller_override=controller_override,
+    ))
+
+
+# ---------------------------------------------------------------------------
 # Field view of a Python state
 # ---------------------------------------------------------------------------
 

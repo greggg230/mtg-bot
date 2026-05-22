@@ -708,6 +708,39 @@ upstream of this dated paragraph).
   overrides. Full Cycle 1 entry at `docs/SEARCH_LIMITATIONS.md`
   §1 (Mutinous Massacre).
 
+  **Control-change-UEOT Cycle 3 landed (2026-05-21,
+  `feature/control-change-ueot-cycle-3-p1`).** Bridge round-trip
+  plumbing — Python ↔ Rust closure for the per-object
+  `controller_override` field. Inbound (the missing direction):
+  `register_and_inject_object` gains an optional
+  `controller_override` PyO3 kwarg (keyword-only, default `None`,
+  back-compat byte-equal); `{0, 1}` pid validation raises
+  `IndexError` BEFORE the registry extend (no partial state on
+  reject). Python-side reciprocal in
+  `src/mtg_bot/parity/cross_engine.py`:
+  `python_controller_override(state, obj)` reads layer-2
+  `"control_change"` entries off a Python `GameObject` (latest-
+  timestamp wins; compared against
+  `controller_id_before_any_aura_swap` baseline for the same-
+  controller short-circuit) and returns the override pid or
+  `None`. `inject_object_with_controller_override(...)` wraps
+  the Rust inbound call. Round-trip pinned: Rust → dict → Rust
+  is byte-identical for default-`None` AND survives byte-equal
+  for `grant_control_change_ueot`-set overrides; the inbound
+  kwarg path is semantically equivalent to inject-then-grant
+  (pin test). Substrate-only invariant maintained: no live mint
+  site yet (Cycle 4 wires Mutinous Massacre / Systems Override);
+  every pre-Cycle 3 cross-engine trajectory stays byte-identical;
+  override field stays out of the per-object fingerprint tuple
+  (canary). 17 new tests in
+  `tests/test_control_change_ueot_cycle3.py`; 1466/1466 PASS on
+  the broad sanity gate (cycle 1 + cycle 3 + rust_engine_smoke +
+  parity_smoke + rust_bridge_parity + aura_substrate_phase_4_s3
+  + tractor_beam_control + aura phases 1/3_s4/4 + 5
+  cross_engine_* test files); 77/77 PASS on trajectory_parity.
+  Cycle 4 is now unblocked. Full Cycle 3 entry at
+  `docs/SEARCH_LIMITATIONS.md` §1 (Mutinous Massacre).
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 

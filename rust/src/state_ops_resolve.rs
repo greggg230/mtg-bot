@@ -18139,16 +18139,47 @@ impl GameState {
     /// Lives in this slice (not `state.rs`) per the per-slice
     /// file-isolation rule. A follow-up consolidation slice can
     /// move it once the parallel-slice constraint relaxes.
+    ///
+    /// **Control-change-UEOT subsystem — Cycle 3 (2026-05-21).** The
+    /// optional `controller_override` kwarg closes the inbound side
+    /// of the Python ↔ Rust bridge round-trip for the per-object
+    /// `controller_override` field. When `Some(pid)`, the freshly-
+    /// injected object enters the target zone with its
+    /// `controller_override` already stamped — mirroring a state
+    /// reconstructed from a Python dict where the source object had
+    /// an active UEOT control-grant. Validated against the same
+    /// 0/1 player-id range `grant_control_change_ueot` enforces;
+    /// out-of-range pids raise `IndexError` BEFORE the registry
+    /// extend, so a bad call site can't leak a half-injected
+    /// object. The default `None` is back-compat — every existing
+    /// `register_and_inject_object` call site (pre-Cycle 3) keeps
+    /// the same shape, with the new field defaulting to `None`
+    /// (byte-equal to pre-Cycle 1).
+    #[pyo3(signature = (printing_dict, controller, target_zone, *, controller_override=None))]
     fn register_and_inject_object(
         &mut self,
         printing_dict: &Bound<'_, PyDict>,
         controller: u8,
         target_zone: u8,
+        controller_override: Option<u8>,
     ) -> PyResult<u32> {
         if (controller as usize) >= 2 {
             return Err(PyIndexError::new_err(format!(
                 "controller {controller} out of range (must be 0 or 1)"
             )));
+        }
+        // **Cycle 3 inbound-side validation.** Match
+        // `grant_control_change_ueot`'s out-of-range guard so the
+        // round-trip path can't smuggle a malformed override into a
+        // freshly-injected object. Validated before the registry
+        // extend so a rejected override never leaves partial state
+        // behind.
+        if let Some(pid) = controller_override {
+            if pid >= 2 {
+                return Err(PyIndexError::new_err(format!(
+                    "controller_override {pid} out of range (must be 0 or 1)"
+                )));
+            }
         }
 
         // Append to the registry. Arc::make_mut clones RegistryData
@@ -18221,11 +18252,14 @@ impl GameState {
             // caller-injected objects never start as Moonlit-
             // substituted tokens. Back-compat default.
             token_supertype_override: false,
-            // Control-change-UEOT substrate — Cycle 1 (2026-05-21):
-            // caller-injected objects start with no UEOT controller
-            // override. Back-compat default; not in the per-object
-            // fingerprint tuple.
-            controller_override: None,
+            // Control-change-UEOT substrate — Cycle 3 (2026-05-21):
+            // optional caller-supplied override for the inbound side
+            // of the Python ↔ Rust bridge round-trip. Defaults to
+            // `None` (back-compat), only `Some(pid)` when the call
+            // site reconstructs an object whose source-side Python
+            // state had an active UEOT control-grant. Not in the
+            // per-object fingerprint tuple.
+            controller_override,
         };
 
         // R76-1: advance the monotonic id counter past this injected
