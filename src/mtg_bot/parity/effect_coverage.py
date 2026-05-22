@@ -416,6 +416,25 @@ RUST_AHEAD_OF_POOL: set[str] = {
     # `delayed_triggers.append`) but the static-printing walker
     # doesn't see it. Override-mapping it elsewhere would be wrong.
     "WarpExileSelf",
+    # **Control-change-UEOT subsystem — Cycle 5 (2026-05-22).** Rust
+    # ``Effect::RemoveChargeCountersFromSourceDelayed`` is the
+    # Systems Override end-step delayed trigger the resolve site
+    # (``Effect::SystemsOverrideEffect`` arm in state_ops_resolve.rs)
+    # schedules onto ``state.delayed_triggers`` when the gained-
+    # control target is a Spacecraft. Python has the exact same-named
+    # class at ``effects/generic/delayed_actions.py:120``
+    # (``RemoveChargeCountersFromSourceDelayed``), but the parsed-pool
+    # vocab never observes it directly because it is NOT a printing's
+    # ``triggered_abilities`` member — it is spawned by the Systems
+    # Override resolve as a delayed-trigger entry, NOT by a printing's
+    # static trigger definition. SystemsOverrideEffect's resolve body
+    # creates the instance dynamically inside an ``if obj.printing.is
+    # _spacecraft:`` branch; the dataclass walk in
+    # :func:`_walk_effect` only walks declared fields, not method-
+    # local constructions. Same RUST_AHEAD_OF_POOL discipline as
+    # ``WarpExileSelf`` above — override-mapping it elsewhere would
+    # be wrong.
+    "RemoveChargeCountersFromSourceDelayed",
 }
 
 

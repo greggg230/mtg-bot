@@ -10071,6 +10071,262 @@ fn apply_effect(
                 }
             }
         }
+        // **Control-change-UEOT subsystem — Cycle 5 live mint site
+        // (2026-05-22; ~4,775 17lands decks).** Systems Override
+        // `{2}{R}` Sorcery — "Gain control of target artifact or
+        // creature until end of turn. Untap that permanent. It gains
+        // haste until end of turn. If it's a Spacecraft, put ten
+        // charge counters on it. If you do, remove ten charge counters
+        // from it at the beginning of the next end step."
+        //
+        // Mirrors Python's `SystemsOverrideEffect.resolve` at
+        // `effects/bespoke.py:1396-1453` byte-equal:
+        //
+        // 1. **Read target.** Pull `current_resolve_payload_target_id`
+        //    (the proven EmergencyEjectEffect / SeedshipImpactEffect /
+        //    DepressurizeEffect payload-target swap pattern). When
+        //    `None` (synthetic-test `push_to_stack` path without
+        //    `push_to_stack_with_target`), fall back to the
+        //    deterministic-first artifact-or-creature permanent in
+        //    ETB-timestamp order across both battlefields. Silent
+        //    no-op when no eligible target exists.
+        // 2. **Locate + filter.** Target must be an artifact OR a
+        //    creature (Python:
+        //    `o.printing.is_artifact or o.printing.is_creature`).
+        //    Indestructible is irrelevant here (Systems Override
+        //    doesn't destroy — control change works on any permanent
+        //    per CR 110.1).
+        // 3. **Gain-control phase.** Stamp `controller_override =
+        //    Some(caster)` with same-controller short-circuit (the
+        //    Cycle-1 substrate's mint shape inlined per per-slice
+        //    file-iso — the Cycle 4 Mutinous Massacre arm precedent).
+        // 4. **Untap.** `obj.tapped = false`.
+        // 5. **Haste UEOT.** Push `UeotModifier::GrantKeyword
+        //    { keyword: "haste" }` onto `obj.ueot_modifiers` (the
+        //    proven `BiosynthicBurstEffect` push shape).
+        // 6. **Spacecraft-conditional rider.** IF the target's
+        //    printing carries the "Spacecraft" subtype, then:
+        //    a. `obj.charge_counters += 10` (Rust does not implement
+        //       the Loading Zone counter-doubling factor; Loading Zone
+        //       is BLOCKED in the EoE pool today — the literal +10
+        //       mirrors Python's no-doubling case byte-equal).
+        //    b. Push a `DelayedTrigger {
+        //       fire_at_turn: state.turn_number,
+        //       controller_id: caster, source_id: target_id,
+        //       effect: Effect::RemoveChargeCountersFromSource
+        //       Delayed { amount: 10 } }` onto
+        //       `state.delayed_triggers`. The Cycle-5 substrate (the
+        //       existing `WarpExileSelf` end-step drain in
+        //       `state_ops_steps.rs::run_delayed_end_step_triggers`
+        //       + the new RemoveCharge resolve arm below) drains the
+        //       trigger at the upcoming end step.
+        // 7. **Cleanup drain.** The Cycle-1
+        //    `clear_controller_overrides_all` reverts the override to
+        //    None; the round-27 `clear_ueot_modifiers_all` clears the
+        //    haste UEOT modifier. Both fire at end of turn.
+        //
+        // **Field-iso inlining note** (identical to Cycle 4's Mutinous
+        // Massacre arm): the Cycle-1 `grant_control_change_ueot`
+        // helper is `#[pymethods] impl GameState`-private and not
+        // accessible across files; the grant body is inlined here per
+        // the per-slice file-iso convention.
+        Effect::SystemsOverrideEffect => {
+            // Source-controller resolution (mirrors Mutinous
+            // Massacre's pattern; prefer the transient
+            // current_resolve_source_controller swap, fall back to
+            // active_player).
+            let caster = state
+                .current_resolve_source_controller
+                .unwrap_or(state.active_player);
+            // Read the cast-time-bound target (payload-target swap)
+            // or fall back to deterministic-first artifact-or-creature
+            // for the synthetic push_to_stack path.
+            let payload_target_opt =
+                state.current_resolve_payload_target_id;
+            let target: Option<(usize, u32)> =
+                crate::bf_iter::bf_iter_etb_sorted(state)
+                    .into_iter()
+                    .find_map(|obj| {
+                        if let Some(pt) = payload_target_opt {
+                            if obj.id != pt {
+                                return None;
+                            }
+                        }
+                        let printing =
+                            state.registry.lookup(obj.printing_id)?;
+                        let is_artifact = printing
+                            .card_types
+                            .iter()
+                            .any(|t| t == "Artifact");
+                        let is_creature = printing
+                            .card_types
+                            .iter()
+                            .any(|t| t == "Creature");
+                        if !(is_artifact || is_creature) {
+                            return None;
+                        }
+                        // Find the owner_idx whose battlefield holds
+                        // this object (controller may be different
+                        // from owner under existing override stamps,
+                        // but the physical zone is keyed on owner).
+                        let owner_idx_opt: Option<usize> = (0..state
+                            .players
+                            .len())
+                            .find(|&pidx| {
+                                state.players[pidx]
+                                    .battlefield
+                                    .iter()
+                                    .any(|o| o.id == obj.id)
+                            });
+                        owner_idx_opt.map(|pidx| (pidx, obj.id))
+                    });
+            let Some((owner_idx, target_id)) = target else {
+                let _ = source_obj_id; // silent no-op — no eligible target
+                return Ok(());
+            };
+            // Check Spacecraft subtype BEFORE the bf mutation (the
+            // borrow checker requires the printing read to release
+            // before we take a mutable borrow on the player's bf).
+            let is_spacecraft: bool = {
+                let printing_id_opt = state.players[owner_idx]
+                    .battlefield
+                    .iter()
+                    .find(|o| o.id == target_id)
+                    .map(|o| o.printing_id);
+                match printing_id_opt {
+                    Some(pid) => match state.registry.lookup(pid) {
+                        Some(p) => p
+                            .subtypes
+                            .iter()
+                            .any(|s| s == "Spacecraft"),
+                        None => false,
+                    },
+                    None => false,
+                }
+            };
+            // Read current effective controller before mutation
+            // (idempotent same-controller short-circuit mirrors the
+            // Cycle-1 helper at `state_ops_cleanup.rs:372`).
+            let current_effective: u8 = state.players[owner_idx]
+                .battlefield
+                .iter()
+                .find(|o| o.id == target_id)
+                .map(|o| {
+                    crate::state_ops_cleanup::effective_controller_id(o)
+                })
+                .unwrap_or(0);
+            let needs_grant = current_effective != caster;
+            // Mutate the target: stamp override (if needed), untap,
+            // push haste UEOT, add charge counters if Spacecraft.
+            {
+                let zone: &mut Vec<GameObject> = Arc::make_mut(
+                    &mut state.players[owner_idx].battlefield,
+                );
+                for obj in zone.iter_mut() {
+                    if obj.id != target_id {
+                        continue;
+                    }
+                    if needs_grant {
+                        obj.controller_override = Some(caster);
+                    }
+                    obj.tapped = false;
+                    obj.ueot_modifiers.push(UeotModifier::GrantKeyword {
+                        keyword: "haste".to_string(),
+                    });
+                    if is_spacecraft {
+                        // Literal +10 — mirrors Python's `add_charge_
+                        // counters(state, obj, 10)`. Loading Zone
+                        // counter-doubling not yet implemented in Rust
+                        // (Loading Zone BLOCKED in the EoE pool); when
+                        // it lands both engines grow the factor in
+                        // lockstep.
+                        obj.charge_counters =
+                            obj.charge_counters.saturating_add(10);
+                    }
+                    break;
+                }
+            }
+            // Schedule the delayed trigger AFTER the bf mutation
+            // releases its borrow. Only when the target is a
+            // Spacecraft — Python's `if obj.printing.is_spacecraft:`
+            // gates BOTH the +10 stamp AND the delayed-trigger
+            // schedule together (the "If you do" rider).
+            if is_spacecraft {
+                state.delayed_triggers.push(
+                    crate::cards::DelayedTrigger {
+                        fire_at_turn: state.turn_number,
+                        controller_id: caster,
+                        source_id: target_id,
+                        effect:
+                            crate::cards::Effect::RemoveChargeCountersFromSourceDelayed {
+                                amount: 10,
+                            },
+                    },
+                );
+            }
+            let _ = source_obj_id; // source is the spell; not needed
+        }
+        // **Control-change-UEOT subsystem — Cycle 5 (2026-05-22).**
+        // Delayed-trigger "remove `amount` charge counters from
+        // CARDNAME" effect, scheduled by Systems Override and drained
+        // at the beginning of the next end step.
+        //
+        // Mirrors Python's `RemoveChargeCountersFromSourceDelayed.
+        // resolve` at `effects/generic/delayed_actions.py:135-151`
+        // byte-equal:
+        //
+        // 1. Read the source (Python: `state.resolving_source`;
+        //    Rust: `source_obj_id` — the same id the
+        //    `push_triggered_ability` flow stamps onto the
+        //    `StackItem::TriggeredAbility` from the `DelayedTrigger
+        //    .source_id` field).
+        // 2. Find the source on the battlefield by id. No-op if it
+        //    has left the bf since the trigger was scheduled (CR
+        //    603.6c — the trigger still fires but has nothing to
+        //    act on).
+        // 3. Decrement `charge_counters` by `amount`, clamped at 0
+        //    (CR 121.5 — counter counts are nonnegative). Mirrors
+        //    Python's `max(0, obj.charge_counters - self.amount)`.
+        //
+        // **No-op cases (CR 603.6c — silent fizzle):**
+        //   * Source no longer on the battlefield (destroyed,
+        //     exiled, bounced between schedule and fire).
+        //   * Source in a different zone now (graveyard / exile /
+        //     hand) — the bf walk skips it.
+        Effect::RemoveChargeCountersFromSourceDelayed { amount } => {
+            let amount_val = *amount;
+            // Find the source on EITHER battlefield (the source may
+            // have been stolen + control reverted between cast and
+            // fire; the physical zone is keyed on owner, not
+            // controller).
+            let owner_idx_opt: Option<usize> = (0..state.players.len())
+                .find(|&pidx| {
+                    state.players[pidx]
+                        .battlefield
+                        .iter()
+                        .any(|o| o.id == source_obj_id)
+                });
+            let Some(owner_idx) = owner_idx_opt else {
+                // Source no longer on a battlefield — CR 603.6c silent
+                // fizzle.
+                return Ok(());
+            };
+            let zone: &mut Vec<GameObject> = Arc::make_mut(
+                &mut state.players[owner_idx].battlefield,
+            );
+            for obj in zone.iter_mut() {
+                if obj.id != source_obj_id {
+                    continue;
+                }
+                // Clamp at 0 — saturating_sub on i32 with positive
+                // operands behaves like max(0, x-y) when both are
+                // nonnegative; the printed +10/-10 contract keeps
+                // charge_counters nonnegative on entry.
+                obj.charge_counters =
+                    (obj.charge_counters - amount_val).max(0);
+                break;
+            }
+        }
         // DestroyTargetLand. CR 701.7 with Land filter — Dust Bowl /
         // Petrified Field pattern. Walks BOTH players' battlefield
         // in ETB-timestamp order via the shared

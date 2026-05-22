@@ -842,6 +842,23 @@ PROBE_MODULES: tuple[Path, ...] = (
     # non-None override) + bridge arms + reverse-serializer leaf
     # flips Mutinous Massacre COVERED → PROBED.
     REPO_ROOT / "tests" / "test_mutinous_massacre_parity.py",
+    # **control-change-ueot-cycle-5-p1 (2026-05-22):** Cycle 5 of the
+    # control-change-UEOT subsystem — Systems Override closure
+    # (~4,775 17lands decks). The dedicated probe module
+    # ``test_systems_override_parity.py`` carries the canonical
+    # ``test_cross_engine_real_eoe_systems_override_control_change_
+    # spacecraft_rider_parity`` function which drives the genuine
+    # parsed Systems Override printing through both engines against
+    # an opponent-controlled Spacecraft. Cycle 5 lands
+    # ``Effect::SystemsOverrideEffect`` + resolve arm (control-grant
+    # + untap + haste + Spacecraft-conditional +10 charge counters
+    # + delayed-trigger schedule) + the new
+    # ``Effect::RemoveChargeCountersFromSourceDelayed { amount }``
+    # delayed-trigger effect + bridge arms + reverse-serializer
+    # leaves. Composes the existing G7 Class-C end-step drain
+    # machinery (second non-WarpExileSelf consumer). Systems
+    # Override COVERED → PROBED.
+    REPO_ROOT / "tests" / "test_systems_override_parity.py",
 )
 
 # Tier keys (stable — the doc + test reference these verbatim).

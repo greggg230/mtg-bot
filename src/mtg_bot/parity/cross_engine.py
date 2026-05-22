@@ -9315,6 +9315,78 @@ def _ta_dict_to_python_effect(eff_dict: dict):
         # site after the C1-C3 substrate landed).
         from mtg_bot.effects.bespoke import MutinousMassacreEffect
         return MutinousMassacreEffect()
+    if kind == "systems_override_effect":
+        # **Control-change-UEOT subsystem — Cycle 5 live mint site
+        # (2026-05-22; ~4,775 17lands decks).** Rust substrate
+        # ``Effect::SystemsOverrideEffect`` (cards.rs field-free UNIT
+        # variant; parser ``"systems_override_effect"``; resolve in
+        # state_ops_resolve.rs beside the ``MutinousMassacreEffect``
+        # arm).
+        #
+        # **Field shape (unit variant).** No fields — bare
+        # ``{"kind": "systems_override_effect"}``. Python's
+        # ``SystemsOverrideEffect`` (effects/bespoke.py:1369) is a
+        # frozen dataclass with no constructor parameters. The single
+        # target rides on the StackItem
+        # (``current_resolve_payload_target_id``); the +10 / -10
+        # amount and Spacecraft-conditional charge-counter rider are
+        # intrinsic to the resolve arm (oracle text bakes "ten" in
+        # both places).
+        #
+        # **Resolve semantics (parity-relevant).** Both engines
+        # locate the target on the battlefield (artifact OR creature),
+        # stamp the controller_override = caster (Cycle-1 substrate),
+        # untap, grant haste UEOT, and — IF the target is a Spacecraft
+        # — add ten charge counters and schedule a
+        # ``RemoveChargeCountersFromSourceDelayed(amount=10)`` for the
+        # upcoming end step. The cleanup-step drain (Cycle-1's
+        # ``clear_controller_overrides_all`` + round-27's
+        # ``clear_ueot_modifiers_all``) reverts both UEOT pieces at
+        # end of turn; the delayed trigger drains the +10 in the
+        # SAME end step (the "If you do" rider keeps the rider self-
+        # consistent on resolve).
+        #
+        # **Real test-pool consumer**: Systems Override — Sorcery
+        # ``{2}{R}`` "Gain control of target artifact or creature
+        # until end of turn. Untap that permanent. It gains haste
+        # until end of turn. If it's a Spacecraft, put ten charge
+        # counters on it. If you do, remove ten charge counters from
+        # it at the beginning of the next end step." ~4,775 17lands
+        # decks (control-change-UEOT subsystem Cycle 5 live mint site
+        # after Cycle 4 / Mutinous Massacre landed).
+        from mtg_bot.effects.bespoke import SystemsOverrideEffect
+        return SystemsOverrideEffect()
+    if kind == "remove_charge_counters_from_source_delayed":
+        # **Control-change-UEOT subsystem — Cycle 5 delayed-trigger
+        # complement (2026-05-22).** Rust substrate
+        # ``Effect::RemoveChargeCountersFromSourceDelayed { amount }``
+        # (cards.rs single-field variant; parser
+        # ``"remove_charge_counters_from_source_delayed"``; resolve in
+        # state_ops_resolve.rs beside the ``SystemsOverrideEffect`` arm).
+        #
+        # **Field shape (amount).** Required ``amount: int``. Python's
+        # ``RemoveChargeCountersFromSourceDelayed`` (effects/generic/
+        # delayed_actions.py:120) is a single-field dataclass with the
+        # same key.
+        #
+        # **Lifecycle.** Scheduled by ``SystemsOverrideEffect`` onto
+        # ``state.delayed_triggers``; pushed onto the stack as a real
+        # ``StackItem::TriggeredAbility`` at the beginning of the next
+        # end step via ``run_delayed_end_step_triggers``. The Rust
+        # bridge round-trips the field-bearing dict cleanly; this arm
+        # is exercised when an in-flight Python state's delayed_triggers
+        # is mirrored into Rust (the cross-engine harness's mid-game
+        # synchronization path) or — defensively — when a Rust state
+        # carrying the scheduled trigger snapshots back through the
+        # python_state_from_rust path. Today's primary consumer is the
+        # Systems Override resolve arm itself (scheduled + drained
+        # entirely within Rust); the bridge arm is the no-fallback-
+        # hybrid completeness teeth.
+        amount = int(eff_dict["amount"])
+        from mtg_bot.effects.generic import (
+            RemoveChargeCountersFromSourceDelayed,
+        )
+        return RemoveChargeCountersFromSourceDelayed(amount=amount)
     if kind == "close_encounter_effect":
         # **Close Encounter — additional-cost-choice closure
         # (Cycle 3, 2026-05-21; ~16,098 17lands decks — highest-

@@ -9785,31 +9785,77 @@ per-card slice. Cycle list:
     `clear_ueot_modifiers_all` which clears the haste UEOT
     modifier. Both fire in the same pass. Pinned end-to-end in the
     real-EoE cross-engine probe.
-- **C5 (deferred)** — Systems Override (`{2}{R}` single-target
-  sibling, ~4,775 17lands decks). Shares the C1-C3 control-change
-  substrate AND now the C4 live mint site pattern (control-change
-  + untap + haste — identical to MutinousMassacre's gain-control
-  phase, but on a SINGLE bound target instead of every survivor).
-  Adds the Spacecraft-conditional charge-counter rider: 10 charge
-  counters at resolve + a delayed end-step trigger that removes
-  10. The charge-counter rider needs a NEW
-  `Effect::SystemsOverrideEffect` variant + the
-  `RemoveChargeCountersFromSourceDelayed` delayed-trigger Effect
-  variant + extending the Rust `DelayedTrigger` end-step drain to
-  dispatch non-WarpExileSelf effects. Scoped here as its own cycle
-  to keep the cycle blast radius bounded (the C4 lane is already
-  inlining the grant body per per-slice file-iso; mixing both card
-  closures in one cycle would compound the surface area). The
-  honest-stop ship-Mutinous-alone-this-cycle decision matches the
-  lane brief's "if 1-cycle-feasible" hedge.
+- **C5 — LANDED (2026-05-22, `feature/control-change-ueot-cycle-5-p1`).**
+  Systems Override (`{2}{R}` single-target sibling, ~4,775 17lands
+  decks). The lane closure pattern landed exactly:
+    * `Effect::SystemsOverrideEffect` field-free unit variant in
+      `rust/src/cards.rs` (declaration + parse arm + to_pydict arm)
+      — schema parity with Python's parameterless dataclass.
+    * `Effect::RemoveChargeCountersFromSourceDelayed { amount: i32 }`
+      single-field variant — schema parity with Python's
+      `RemoveChargeCountersFromSourceDelayed(amount: int)`.
+    * Resolve arm in `rust/src/state_ops_resolve.rs` beside the
+      `MutinousMassacreEffect` sibling: reads the cast-time target
+      via `current_resolve_payload_target_id` (Emergency Eject /
+      Seedship Impact precedent), filters artifact-OR-creature,
+      stamps `controller_override = Some(caster)` (Cycle-1 substrate
+      mint site #2, inlined per per-slice file-iso), untaps, pushes
+      haste UEOT modifier, and — IF the target carries the
+      "Spacecraft" subtype — adds 10 charge counters and schedules a
+      `DelayedTrigger { effect:
+      RemoveChargeCountersFromSourceDelayed { amount: 10 } }` onto
+      `state.delayed_triggers`.
+    * `RemoveChargeCountersFromSourceDelayed` resolve arm: re-look-up
+      source on bf, decrement `charge_counters` by `amount` clamped
+      at 0, CR 603.6c silent fizzle when the source has left bf.
+    * **End-step drain dispatches the new variant via the existing
+      G7 Class-C `run_delayed_end_step_triggers` machinery** —
+      `push_triggered_ability` is generic over the `Effect` payload
+      (no enum-arm gate); landing the new Effect arm in
+      `apply_effect` was the only substrate change needed. Systems
+      Override is the SECOND consumer of the delayed-trigger drain
+      (WarpExileSelf was first); the dispatch is now observed
+      driving a non-WarpExileSelf effect.
+    * `cross_engine.py` `systems_override_effect` +
+      `remove_charge_counters_from_source_delayed` dict→Python
+      bridge arms.
+    * `trajectory.py` `_python_spell_effect_to_dict` `_leaf` arms —
+      `SystemsOverrideEffect` → bare unit dict, and
+      `RemoveChargeCountersFromSourceDelayed` → field-bearing dict
+      (single `amount` field). Adding these flips Systems Override
+      into the spell-card-bridge admit set under the Phase-1
+      `(1, 1)` single-target admit arm (auto-grow, no hardcoded
+      card-name list — the §2 auto-grow teeth).
+    * `RemoveChargeCountersFromSourceDelayed` added to
+      `RUST_AHEAD_OF_POOL` in `effect_coverage.py` — same
+      WarpExileSelf precedent: the Python class exists but the
+      static-printing walker doesn't see it (the schedule is
+      dynamic, inside SystemsOverrideEffect's resolve body).
+
+  PROBED 280 → 281 (Systems Override); admit set 25 → 26. Cycle 5
+  composes Cycle 1's controller_override + cleanup drain (revert
+  the override at end of turn), the round-27 UEOT-clear pass (clear
+  the haste), and the G7 Class-C end-step drain (remove the 10
+  charge counters at the next end step). Pinned end-to-end in the
+  real-EoE cross-engine probe driving the parsed Systems Override
+  printing against an opponent-controlled Spacecraft.
+
+  **Loading Zone divergence (deferred).** Python's
+  `add_charge_counters` threads through `_counter_doubling_factor`
+  (Loading Zone doubles charge-counter adds on Spacecraft).
+  Rust's resolve arm does NOT yet implement the doubling factor
+  (Loading Zone is BLOCKED in the EoE pool today; no test exercises
+  the doubling path). When Loading Zone lands both engines must
+  grow the factor in lockstep — the literal +10 here is byte-equal
+  with Python in the absence of Loading Zone. Tracked as a future
+  micro-cycle when Loading Zone's broader blocker closes.
 - **C6** — Threaten / Act-of-Treason / Sothera’s Requiem are
   cross-set siblings (not in EoE; deferred but the substrate
   carries the same shape) + agent-prompt extension (live agent-
   driven odd/even pick via a new `PendingDecision::ChooseOddOrEven`).
 
-Pool-flip per the cycle list: 1-2 cards per cycle (Mutinous
-Massacre LANDED C4, Systems Override deferred to C5) at ~5k-10k
-decks each.
+Pool-flip per the cycle list: 2 cards across C4+C5 (Mutinous
+Massacre LANDED C4, Systems Override LANDED C5) at ~5k decks each.
 
 ### 2. Zero Point Ballad — X-cost subsystem missing on Rust
 

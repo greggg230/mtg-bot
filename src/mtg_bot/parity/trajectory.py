@@ -4126,6 +4126,10 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
         FocusFireEffect,
         MutinousMassacreEffect,
         SeedshipImpactEffect,
+        SystemsOverrideEffect,
+    )
+    from mtg_bot.effects.generic.delayed_actions import (
+        RemoveChargeCountersFromSourceDelayed,
     )
     from mtg_bot.effects.generic.damage import (
         DealDamageEachOpponent,
@@ -4505,6 +4509,42 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
         # ``(0, 0)``-shape wrath admit arm — the §2 auto-grow teeth.
         if isinstance(eff, MutinousMassacreEffect):
             return {"kind": "mutinous_massacre_effect"}
+        # **Control-change-UEOT subsystem — Cycle 5 live mint site
+        # (2026-05-22; ~4,775 17lands decks).** Pid-FREE covered unit
+        # variant — Rust's ``parse_effect`` ``"systems_override_effect"``
+        # arm takes NO fields and the dict→Python bridge arm
+        # (cross_engine.py ``systems_override_effect``) constructs
+        # the field-free ``SystemsOverrideEffect()``. The single
+        # target rides on the ``StackItem``'s payload-target field;
+        # the +10 / -10 amount and Spacecraft-conditional charge-
+        # counter rider are intrinsic to the resolve arm (oracle text
+        # bakes "ten" in both places). No token pid → no
+        # :func:`_seat_token_printings` dependency; the round-trip is
+        # the clean ``mutinous_massacre_effect`` / ``close_encounter_
+        # effect`` unit-leaf idiom. Adding this leaf flips Systems
+        # Override into the spell-card-bridge admit set under the
+        # Phase-1 ``(1, 1)`` single-target admit arm — the §2
+        # auto-grow teeth.
+        if isinstance(eff, SystemsOverrideEffect):
+            return {"kind": "systems_override_effect"}
+        # **Control-change-UEOT subsystem — Cycle 5 delayed-trigger
+        # complement (2026-05-22).** Single-field
+        # ``RemoveChargeCountersFromSourceDelayed(amount)`` leaf.
+        # Round-trips through the field-bearing dict — Rust's
+        # ``parse_effect`` ``"remove_charge_counters_from_source_
+        # delayed"`` arm REQUIRES ``amount`` and the dict→Python
+        # bridge arm reconstructs ``RemoveChargeCountersFromSource
+        # Delayed(amount=amount)`` byte-equal. Scheduled by Systems
+        # Override at resolve time; this leaf exists so the
+        # ``delayed_triggers`` bridge round-trip is complete (the
+        # no-fallback-hybrid completeness teeth — without it a
+        # mid-game state-sync from Python → Rust would silently
+        # discard the in-flight rider).
+        if isinstance(eff, RemoveChargeCountersFromSourceDelayed):
+            return {
+                "kind": "remove_charge_counters_from_source_delayed",
+                "amount": int(eff.amount),
+            }
         # **Phase-3 wrath-admit-widening (2026-05-21).** Pyroclasm-shape
         # mass-damage leaf — ``DealNDamageToEachCreature(amount)``. The
         # bridge arm at ``cross_engine.py::damage_each_creature`` REQUIRES

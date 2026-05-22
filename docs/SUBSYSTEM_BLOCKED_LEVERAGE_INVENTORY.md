@@ -779,8 +779,44 @@ stale — both shipped upstream of this dated paragraph.
   the surface area beyond a reviewable slice. Full Cycle 4 entry
   at `docs/SEARCH_LIMITATIONS.md` §1 (Mutinous Massacre).
 
+  **Control-change-UEOT Cycle 5 landed (2026-05-22,
+  `feature/control-change-ueot-cycle-5-p1`).** Second live mint
+  site: Systems Override (~4,775 17lands decks) flipped COVERED →
+  PROBED via `Effect::SystemsOverrideEffect` field-free unit variant
+  + resolve arm (single-target control-change + untap + haste UEOT
+  + Spacecraft-conditional +10 charge counters + delayed-trigger
+  schedule) + the new
+  `Effect::RemoveChargeCountersFromSourceDelayed { amount: i32 }`
+  variant + its resolve arm. **The G7 Class-C end-step drain
+  composes uniformly without modification** —
+  `push_triggered_ability` is generic over the `Effect` payload
+  (no enum-arm gate), so the existing
+  `run_delayed_end_step_triggers` machinery pushes the new variant
+  onto the stack at PHASE_END_STEP entry exactly the same way it
+  pushes `WarpExileSelf`. The resolve arm landing in `apply_effect`
+  was the only substrate change needed; Systems Override is the
+  SECOND non-WarpExileSelf consumer of the delayed-trigger drain.
+  Admit set 25 → 26 (Systems Override AUTO-JOINS the Phase-1
+  `(1, 1)` single-target admit shape; no admit-set widening needed
+  per the §2 auto-grow teeth). 15 new tests in
+  `tests/test_systems_override_parity.py` (parser SoT + 2 serializer
+  round-trips + admit-gate flip + 2 covered-class pins +
+  6 Rust resolve unit pins + cleanup-drain composition +
+  silent-no-op + the GENUINE real-EoE cross-engine probe driving
+  the parsed printing through both engines against an opponent-
+  controlled Spacecraft, pinning the +10/-10 packet end-to-end).
+  Loading Zone counter-doubling not yet mirrored in Rust (Loading
+  Zone is BLOCKED in the EoE pool today; the literal +10 is
+  byte-equal in its absence — deferred as a future micro-cycle).
+  Full Cycle 5 entry at `docs/SEARCH_LIMITATIONS.md` §1 (Systems
+  Override). Systems Override drops out of the single-gated EU
+  list — the control-change-UEOT subsystem closes its EoE-pool
+  consumers across C4 (Mutinous Massacre) + C5 (Systems Override);
+  C6 is cross-set / agent-prompt extension only.
+
 * **Pool-flip per cycle:** 1 card + its deck count.
-* **Cumulative reach:** largest row but incremental cadence.
+* **Cumulative reach:** largest row but incremental cadence (C4+C5
+  together flipped 2 cards × ~5k decks each).
 
 ### (4) Dynamic-P/T formula — **CLOSED** (round-84, 2026-05-20)
 

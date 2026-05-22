@@ -2075,6 +2075,104 @@ pub enum Effect {
     /// fields. The bridge translates this Rust variant to
     /// `MutinousMassacreEffect()` (field-free construction).
     MutinousMassacreEffect,
+    /// **Control-change-UEOT subsystem — Cycle 5 live mint site
+    /// (2026-05-22; ~4,775 17lands decks).** Systems Override
+    /// `{2}{R}` Sorcery — "Gain control of target artifact or
+    /// creature until end of turn. Untap that permanent. It gains
+    /// haste until end of turn. If it's a Spacecraft, put ten charge
+    /// counters on it. If you do, remove ten charge counters from
+    /// it at the beginning of the next end step."
+    ///
+    /// Mirrors Python's `SystemsOverrideEffect`
+    /// (`effects/bespoke.py:1369`). Field-free unit variant — the
+    /// single target rides on the resolving `StackItem` via
+    /// `current_resolve_payload_target_id` (the same payload-target
+    /// swap shape `Effect::EmergencyEjectEffect` /
+    /// `Effect::SeedshipImpactEffect` / `Effect::Depressurize` use).
+    ///
+    /// **Resolve semantics (mirrors `SystemsOverrideEffect.resolve`
+    /// at `effects/bespoke.py:1396-1453` byte-equal):**
+    /// 1. Read the cast-time-bound target via
+    ///    `current_resolve_payload_target_id`. If `None` (synthetic-
+    ///    test `push_to_stack` path without
+    ///    `push_to_stack_with_target`), fall back to the first
+    ///    artifact-or-creature permanent in ETB-timestamp order
+    ///    across both battlefields. Silent no-op when no eligible
+    ///    target exists (the synthetic empty-bf case).
+    /// 2. Locate the target on the battlefield. Filter: any artifact
+    ///    OR any creature (Python's
+    ///    `o.printing.is_artifact or o.printing.is_creature`).
+    /// 3. **Gain-control phase.** Stamp
+    ///    `controller_override = Some(caster)` (the Cycle-1
+    ///    substrate's mint site — the same inline mint shape Cycle 4's
+    ///    Mutinous Massacre arm uses), with same-controller short-
+    ///    circuit so own-permanent targets get no override but still
+    ///    untap and gain haste UEOT (Python branches identically —
+    ///    `grant_control_change_ueot` no-ops when the new controller
+    ///    matches).
+    /// 4. **Untap + haste.** `obj.tapped = false`; push
+    ///    `UeotModifier::GrantKeyword { keyword: "haste" }` onto
+    ///    `obj.ueot_modifiers` (proven `BiosynthicBurstEffect` shape).
+    /// 5. **Spacecraft-conditional charge-counter rider (CR 121.2 —
+    ///    charge counters; CR 603.7 — delayed trigger).** If the
+    ///    target's printing carries the "Spacecraft" subtype (Python:
+    ///    `printing.is_spacecraft = "Spacecraft" in subtypes`), then:
+    ///    * Increment `obj.charge_counters += 10`. (Rust does not
+    ///      implement the Loading Zone counter-doubling factor —
+    ///      Loading Zone is BLOCKED in the EoE pool today; the literal
+    ///      +10 mirrors Python's `add_charge_counters` no-doubling
+    ///      case byte-equal. When Loading Zone lands, both engines
+    ///      grow the factor in lockstep.)
+    ///    * Schedule a `DelayedTrigger {
+    ///      fire_at_turn: state.turn_number, controller_id: caster,
+    ///      source_id: target_id,
+    ///      effect: Effect::RemoveChargeCountersFromSourceDelayed
+    ///      { amount: 10 } }` onto `state.delayed_triggers`. The
+    ///      Cycle-5 substrate (the existing `WarpExileSelf` end-step
+    ///      drain in `state_ops_steps.rs::run_delayed_end_step_triggers`
+    ///      + the new `RemoveChargeCountersFromSourceDelayed` resolve
+    ///      arm) drains the trigger at the upcoming end step.
+    /// 6. **Cleanup drain.** Cycle-1's
+    ///    `clear_controller_overrides_all` reverts the override at
+    ///    end of turn; the round-27 `clear_ueot_modifiers_all` clears
+    ///    the haste UEOT modifier. Both fire in the same pass.
+    ///
+    /// **Field-free unit variant** (the `MutinousMassacreEffect` /
+    /// `ExorciseEffect` Tier-A unit-variant idiom). No dict payload —
+    /// the spell's target rides on the `StackItem`'s payload-target
+    /// field; the +10 / -10 amount is hardcoded per the printed oracle
+    /// text (Python's `RemoveChargeCountersFromSourceDelayed(amount=10)`
+    /// is the call site's literal — the printing's oracle has the
+    /// "ten" baked in).
+    ///
+    /// **Schema parity with Python.** Unit variant on both sides — no
+    /// fields. The bridge translates this Rust variant to
+    /// `SystemsOverrideEffect()` (field-free construction).
+    SystemsOverrideEffect,
+    /// **Control-change-UEOT subsystem — Cycle 5 (2026-05-22).**
+    /// Delayed-trigger "remove `amount` charge counters from this
+    /// permanent" effect, scheduled by `SystemsOverrideEffect` and
+    /// drained at the beginning of the next end step via
+    /// `state_ops_steps.rs::run_delayed_end_step_triggers`.
+    ///
+    /// **Mirrors Python's `RemoveChargeCountersFromSourceDelayed`
+    /// (`effects/generic/delayed_actions.py:120`).** Scheduled at
+    /// Systems Override resolve time onto `state.delayed_triggers`
+    /// with `source_id` = the stolen Spacecraft's object id; pushed
+    /// onto the stack as a real `StackItem::TriggeredAbility` at
+    /// PHASE_END_STEP entry. The resolver arm looks up the source
+    /// obj by `source_obj_id` on the battlefield and decrements
+    /// `charge_counters` by `amount`, clamped at 0 (CR 121.5 —
+    /// can't have negative counters of a kind). No-op if the source
+    /// has left the battlefield between the schedule (Systems
+    /// Override resolve) and the trigger fire (end step) — CR 603.6c.
+    ///
+    /// **Schema parity with Python.** Single-field `amount` variant —
+    /// mirrors Python's `RemoveChargeCountersFromSourceDelayed(amount:
+    /// int)` dataclass. The Systems Override caller passes 10 (the
+    /// printed oracle's literal); the variant is generalized to take
+    /// any `amount` for future delayed-counter-remove consumers.
+    RemoveChargeCountersFromSourceDelayed { amount: i32 },
     /// Deal `amount` damage to any target — creature OR player
     /// (Lightning Bolt pattern, CR 701.4). 7 cards in EoE pool per
     /// round-20 measurement (Debris Field Crusher etc.). Mirrors
@@ -8587,6 +8685,27 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
             // shape.
             Ok(Effect::MutinousMassacreEffect)
         }
+        "systems_override_effect" => {
+            // Control-change-UEOT subsystem — Cycle 5 live mint site
+            // (2026-05-22; ~4,775 17lands decks). Unit variant — no
+            // required fields. The single target rides on the
+            // `StackItem`'s payload-target field; the +10 / -10 amount
+            // and the Spacecraft-conditional charge-counter rider are
+            // intrinsic to the resolve arm. Mirrors the
+            // `mutinous_massacre_effect` field-free unit-variant
+            // parser arm shape.
+            Ok(Effect::SystemsOverrideEffect)
+        }
+        "remove_charge_counters_from_source_delayed" => {
+            // Control-change-UEOT subsystem — Cycle 5 (2026-05-22).
+            // Delayed-trigger remove-N-charge-counters effect. Single
+            // required field `amount` (i32). Mirrors Python's
+            // `RemoveChargeCountersFromSourceDelayed(amount: int)`
+            // dataclass. Required-field contract — KeyError at
+            // register time if missing.
+            let amount: i32 = require(dict, "amount")?.extract()?;
+            Ok(Effect::RemoveChargeCountersFromSourceDelayed { amount })
+        }
         "deal_damage_any_target" => {
             // Python's `DealDamageAnyTarget(DealDamage)` carries the
             // inherited `amount` field plus an `optional: bool` slot
@@ -12498,6 +12617,32 @@ pub(crate) fn effect_to_pydict<'py>(
             // pick is intrinsic to the resolve arm (NOT serialized
             // — Rust mirrors Python's no-agent default pick=0).
             d.set_item("kind", "mutinous_massacre_effect")?;
+        }
+        Effect::SystemsOverrideEffect => {
+            // Control-change-UEOT subsystem — Cycle 5 live mint site
+            // (2026-05-22). Unit variant — `kind` only (the Mutinous
+            // Massacre / Close Encounter field-free to_dict idiom).
+            // Bidirectional with the `systems_override_effect` parse
+            // arm + the `cross_engine.py` bridge arm + the
+            // `trajectory.py` reverse-serializer leaf. The single
+            // target rides on the StackItem
+            // (`current_resolve_payload_target_id`) and is NOT
+            // serialized here; the +10/-10 amount + Spacecraft-
+            // conditional charge-counter rider are intrinsic to the
+            // resolve arm.
+            d.set_item("kind", "systems_override_effect")?;
+        }
+        Effect::RemoveChargeCountersFromSourceDelayed { amount } => {
+            // Control-change-UEOT subsystem — Cycle 5 (2026-05-22).
+            // Delayed-trigger remove-N-charge-counters effect.
+            // Bidirectional with the
+            // `remove_charge_counters_from_source_delayed` parse arm.
+            // Single-field payload — `kind` + `amount`. The source
+            // permanent ID is carried by the `DelayedTrigger` entry
+            // (`source_id`), then flows onto the resolving
+            // `StackItem::TriggeredAbility` via `push_triggered_ability`.
+            d.set_item("kind", "remove_charge_counters_from_source_delayed")?;
+            d.set_item("amount", *amount)?;
         }
         Effect::DealDamageAnyTarget { amount } => {
             d.set_item("kind", "deal_damage_any_target")?;
