@@ -9791,14 +9791,148 @@ Required substrate:
   agreement on a real Zero-Point-Ballad / Devastating-Onslaught
   trajectory requires both Cycle 2 (cast-pipeline X bind) and
   Cycle 3 (Effect arm + admit-predicate widen).
-- **C2** — Admit-predicate widen: remove the
-  `mc.x_pips: return False` reject, replace with a positive
-  X-shape admit gate keyed on the bound X value being
-  round-trip-clean through the reverse serializer; ~30 LoC. Add
-  the cast-pipeline detector to `cast_spell_noncreature` that
-  reads `mc.x_pips > 0` and binds the deterministic-first X via
-  pay-all-floating no-agent fallback (mirrors Python's
-  `actions._pick_x_cost_at_cast`).
+- **C2 — LANDED (2026-05-22, `feature/x-value-subsystem-cycle-2-p1`).**
+  Verify-first walk surfaced that the C2 brief assumed substrate
+  that did not exist — Rust's `cards::ManaCost` had NO `x_pips`
+  field at all (`cards.rs:39-46` pre-Cycle-2 was bare `generic +
+  5-colored u8` only); `parse_mana_cost` rejected the `"X"` key
+  as unknown; `mana_cost_to_pydict` never emitted it; no PyO3
+  getter surfaced it; the cast pipeline could not detect an
+  X-cost printing because the field was structurally absent. The
+  C2 brief's planned cast-pipeline detector + admit-predicate
+  widen + StackItem mint site required a foundational
+  `cards::ManaCost` extension as a prerequisite — that's this
+  cycle's deliverable.
+
+  Cycle 2 SCOPED-DOWN to the foundational `cards::ManaCost`
+  substrate extension (parallel shape to close-encounter-
+  substrate Cycle 1 → Cycle 2 → Cycle 3 staging — the
+  substrate-only cycle precedes the mint-site cycle which
+  precedes the Effect-arm cycle):
+
+  - `cards::ManaCost.x_pips: u8` — additive field, back-compat
+    default 0. Mirrors Python's `ManaCost.x_pips: int = 0`
+    (`src/mtg_bot/cards/base.py:271`). The actual generic mana
+    paid at cast time is `generic + x_pips * X` where X is the
+    caster's chosen value (CR 601.2f). `u8` (not `i32`) matches
+    every other field on `ManaCost`; the chosen X stays `i32` on
+    `StackItem.x_value` (the Cycle 1 slot) because it carries
+    arithmetic surface (clamping / saturation make signed values
+    useful), while `x_pips` is a structural template count
+    (always ≥ 0). NOT in `total()` per CR 202.3b ("the mana value
+    of an object with `{X}` in its mana cost is calculated as
+    though X were 0") — though Rust has no `total()` method
+    today, the SL note is locked in for the Cycle 2.5+ MV gates.
+  - `parse_mana_cost` accepts the `"X"` key
+    (`rust/src/cards.rs::parse_mana_cost`). Back-compat: every
+    pre-Cycle-2 registry-dict omits the key, which maps to
+    `x_pips = 0` byte-equal. The error message now lists `X` in
+    the valid-key set.
+  - `mana_cost_to_pydict` emits `"X"` when `x_pips > 0`
+    (`rust/src/cards.rs::mana_cost_to_pydict`). Back-compat: a
+    non-X printing's dict shape is byte-equal to the pre-Cycle-2
+    output. Round-trip with `parse_mana_cost` is byte-equal:
+    parse a dict with `"X": N` → emit a dict with `"X": N`
+    (excepting `"X": 0`, which becomes implicit-0 after one
+    round trip per the gate).
+  - PyO3 getter `Registry.get_printing_x_pips(id) -> u8`
+    (`rust/src/cards.rs`) — frequently-read scalar getter
+    sibling to `get_printing_power` / `get_printing_toughness`;
+    mirrors the precedent the dict-shaped `get_printing_mana_
+    cost` shares with the dedicated-scalar getters.
+  - The three Lightstall +{1} surcharge struct literals
+    (`state_ops_cast.rs::cast_creature` /
+    `cast_spell_noncreature` / `state_ops_legal.rs::
+    lightstall_legal_targets`) preserve `x_pips` across the
+    surcharge per CR 601.2f (cost adjustments touch the generic
+    side only; `{X}` symbols intact for the controller to choose
+    later). Back-compat byte-equal because every existing
+    Lightstall-eligible printing has `x_pips == 0`.
+  - `state_ops_mana.rs::can_pay_cost` SL doc updated — the "no
+    x_pips" claim becomes "x_pips present but IGNORED at
+    `can_pay_cost`; the predicate signature stays unchanged;
+    Cycle 2.5+ folds `x_pips * x_value` into generic at the
+    cast-pipeline detector BEFORE invoking this predicate (so the
+    predicate operates on the post-fold cost shape and never
+    needs to know X exists)". This frames the divergence
+    explicitly: X-cost spells are still admit-declined, so the
+    predicate ignoring `x_pips` is harmless today; the Cycle 2.5+
+    cast detector is the responsible-broker that produces an
+    X-folded cost before any pay/can-pay surface sees it.
+  - Tests: `tests/test_x_value_subsystem_cycle2.py` (12 tests
+    covering: registry round-trip on `x_pips=1` / `x_pips=u8::
+    MAX` / `x_pips=0` / missing-key-default, negative `"X"` is
+    type-rejected, `get_printing_mana_cost` emits `"X"` iff
+    `x_pips > 0`, combined X + colored + generic round-trip,
+    unknown-key still rejected with updated error message,
+    default-0 invariant across a non-X-only registry, Cycle 1
+    invariants survive — non-X cast still pushes `x_value:
+    None` — and X-cost composes orthogonally with the
+    additional-cost-choose-your-creature flag).
+
+  **Live-mint-site invariant unchanged in C2.** No cast site
+  mints `StackItem.x_value` yet — the cast pipeline still hard-
+  codes `None` for the X slot. Existing cross-engine trajectories
+  on non-X decks stay byte-identical (the registry's
+  `get_printing_x_pips` returns 0 for every non-X printing,
+  which the Cycle 2.5+ cast detector will gate on). C2 grows the
+  substrate vocabulary only; C2.5 wires the mint.
+
+  **Admit-predicate unchanged in C2.** `_printing_is_bridge_
+  simple_spell` at `trajectory.py:4926-4927` still rejects every
+  X-cost printing positively (`if mc.x_pips > 0: return False
+  # X-cost — a later spell-lever phase`). Zero Point Ballad,
+  Devastating Onslaught stay declined; no pool-flip in C2.
+
+  **Why C2 scoped-down (verify-first vs the original brief).**
+  The original C2 brief assumed the C2 cast-pipeline detector
+  could mint `StackItem.x_value` AND added a PendingDecision
+  scaffold for Zero Point Ballad's reanimation step. Both turned
+  out wrong on verify-first:
+  - The substrate didn't exist (no `x_pips` on Rust's `ManaCost`
+    at all) — extending the cast pipeline required threading a
+    new field through the entire `cards::ManaCost` surface +
+    parser + bridge + emit first. That's this cycle's slice.
+  - Zero Point Ballad's Python `ZeroPointBalladEffect`
+    (`effects/bespoke.py:1692-1741`) uses synchronous
+    `p.agent.choose_target` for the X≥6 reanimation step — NOT
+    a `PendingDecision` push. A `PendingDecision::ChooseFrom
+    OwnedDestroyedThisResolve` Rust scaffold would have NO
+    parity counterpart and would silently grow the apply_effect
+    surface without a real call site. Dropped; Cycle 3+ wires
+    whatever resolve-time shape (synchronous choose_target arm,
+    or a Decision-style callback if/when one is added) actually
+    matches Python.
+
+- **C2.5** — Admit-predicate widen + cast-pipeline mint site:
+  - Add a cast-pipeline X-cost detector in
+    `state_ops_cast.rs::cast_spell_noncreature` that reads
+    `printing.mana_cost.x_pips > 0`, picks the deterministic-
+    first X via a pay-all-floating no-agent fallback (mirroring
+    Python's `_choose_and_apply_x` no-agent path at
+    `actions.py:529-549`, which returns 0 if no agent — but the
+    Rust convention is deterministic-first-legal, so the
+    fallback computes max payable X and binds that), folds
+    `x_pips * x_value` into the cost's generic side BEFORE
+    invoking `auto_tap_pay_for_cost`, then passes the chosen X
+    to the Cycle-1-prepared `new_spell_with_targets_mode_addcost_
+    and_x` constructor.
+  - Add a Decision-style PyO3 callback `submit_choose_x_decision`
+    (parallel to `submit_choose_mode_decision` for the resolve-
+    time path), letting the harness drive cross-engine agreement
+    on real games. Open question: whether the cross-engine
+    harness needs a `_PickAllFloatingXAgent` shim or can run
+    with `_PickFirstLegalAgent` semantics (X = the upper bound)
+    — TBD when the detector lands.
+  - Remove the `mc.x_pips: return False` reject from
+    `_printing_is_bridge_simple_spell`; replace with a positive
+    X-cost admit gate that gates on `_spell_effect_is_covered_
+    and_bridged(printing)` AND `_python_spell_effect_to_dict(se)
+    is not None`. Until C3 adds the `Effect::ZeroPointBallad`
+    arm, the covered+bridged gate keeps Zero Point Ballad
+    DECLINED via the no-Effect-coverage tooth; the admit-arm
+    widen is structurally clean substrate.
+  - ~80 LoC + ~15 tests.
 - **C3** — `Effect::ZeroPointBallad` resolve arm (destroy-with-
   toughness-≤-X filter + life-loss + optional reanimation single-
   target). Reads `state.current_resolve_x_value` via the Cycle 1

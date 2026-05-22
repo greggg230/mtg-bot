@@ -43,6 +43,47 @@ pub struct ManaCost {
     pub black: u8,
     pub red: u8,
     pub green: u8,
+    /// **X-value subsystem — Cycle 2 (cards::ManaCost substrate,
+    /// 2026-05-22).** Number of `{X}` symbols in this printed cost.
+    /// Mirrors Python's `ManaCost.x_pips: int = 0`
+    /// (`src/mtg_bot/cards/base.py:271`).
+    ///
+    /// The actual generic mana paid at cast time is
+    /// `generic + x_pips * X` where X is the caster's chosen value.
+    /// Stored separately so a card's templated cost stays distinct
+    /// from its paid cost (cost reductions only touch the `generic`
+    /// side per CR 601.2f; the `x_pips` template is preserved).
+    ///
+    /// **Cycle 2 substrate-only — back-compat default 0.** Every
+    /// existing printing's registry dict omits the `"X"` key (the
+    /// parser maps that to 0), so every pre-Cycle-2 `ManaCost`
+    /// stays byte-equal. Cycle 2.5+ wires:
+    ///
+    ///   * a cast-pipeline X-cost detector (`mc.x_pips > 0` →
+    ///     pay-all-floating no-agent fallback);
+    ///   * `pay_mana_cost` / `auto_tap_pay_for_cost` extensions
+    ///     that fold `x_pips * x_value` into generic before paying
+    ///     (mirroring Python `actions.py:1604-1611`);
+    ///   * a live mint site for `StackItem.x_value` via the Cycle-1
+    ///     `new_spell_with_targets_mode_addcost_and_x` constructor;
+    ///   * the `_printing_is_bridge_simple_spell` admit-predicate
+    ///     widen for X-cost spells (Zero Point Ballad, Devastating
+    ///     Onslaught).
+    ///
+    /// **`u8` (not `i32`).** Mana cost symbol counts are tiny non-
+    /// negative integers — every other field on `ManaCost` is `u8`;
+    /// `x_pips` matches the precedent. `StackItem.x_value` (Cycle 1)
+    /// stays `i32` because it carries the chosen X (arithmetic
+    /// surface — clamping / saturation make signed values useful);
+    /// `x_pips` is a structural template count (always ≥ 0).
+    ///
+    /// **Not in `total()`.** A printing's mana-value (`total()`)
+    /// historically excludes X — CR 202.3b "the mana value of an
+    /// object with `{X}` in its mana cost is calculated as though X
+    /// were 0." `total()` continues to exclude `x_pips` so MV-driven
+    /// gates (cost-reduction max-MV filters, exile-by-MV searches)
+    /// stay byte-equal for non-X cards.
+    pub x_pips: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7746,9 +7787,22 @@ fn parse_mana_cost(dict: &Bound<'_, PyDict>) -> PyResult<ManaCost> {
             "B" => cost.black = value,
             "R" => cost.red = value,
             "G" => cost.green = value,
+            // **X-value subsystem — Cycle 2 (2026-05-22).** Accept
+            // the `"X"` key for X-cost spells (Zero Point Ballad's
+            // `{X}{B}`, Devastating Onslaught's `{X}{X}{R}`, etc.).
+            // The value is the number of `{X}` symbols in the
+            // printed cost; the cast pipeline (Cycle 2.5+) folds
+            // `x_pips * x_value` into generic at payment time
+            // (mirrors Python `actions.py:1605-1611`).
+            //
+            // Back-compat: every existing registry-dict omits the
+            // `"X"` key, so the field defaults to 0 (`ManaCost::
+            // default()` initializes `x_pips: 0`) — byte-equal to
+            // the pre-Cycle-2 ManaCost.
+            "X" => cost.x_pips = value,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown mana_cost key {other:?}; valid: generic, W, U, B, R, G"
+                    "unknown mana_cost key {other:?}; valid: generic, W, U, B, R, G, X"
                 )))
             }
         }
@@ -12001,6 +12055,14 @@ fn mana_cost_to_pydict<'py>(
     if cost.green > 0 {
         d.set_item("G", cost.green)?;
     }
+    // **X-value subsystem — Cycle 2 (2026-05-22).** Emit `"X"` when
+    // `x_pips > 0` so the dict round-trips byte-equal with
+    // `parse_mana_cost`. Back-compat: every non-X printing has
+    // `x_pips == 0` (the post-Cycle-2 default) and continues to
+    // omit the `"X"` key, byte-equal to the pre-Cycle-2 dict.
+    if cost.x_pips > 0 {
+        d.set_item("X", cost.x_pips)?;
+    }
     Ok(d)
 }
 
@@ -13166,6 +13228,33 @@ impl Registry {
     ) -> PyResult<Bound<'py, PyDict>> {
         let p = self.lookup(id)?;
         mana_cost_to_pydict(py, &p.mana_cost)
+    }
+
+    /// **X-value subsystem — Cycle 2 (2026-05-22).** Number of `{X}`
+    /// symbols in this printing's printed mana cost (0 for every
+    /// non-X spell). Mirrors Python's
+    /// `printing.mana_cost.x_pips` access pattern.
+    ///
+    /// **Why a dedicated getter.** `get_printing_mana_cost` already
+    /// emits the `"X"` key in its dict when nonzero (see
+    /// `mana_cost_to_pydict`), but the dict-walk indirection is
+    /// awkward for downstream consumers that just want a fast
+    /// boolean / count gate ("is this an X-cost spell?"). The
+    /// dedicated getter mirrors the precedent set by
+    /// `get_printing_power` / `get_printing_toughness` —
+    /// frequently-read scalar getters live next to the dict-shaped
+    /// `get_printing_mana_cost`.
+    ///
+    /// **Cycle 2 substrate-only.** No downstream Rust consumer
+    /// reads this getter yet — the live cast-pipeline detector
+    /// (`mc.x_pips > 0` → bind X via pay-all-floating no-agent
+    /// fallback) is Cycle 2.5+ work. The getter is wired NOW so
+    /// the test surface can pin the field-round-trips-through-the-
+    /// registry contract and Cycle 2.5+ can read it without
+    /// further substrate changes (mirrors how Cycle 1's
+    /// `stack_top_x_value` getter landed pre-mint-site).
+    fn get_printing_x_pips(&self, id: u32) -> PyResult<u8> {
+        Ok(self.lookup(id)?.mana_cost.x_pips)
     }
 
     fn get_printing_effects<'py>(

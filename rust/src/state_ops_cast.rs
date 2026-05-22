@@ -1065,6 +1065,11 @@ impl GameState {
                 if from_exile_lightstall {
                     // Apply +{1} generic surcharge. Mirrors Python
                     // `actions.py:1494-1499`. Colored pips unchanged.
+                    // X-value subsystem Cycle 2: `x_pips` template
+                    // is preserved across surcharge (CR 601.2f —
+                    // cost adjustments touch the generic side
+                    // only; `{X}` symbols intact for the controller
+                    // to choose later).
                     crate::cards::ManaCost {
                         generic: p.mana_cost.generic.saturating_add(1),
                         white: p.mana_cost.white,
@@ -1072,6 +1077,7 @@ impl GameState {
                         black: p.mana_cost.black,
                         red: p.mana_cost.red,
                         green: p.mana_cost.green,
+                        x_pips: p.mana_cost.x_pips,
                     }
                 } else {
                     p.mana_cost.clone()
@@ -1582,6 +1588,8 @@ impl GameState {
                 if from_exile_lightstall {
                     // Apply +{1} generic surcharge (Lightstall path).
                     // Mirrors Python `actions.py:1494-1499`.
+                    // X-value subsystem Cycle 2: `x_pips` template
+                    // is preserved across surcharge (CR 601.2f).
                     crate::cards::ManaCost {
                         generic: p.mana_cost.generic.saturating_add(1),
                         white: p.mana_cost.white,
@@ -1589,6 +1597,7 @@ impl GameState {
                         black: p.mana_cost.black,
                         red: p.mana_cost.red,
                         green: p.mana_cost.green,
+                        x_pips: p.mana_cost.x_pips,
                     }
                 } else {
                     p.mana_cost.clone()

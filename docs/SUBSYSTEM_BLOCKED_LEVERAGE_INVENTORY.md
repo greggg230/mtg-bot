@@ -738,6 +738,49 @@ upstream of this dated paragraph).
   substrate hexad characterization. Full Cycle 1 entry at
   `docs/SEARCH_LIMITATIONS.md` §2 (Zero Point Ballad).
 
+  **X-value-subsystem Cycle 2 landed (2026-05-22,
+  `feature/x-value-subsystem-cycle-2-p1`).** Verify-first walk
+  surfaced that Rust's `cards::ManaCost` struct had NO `x_pips`
+  field at all (`cards.rs:39-46` pre-Cycle-2 was bare `generic
+  + 5-colored u8`) — so the cast pipeline couldn't even
+  STRUCTURALLY detect an X-cost printing, the parser rejected
+  the `"X"` key as unknown, and `mana_cost_to_pydict` never
+  emitted it. The original C2 brief assumed this substrate
+  existed and planned to ship the cast-pipeline detector +
+  StackItem mint site + admit-predicate widen in one cycle;
+  honest re-scope split that into C2 (foundational
+  `cards::ManaCost.x_pips` substrate, this cycle) and C2.5
+  (cast detector + admit widen, next cycle). Verify-first also
+  surfaced that Zero Point Ballad's Python
+  `ZeroPointBalladEffect` uses synchronous `p.agent.choose_target`
+  for its X≥6 reanimation step — NOT a `PendingDecision` push —
+  so the original C2 brief's `PendingDecision::ChooseFromOwned
+  DestroyedThisResolve` scaffold has no parity counterpart and
+  was dropped from this cycle (Cycle 3+ wires whatever
+  resolve-time shape matches Python). Cycle 2 ships: (1)
+  `cards::ManaCost.x_pips: u8` (back-compat default 0,
+  mirrors Python's `ManaCost.x_pips: int = 0`); (2)
+  `parse_mana_cost` accepts the `"X"` key; (3)
+  `mana_cost_to_pydict` emits `"X"` when nonzero; (4) PyO3
+  getter `Registry.get_printing_x_pips(id) -> u8`; (5) the
+  three Lightstall +{1} surcharge struct literals preserve
+  `x_pips` across surcharge (CR 601.2f); (6) updated
+  `state_ops_mana.rs::can_pay_cost` SL doc framing the
+  "x_pips ignored at can_pay_cost; Cycle 2.5+ folds it into
+  generic before invocation" divergence. Substrate landing is
+  **back-compat byte-equivalent** on production self-play /
+  cross-engine trajectories — every existing printing's
+  registry-dict omits the `"X"` key (`x_pips` defaults to 0),
+  the emit side continues to omit the key for those printings,
+  `can_pay_cost` ignores the new field (every existing call
+  site passes a cost with `x_pips == 0`), and no admit-predicate
+  flip lands (X-cost spells stay declined). The substrate is
+  sufficient for Cycle 2.5 to wire the cast-pipeline X-cost
+  detector + StackItem mint site as a purely additive change
+  with no further `cards::ManaCost` extension required. Full
+  Cycle 2 entry at `docs/SEARCH_LIMITATIONS.md` §2 (Zero Point
+  Ballad).
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 

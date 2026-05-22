@@ -487,10 +487,18 @@ impl GameState {
 /// Mirrors Python `mtg_bot.actions.can_pay_cost`
 /// (`src/mtg_bot/actions.py:336-403`) — the source of truth —
 /// algorithm-for-algorithm for the live CastSpell surface's
-/// `generic + 5-colored` `ManaCost` shape (the only shape the Rust
-/// `cards::ManaCost` struct carries — `cards.rs:38-46`: no `x_pips`,
-/// no `hybrid` list, no Phyrexian field; Python's hybrid/X handling is
-/// unreachable here). The two halves of the algorithm already exist
+/// `generic + 5-colored` `ManaCost` shape. **X-value subsystem
+/// Cycle 2 (2026-05-22) added an `x_pips: u8` slot** to
+/// `cards::ManaCost` so X-cost printings (Zero Point Ballad,
+/// Devastating Onslaught) can round-trip the bridge — but the
+/// admit gate still rejects them and `can_pay_cost` still IGNORES
+/// `x_pips` (every existing call site passes a cost with
+/// `x_pips == 0`; Cycle 2.5+ will fold `x_pips * x_value` into
+/// generic at the cast-pipeline detector before invoking this
+/// predicate, so the predicate signature stays unchanged).
+/// `hybrid` and Phyrexian fields still don't exist; Python's
+/// hybrid handling stays unreachable here. The two halves of the
+/// algorithm already exist
 /// and are byte-equal-pinned by the ActivateAbility gate (pins I50):
 ///
 ///   * `auto_tap_headroom_pool(state, idx)`

@@ -2558,6 +2558,12 @@ impl GameState {
             // is colorless); colored pip slots are unchanged.
             let sk = crate::state_ops_mana::SpellKind::Any;
             let base_cost = eff(&printing.mana_cost);
+            // X-value subsystem Cycle 2: `x_pips` template is
+            // preserved across the +{1} Lightstall surcharge (CR
+            // 601.2f). Today's `can_pay_cost` ignores `x_pips`
+            // (X-cost cards stay admit-declined); when Cycle 2.5+
+            // wires the cast-pipeline X detector the predicate will
+            // fold `x_pips * x_value` into generic before checking.
             let surcharged_cost = crate::cards::ManaCost {
                 generic: base_cost.generic.saturating_add(1),
                 white: base_cost.white,
@@ -2565,6 +2571,7 @@ impl GameState {
                 black: base_cost.black,
                 red: base_cost.red,
                 green: base_cost.green,
+                x_pips: base_cost.x_pips,
             };
             if !crate::state_ops_mana::can_pay_cost(
                 self, idx, &surcharged_cost, &sk,
