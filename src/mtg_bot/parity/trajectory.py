@@ -4923,8 +4923,27 @@ def _printing_is_bridge_simple_spell(printing) -> bool:
     if printing.room_halves:
         return False
     mc = printing.mana_cost
-    if mc is not None and getattr(mc, "x_pips", 0):
-        return False  # X-cost — a later spell-lever phase
+    # **X-value-subsystem-C2.5 (2026-05-22).** X-cost admit-predicate
+    # widen — the early ``if mc.x_pips: return False`` reject is gone.
+    # X-cost printings now flow through the per-phase target-shape gates
+    # below. ONLY the Phase-3 wrath shape (`(0, 0)` with no slot_kinds /
+    # no ``targets`` attr) admits an X-cost printing — every other
+    # phase's `_PHASEN_*_SHAPE` predicate is conjuncted with
+    # ``mc.x_pips == 0`` so the X-cost lane stays surgical
+    # (single-target Phase 1, 2-slot Phase 2, multi-target Phase 4,
+    # or_both Phase 5 — all stay declined for X-cost cards). Today the
+    # ONLY X-cost EoE card whose `spell_effect` shape would satisfy the
+    # Phase-3 widen is Zero Point Ballad (and Devastating Onslaught
+    # which shares the X-value substrate but is Sorcery
+    # "create X token copies of..." — different resolve shape).
+    # **The widen is structurally clean substrate: until C3 lands the
+    # `Effect::ZeroPointBallad` resolve arm + bridge, the
+    # `_spell_effect_is_covered_and_bridged` tooth + the
+    # `_python_spell_effect_to_dict(se) is None` round-trip-or-bail
+    # tooth below keep Zero Point Ballad DECLINED.** The admit-arm
+    # widen + cast-pipeline live-mint substrate ship together so
+    # Cycle 3 lands the Effect arm against an existing admit gate.
+    _printing_is_x_cost = mc is not None and getattr(mc, "x_pips", 0) > 0
     # Additional-cost-choice (Close Encounter): the live printing
     # exposes NO ``additional_cost_choice`` attribute (verify-first
     # at the implement HEAD — the spec ADDENDUM's "warp_cost is not
@@ -4996,7 +5015,14 @@ def _printing_is_bridge_simple_spell(printing) -> bool:
     # exists to prevent).
     min_t, max_t = se.target_count_range()
     slot_kinds = se.target_slot_kinds()
-    _PHASE1_SHAPE = (min_t, max_t) == (1, 1) and not slot_kinds
+    # X-value-subsystem-C2.5: every non-Phase-3 phase explicitly
+    # excludes X-cost printings (`mc.x_pips > 0`). Only Phase 3
+    # admits X-cost (the wrath-shape lane that motivated the widen).
+    _PHASE1_SHAPE = (
+        (min_t, max_t) == (1, 1)
+        and not slot_kinds
+        and not _printing_is_x_cost
+    )
     # Phase-2 admit shape: exactly two required targets with the
     # disjoint friendly/opponent creature slot pair. ``_select_spell
     # _targets`` filters the flat ``legal_targets`` per slot_kind and
@@ -5004,9 +5030,10 @@ def _printing_is_bridge_simple_spell(printing) -> bool:
     # controlled creature, slot 1 = first non-caster-controlled
     # creature — the EXACT pair the Rust ``cast_spell_noncreature``
     # 2-slot scan binds + the double resolve-swap threads byte-equal.
-    _PHASE2_SHAPE = (min_t, max_t) == (2, 2) and tuple(slot_kinds) == (
-        "my_creature",
-        "creature",
+    _PHASE2_SHAPE = (
+        (min_t, max_t) == (2, 2)
+        and tuple(slot_kinds) == ("my_creature", "creature")
+        and not _printing_is_x_cost
     )
     # **Phase 3 — wrath-admit-widening (2026-05-21).** ``(0, 0)``-shape
     # spells with NO slot_kinds: wrath-style mass-effect spells whose
@@ -5023,6 +5050,19 @@ def _printing_is_bridge_simple_spell(printing) -> bool:
     # full no-fallback-hybrid load (an admitted card without a
     # round-trip-clean Effect arm bails via
     # :func:`_python_spell_effect_to_dict` returning ``None``).
+    # **X-value-subsystem-C2.5 (2026-05-22) widen.** Phase 3 is the
+    # SOLE phase that admits X-cost printings. The `(0, 0)`-shape with
+    # empty slot_kinds + no ``targets`` attr is the only target
+    # grammar Zero Point Ballad's `{X}{B}{B}` "Destroy each creature
+    # with toughness X or less. Then ..." resolve body fits — no
+    # at-cast target binding, the destroy walks the bf snapshot at
+    # resolve time scoped by `state.resolving_x_value` (read via the
+    # Cycle-1 bracket). The covered+bridged + round-trip-or-bail
+    # teeth still gate the admit set — until C3 lands
+    # `Effect::ZeroPointBallad`, Zero Point Ballad stays DECLINED via
+    # the no-Effect-coverage tooth (the admit widen is substrate-only
+    # in C2.5: the predicate accepts the SHAPE, but the gate hasn't
+    # opened yet for any real EoE X-cost card).
     _PHASE3_WRATH_SHAPE = (
         (min_t, max_t) == (0, 0)
         and not slot_kinds
@@ -5069,6 +5109,7 @@ def _printing_is_bridge_simple_spell(printing) -> bool:
                 and slot_kinds[0] in ("graveyard_creature",)
             )
         )
+        and not _printing_is_x_cost
     )
     # **Phase 5 — scour-for-scrap-cycle-2 (2026-05-21) — `or_both`
     # modal admit-widen.** ``ModalChooseOne(or_both=True)`` cards whose
@@ -5094,6 +5135,7 @@ def _printing_is_bridge_simple_spell(printing) -> bool:
     _PHASE5_OR_BOTH_MIXED_TARGET_SHAPE = (
         (min_t, max_t) == (0, 1)
         and not slot_kinds
+        and not _printing_is_x_cost
     )
     if not (
         _PHASE1_SHAPE

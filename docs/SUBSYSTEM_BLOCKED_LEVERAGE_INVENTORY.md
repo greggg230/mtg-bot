@@ -781,6 +781,43 @@ upstream of this dated paragraph).
   Cycle 2 entry at `docs/SEARCH_LIMITATIONS.md` §2 (Zero Point
   Ballad).
 
+  **X-value-subsystem Cycle 2.5 landed (2026-05-22,
+  `feature/x-value-subsystem-cycle-2-5-p1`).** Composite cycle
+  shipping the admit-predicate widen + first live mint site for
+  `StackItem.x_value`. Part 1
+  (`parity/trajectory.py::_printing_is_bridge_simple_spell`)
+  drops the early `mc.x_pips > 0` reject and adds an
+  `_printing_is_x_cost` local that each non-Phase-3 phase
+  predicate (Phase 1 / 2 / 4 / 5) conjuncts on — only the
+  Phase-3 wrath shape (`(0, 0)` no slot_kinds / no `targets`
+  attr) admits an X-cost printing. The covered+bridged +
+  round-trip-or-bail teeth keep Zero Point Ballad DECLINED
+  (no `Effect::ZeroPointBallad` yet); admit-set delta is 0
+  cards in C2.5. Part 2
+  (`state_ops_cast.rs::cast_spell_noncreature` Delta-2 block)
+  adds an additive X-cost detector branch: if
+  `cost.x_pips > 0`, bind `bound_x_value = Some(0)` per the
+  no-agent fallback (verify-first re-scope: Python's
+  `_choose_and_apply_x` at `actions.py:529-549` returns 0 when
+  `p.agent is None`; the cross-engine harness drives Python
+  with `agent=None`, so X=0 is the byte-equal mirror — NOT
+  max payable as the original C2.5 brief implied), fold
+  `x_pips * x_value` into generic and zero `x_pips` before
+  `auto_tap_pay_for_cost`, then thread `Some(x)` into the
+  Cycle-1-prepared `new_spell_with_targets_mode_addcost_and_x`
+  constructor. **Live-mint-site invariant changeover.** Non-X
+  spells still push `StackItem.x_value = None` (regression
+  invariant); X-cost spells now push `Some(0)` — the FIRST
+  production code path that mints a non-None value into the
+  Cycle 1 substrate field. CR 117.4 boundary (`Some(0)` ≠
+  `None`) preserved by the `Option<i32>` storage shape. Tests:
+  13 pins in `tests/test_x_value_subsystem_cycle2_5.py`. The
+  `submit_choose_x_decision` callback the original brief
+  proposed is **deferred** to C3+ — verify-first found no
+  cross-engine consumer for agent-driven X today (the harness
+  is no-agent). Full C2.5 entry at
+  `docs/SEARCH_LIMITATIONS.md` §2 (Zero Point Ballad).
+
 * **Pool-flip per cycle:** 1 card + its deck count.
 * **Cumulative reach:** largest row but incremental cadence.
 

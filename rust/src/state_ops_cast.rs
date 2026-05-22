@@ -1605,6 +1605,80 @@ impl GameState {
             }
             None => return Ok(false),
         };
+        // **X-value-subsystem-C2.5 (2026-05-22) — cast-pipeline
+        // detector.** If the printing carries an X-cost
+        // (`mc.x_pips > 0`), this is the first live mint site for
+        // `StackItem.x_value`. Bind X via the no-agent fallback
+        // (Python `actions.py:_choose_and_apply_x` at
+        // `actions.py:529-549`: when `p.agent is None`, the chosen
+        // X is 0). The cross-engine harness DOES set `agent=None` by
+        // default, so binding X=0 here gives byte-equal parity with
+        // Python under the harness — the first cross-engine X-cost
+        // trajectory observes `StackItem.x_value = Some(0)` on both
+        // sides. Production Python (with `DefaultTacticalAgent`)
+        // picks `upper_bound` instead; the Rust side has no
+        // production-grade agent surface yet (Rust is the harness-
+        // side replay engine), so the no-agent semantics is the
+        // only honest mirror.
+        //
+        // **CR 117.4 boundary.** `Some(0)` is distinct from `None`:
+        // `None` means "no X choice was made" (a non-X spell);
+        // `Some(0)` means "X choice was made AND the chosen value
+        // was 0". The Cycle 1 substrate field is `Option<i32>` for
+        // exactly this distinction.
+        //
+        // **Cost fold (CR 601.2f).** Python's actions.py:1602-1611
+        // folds `x_pips * x_value` into generic and zeros x_pips
+        // BEFORE `auto_tap_for_cost`. Mirror byte-equal: with
+        // X = 0, the fold is a no-op on generic — the printed
+        // generic stays unchanged, and `x_pips` is implicitly
+        // ignored by `auto_tap_pay_for_cost` (which has never
+        // walked `x_pips`). For X > 0 (production agent path —
+        // not exercised by the harness yet), the fold WOULD add
+        // `x_pips * x_value` to generic; the cost struct below
+        // captures that future-shape explicitly.
+        //
+        // **Cycle 2.5 surface.** This branch is the additive
+        // append the brief required (no restructure of the cast
+        // pipeline) — it surfaces `bound_x_value: Option<i32>` for
+        // the constructor call below to thread into StackItem.
+        let bound_x_value: Option<i32> = if cost.x_pips > 0 {
+            // No-agent fallback: X = 0 (Python's
+            // `_choose_and_apply_x` returns 0 when
+            // `p.agent is None`).
+            let chosen_x: i32 = 0;
+            Some(chosen_x)
+        } else {
+            None
+        };
+        // Fold `x_pips * x_value` into generic and zero `x_pips`
+        // before paying. With the no-agent X=0 default the fold is
+        // a no-op (still byte-equal to pre-C2.5 for non-X spells,
+        // and for X-cost spells the generic side is unchanged
+        // because 0 * x_pips = 0). The fold uses i64 arithmetic
+        // and saturates back to u8 to mirror Python's int
+        // unboundedness while staying inside the field's u8 storage
+        // (every real X-cost EoE printing has `x_pips <= 2`).
+        let cost = if cost.x_pips > 0 {
+            let x = bound_x_value.unwrap_or(0).max(0) as u32;
+            let extra: u32 = (cost.x_pips as u32).saturating_mul(x);
+            crate::cards::ManaCost {
+                generic: cost
+                    .generic
+                    .saturating_add(extra.min(u8::MAX as u32) as u8),
+                white: cost.white,
+                blue: cost.blue,
+                black: cost.black,
+                red: cost.red,
+                green: cost.green,
+                // Zero `x_pips` post-fold so `auto_tap_pay_for_cost`
+                // (which has never honored `x_pips`) sees a concrete
+                // cost. Python `actions.py:1610` mirrors this.
+                x_pips: 0,
+            }
+        } else {
+            cost
+        };
         // Delta 3: pay `mana_cost` via the auto-tap-from-lands path
         // (Python's instant/sorcery branch of `_cast_spell` pays
         // through the SAME `auto_tap_for_cost`, `actions.py:1662`).
@@ -2464,8 +2538,20 @@ impl GameState {
                 bound_target_2,
                 bound_mode_idx,
                 bound_additional_cost_choice_id,
-                // X-value subsystem Cycle 1: no live mint site.
-                None,
+                // **X-value subsystem C2.5 (2026-05-22) — first live
+                // mint site.** Threads `bound_x_value` (set in the
+                // Delta-2/Delta-3 cost block above) into the
+                // StackItem. Non-X printings still set `None`
+                // (byte-equal regression invariant: every existing
+                // cross-engine trajectory on non-X spells stays
+                // identical). X-cost printings set `Some(0)` under
+                // the cross-engine harness (no-agent fallback,
+                // mirroring Python `_choose_and_apply_x` returning
+                // 0 when `p.agent is None`) — the cross-engine
+                // byte-equality contract holds because Python
+                // pushes `x_value=0` to its StackItem on the same
+                // path (`actions.py:1762`).
+                bound_x_value,
             ));
         }
         // Delta 7: priority/passes reset, verbatim from

@@ -9878,11 +9878,13 @@ Required substrate:
   which the Cycle 2.5+ cast detector will gate on). C2 grows the
   substrate vocabulary only; C2.5 wires the mint.
 
-  **Admit-predicate unchanged in C2.** `_printing_is_bridge_
-  simple_spell` at `trajectory.py:4926-4927` still rejects every
-  X-cost printing positively (`if mc.x_pips > 0: return False
-  # X-cost — a later spell-lever phase`). Zero Point Ballad,
-  Devastating Onslaught stay declined; no pool-flip in C2.
+  **Admit-predicate unchanged in C2** (this status is now stale
+  — C2.5 widened the admit predicate; see the C2.5 LANDED entry
+  below). C2-snapshot: `_printing_is_bridge_simple_spell` at
+  `trajectory.py:4926-4927` still rejects every X-cost printing
+  positively (`if mc.x_pips > 0: return False # X-cost — a
+  later spell-lever phase`); Zero Point Ballad, Devastating
+  Onslaught stay declined; no pool-flip in C2.
 
   **Why C2 scoped-down (verify-first vs the original brief).**
   The original C2 brief assumed the C2 cast-pipeline detector
@@ -9904,35 +9906,116 @@ Required substrate:
     or a Decision-style callback if/when one is added) actually
     matches Python.
 
-- **C2.5** — Admit-predicate widen + cast-pipeline mint site:
-  - Add a cast-pipeline X-cost detector in
-    `state_ops_cast.rs::cast_spell_noncreature` that reads
-    `printing.mana_cost.x_pips > 0`, picks the deterministic-
-    first X via a pay-all-floating no-agent fallback (mirroring
-    Python's `_choose_and_apply_x` no-agent path at
-    `actions.py:529-549`, which returns 0 if no agent — but the
-    Rust convention is deterministic-first-legal, so the
-    fallback computes max payable X and binds that), folds
-    `x_pips * x_value` into the cost's generic side BEFORE
-    invoking `auto_tap_pay_for_cost`, then passes the chosen X
-    to the Cycle-1-prepared `new_spell_with_targets_mode_addcost_
-    and_x` constructor.
-  - Add a Decision-style PyO3 callback `submit_choose_x_decision`
-    (parallel to `submit_choose_mode_decision` for the resolve-
-    time path), letting the harness drive cross-engine agreement
-    on real games. Open question: whether the cross-engine
-    harness needs a `_PickAllFloatingXAgent` shim or can run
-    with `_PickFirstLegalAgent` semantics (X = the upper bound)
-    — TBD when the detector lands.
-  - Remove the `mc.x_pips: return False` reject from
-    `_printing_is_bridge_simple_spell`; replace with a positive
-    X-cost admit gate that gates on `_spell_effect_is_covered_
-    and_bridged(printing)` AND `_python_spell_effect_to_dict(se)
-    is not None`. Until C3 adds the `Effect::ZeroPointBallad`
-    arm, the covered+bridged gate keeps Zero Point Ballad
-    DECLINED via the no-Effect-coverage tooth; the admit-arm
-    widen is structurally clean substrate.
-  - ~80 LoC + ~15 tests.
+- **C2.5 — LANDED (2026-05-22, `feature/x-value-subsystem-cycle-2-5-p1`).**
+  Admit-predicate widen + first live mint site for
+  `StackItem.x_value`. Composite cycle: Part 1 widens
+  `_printing_is_bridge_simple_spell` (drops the early
+  `mc.x_pips > 0` reject, conjuncts `and not _printing_is_x_cost`
+  onto Phase 1/2/4/5 so the X-cost lane is restricted to Phase 3
+  alone); Part 2 adds the cast-pipeline X-cost detector to
+  `state_ops_cast.rs::cast_spell_noncreature` (gates on
+  `cost.x_pips > 0`, binds the deterministic-first X via the
+  no-agent fallback, folds `x_pips * x_value` into generic and
+  zeros `x_pips` before `auto_tap_pay_for_cost`, threads
+  `Some(x)` into the Cycle-1-prepared
+  `new_spell_with_targets_mode_addcost_and_x` constructor).
+
+  Rust additions (Part 2):
+
+  - **Cast detector + fold (`state_ops_cast.rs::
+    cast_spell_noncreature` Delta-2 block).** An ADDITIVE branch
+    after the Delta-2 cost resolution: if `cost.x_pips > 0`,
+    bind `bound_x_value = Some(0)` (no-agent fallback —
+    rationale below) and rebuild the cost with
+    `generic = cost.generic + x_pips * x_value` and `x_pips = 0`.
+    With X=0 the fold is a no-op on generic (`0 * x_pips = 0`);
+    the colored side is untouched. Then `auto_tap_pay_for_cost`
+    sees a concrete cost with no `{X}` symbols. Mirrors Python's
+    `actions.py:1602-1611` byte-equal.
+  - **No-agent fallback (X = 0).** Verify-first re-scope vs the
+    original C2.5 brief: the brief called for "X = max available
+    generic mana from caster's mana pool, mirroring Python's
+    no-agent semantics". The verify-first walk surfaced that
+    Python's `_choose_and_apply_x` (`actions.py:529-549`)
+    returns **0** when `p.agent is None` (NOT the upper bound).
+    The cross-engine harness drives Python with `agent=None` by
+    default (`cross_engine.py:1017-1018` flags this explicitly),
+    so the byte-equal mirror is X=0 — NOT max. DefaultTactical
+    Agent's `choose_x` returns `upper_bound`, but that's the
+    production-game path with agents installed, NOT the cross-
+    engine harness path that's the parity contract surface. The
+    brief's "max payable" wording was a transcription gap —
+    documented this divergence here so future cycles don't
+    inherit the gap.
+
+    Net effect: under the harness, Rust mints
+    `StackItem.x_value = Some(0)` and Python mints `x_value = 0`
+    on the same X-cost cast — byte-equal. CR 117.4 boundary
+    (`Some(0)` ≠ `None`) is preserved: non-X spells continue to
+    push `None`, X-cost spells push `Some(0)`. The Cycle 1
+    substrate's `Option<i32>` storage shape was designed for
+    exactly this distinction.
+  - **Decision-push deferred.** The original brief proposed a
+    `submit_choose_x_decision` PyO3 callback parallel to
+    `submit_choose_mode_decision`. Verify-first found Rust has
+    no `PendingDecision` queue for X-value announcement today
+    (the cast pipeline runs synchronously; X is bound at push
+    time). Adding a decision-push subsystem for X would be
+    foundational scaffold work without a real consumer (no
+    cross-engine probe exercises agent-driven X yet — the
+    harness is no-agent). Deferred to C3+ if a real driver
+    (e.g. an X-cost MCTS policy slot) ships.
+
+  Python additions (Part 1):
+
+  - **Admit-predicate widen (`parity/trajectory.py::
+    _printing_is_bridge_simple_spell`).** The early
+    `if mc.x_pips > 0: return False` reject is GONE; replaced
+    with a `_printing_is_x_cost` local that the per-phase shape
+    predicates conjunct on. Phase 1 / Phase 2 / Phase 4 / Phase
+    5 each gain `and not _printing_is_x_cost` — those lanes
+    explicitly reject X-cost printings. Phase 3 (`(0, 0)` wrath
+    shape with no slot_kinds / no `targets` attr) is the SOLE
+    phase that admits X-cost printings.
+  - **Covered+bridged + round-trip-or-bail teeth carry the load.**
+    Until C3 ships `Effect::ZeroPointBallad` + the bridge arm,
+    Zero Point Ballad stays DECLINED via the no-Effect-coverage
+    tooth (`_spell_effect_is_covered_and_bridged(printing)`
+    returns False for `ZeroPointBalladEffect`). The C2.5 widen
+    is structurally clean substrate: the predicate accepts the
+    SHAPE, but the gate hasn't opened yet for any real EoE
+    X-cost card.
+  - **`mc.x_pips > 0` admit-set delta is empty in C2.5.** No
+    pool-flip; the admit set is unchanged. The widen exists so
+    C3 can flip Zero Point Ballad with a single Effect-arm
+    change, NOT a coordinated admit-gate + Effect-arm cycle.
+
+  Tests: `tests/test_x_value_subsystem_cycle2_5.py` (13 tests
+  covering: Pin 1 non-X Phase-1 regression / Pin 2 Zero Point
+  Ballad still declined / Pin 3 Phase-1 X-cost rejected / Pin 4
+  Phase-4 X-cost rejected / Pin 5 non-X cast pushes None
+  regression / Pin 6 X-cost cast pushes Some(0) [FIRST LIVE
+  MINT] / Pin 7 CR 117.4 boundary distinct / Pin 8 resolver
+  bracket no-leak under live mint / Pin 9 multi-spell per-item
+  isolation / Pin 10 x_pips=2 Devastating Onslaught fold / Pin
+  11 non-X byte-equal field-view regression / Pin 12 cross-
+  engine X-cost byte-equality Some(0) / Pin 13 x_pips=0 implicit
+  back-compat).
+
+  **Live-mint-site invariant changeover in C2.5.** Non-X spells
+  still push `StackItem.x_value = None` (the regression pin
+  guards every existing trajectory). X-cost spells now push
+  `Some(0)` (the new behavior pin — first time the Cycle 1
+  substrate field carries a non-None value in production code).
+  Every other field on the StackItem (target_obj_id, chosen
+  _mode_idx, additional_cost_choice_id, etc.) is byte-equal
+  between X and non-X cast shapes.
+
+  **Admit-set delta: still 0 cards.** Zero Point Ballad stays
+  declined (covered+bridged tooth); no pool-flip in C2.5. C3
+  will land `Effect::ZeroPointBallad` + the bridge arm, at which
+  point the admit gate opens and Zero Point Ballad flips
+  (PROBED 279 → 280 expected).
 - **C3** — `Effect::ZeroPointBallad` resolve arm (destroy-with-
   toughness-≤-X filter + life-loss + optional reanimation single-
   target). Reads `state.current_resolve_x_value` via the Cycle 1
