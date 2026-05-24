@@ -16859,6 +16859,206 @@ fn apply_effect(
             // the inner inherits the resolving source's identity.
             apply_effect(state, then, source_obj_id)?;
         }
+        // **Weftwalking Cycle 1 — `ConditionalIfCastFromHand` resolve
+        // arm (2026-05-23).** The "if you cast it" intervening-if
+        // gate on Weftwalking's ETB. Per the Python source-of-truth
+        // (`combinators.py:1549-1559`): the engine puts enchantments
+        // onto the battlefield ONLY via the cast-from-hand path, so
+        // every fire of this wrapper is structurally a "cast
+        // happened" — the gate degrades to "always run the inner
+        // effect". The `cast_via_hand` flag is ephemeral (cleared by
+        // `put_into_battlefield` BEFORE ETB triggers fire), so
+        // neither engine has a reliable "this-permanent-was-cast-as-
+        // a-spell" persistent flag to consult at resolve time.
+        //
+        // The wrapper is preserved (rather than dropped at parse
+        // time) so the printed gate isn't silently dropped — a
+        // future engine that adds a non-cast ETB path for
+        // enchantments + a persistent provenance flag would land the
+        // conditional check here without re-touching the parser or
+        // the bridge. Same fidelity discipline as Python's documented
+        // simplification at `combinators.py:1518-1536`.
+        //
+        // **Recursive `inner` fire.** Calls `apply_effect(state,
+        // inner, source_obj_id)` unconditionally — full effect
+        // composition in scope for free (sibling of `Effect::IfNot`'s
+        // condition-FALSE recursive then-fire).
+        Effect::ConditionalIfCastFromHand { inner } => {
+            apply_effect(state, inner, source_obj_id)?;
+        }
+        // **Weftwalking Cycle 1 — `ShuffleZonesIntoLibrary` resolve
+        // arm (2026-05-23).** Moves all cards from each named owned
+        // zone into the source's controller's library, stamps
+        // `ZONE_LIBRARY` on each, clears the source zones, then
+        // shuffles the library. Mirrors Python's
+        // `ShuffleZonesIntoLibrary.resolve`
+        // (`effects/generic/zone_moves.py:423-448`) STEP-FOR-STEP so
+        // the post-resolve state is byte-equal.
+        //
+        // **Controller resolution.** "your" in "shuffle your hand
+        // and graveyard into your library" refers to the source's
+        // controller (CR 119.5 / 608.2 — "you" on a triggered
+        // ability is the controller of the ability source).
+        // Mirrors the `IfNot` / `Mill` / `DiscardSelf` source-finder
+        // shape: prefer the `current_resolve_source_controller`
+        // transient, fall back to a 5-zone walk for the source obj,
+        // then the stack scan, then `state.active_player`.
+        //
+        // **Per-zone move semantics.** For each recognized zone name
+        // in declaration order (`"hand"` then `"graveyard"`; other
+        // names silently skipped per Python parity at
+        // `zone_moves.py:431-442`):
+        //   1. Snapshot the zone's contents (cards iterate in zone
+        //      order — top-of-hand / oldest-graveyard first; the
+        //      subsequent shuffle wipes the ordering anyway).
+        //   2. For each card: stamp `ZONE_LIBRARY` on its zone
+        //      field, append to the controller's library.
+        //   3. Clear the source zone (Python `p.hand.clear()` /
+        //      `p.graveyard.clear()`).
+        //
+        // **Shuffle the WHOLE library.** Same dual-Python-`random.
+        // Random` / xorshift64 fallback block as
+        // `FamishedWorldsireLookTopXByPowerPutLandsTapped` /
+        // `SearchLibraryForBasicLandTapped` —
+        // `external_rng::next_below` for byte-identical
+        // `random.Random.shuffle` parity when a Python RNG is
+        // installed, xorshift64 with a per-(turn, ap, source,
+        // lib_len) seed otherwise.
+        //
+        // **Empty zones are a no-op.** A controller with empty hand
+        // + empty graveyard still calls the shuffle step (matches
+        // Python's unconditional `shuffle_library(state,
+        // controller_id)` call), but a library with < 2 cards skips
+        // the shuffle inner loop (no-op anyway).
+        Effect::ShuffleZonesIntoLibrary { zones } => {
+            // Source-controller resolution.
+            let controller: u8 = if let Some(c) =
+                state.current_resolve_source_controller
+            {
+                c
+            } else {
+                let mut found: Option<u8> = None;
+                'outer_szl: for player in state.players.iter() {
+                    for zone in [
+                        &player.hand,
+                        &player.library,
+                        &player.battlefield,
+                        &player.graveyard,
+                        &player.exile,
+                    ] {
+                        if let Some(obj) =
+                            zone.iter().find(|o| o.id == source_obj_id)
+                        {
+                            found = Some(obj.controller);
+                            break 'outer_szl;
+                        }
+                    }
+                }
+                if found.is_none() {
+                    if let Some(item) = state
+                        .stack
+                        .iter()
+                        .find(|i| i.source_obj_id == source_obj_id)
+                    {
+                        found = Some(item.controller);
+                    }
+                }
+                found.unwrap_or(state.active_player)
+            };
+            let controller_idx = controller as usize;
+            // Iterate the zones list in declaration order. Only
+            // `"hand"` and `"graveyard"` recognized; other names
+            // silently skipped (matches Python class semantics).
+            for zone_name in zones.iter() {
+                match zone_name.as_str() {
+                    "hand" => {
+                        let player = &mut state.players[controller_idx];
+                        let hand_drain: Vec<_> = {
+                            let hand = Arc::make_mut(&mut player.hand);
+                            hand.drain(..).collect()
+                        };
+                        let lib = Arc::make_mut(&mut player.library);
+                        for mut obj in hand_drain {
+                            obj.zone = ZONE_LIBRARY;
+                            lib.push(obj);
+                        }
+                    }
+                    "graveyard" => {
+                        let player = &mut state.players[controller_idx];
+                        let gy_drain: Vec<_> = {
+                            let gy = Arc::make_mut(&mut player.graveyard);
+                            gy.drain(..).collect()
+                        };
+                        let lib = Arc::make_mut(&mut player.library);
+                        for mut obj in gy_drain {
+                            obj.zone = ZONE_LIBRARY;
+                            lib.push(obj);
+                        }
+                    }
+                    _ => {
+                        // Unknown zone — silent skip (Python parity).
+                    }
+                }
+            }
+            // Shuffle the WHOLE library — CR 701.19, mirrors
+            // Python's `shuffle_library(state, controller_id)`.
+            // Same dual-path block as
+            // `FamishedWorldsireLookTopXByPowerPutLandsTapped` /
+            // `SearchLibraryForBasicLandTapped`.
+            let lib_len_post = state.players[controller_idx].library.len();
+            if lib_len_post >= 2 {
+                let py_rng_owned: Option<Py<PyAny>> = state
+                    .rng_ref()
+                    .map(|r| Python::with_gil(|py| r.clone_ref(py)));
+                if let Some(py_rng) = py_rng_owned {
+                    let player = &mut state.players[controller_idx];
+                    let lib = Arc::make_mut(&mut player.library);
+                    let n = lib.len();
+                    Python::with_gil(|py| -> PyResult<()> {
+                        let bound = py_rng.bind(py);
+                        for i in (1..n).rev() {
+                            let j = crate::external_rng::next_below(
+                                bound,
+                                i + 1,
+                            )?;
+                            lib.swap(i, j);
+                        }
+                        Ok(())
+                    })?;
+                } else {
+                    // xorshift64 fallback — same control flow as every
+                    // other xorshift site in the engine.
+                    let mut seed = (state.turn_number as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ ((state.active_player as u64) << 56)
+                        ^ ((source_obj_id as u64) << 16)
+                        ^ (lib_len_post as u64);
+                    if seed == 0 {
+                        seed = 0xdead_beef_dead_beef;
+                    }
+                    let player = &mut state.players[controller_idx];
+                    let lib = Arc::make_mut(&mut player.library);
+                    let n = lib.len();
+                    let mut x_rng = seed;
+                    for i in (1..n).rev() {
+                        x_rng ^= x_rng << 13;
+                        x_rng ^= x_rng >> 7;
+                        x_rng ^= x_rng << 17;
+                        let n_u64 = (i + 1) as u64;
+                        let bound = u64::MAX - (u64::MAX % n_u64);
+                        let mut r = x_rng;
+                        while r >= bound {
+                            r ^= r << 13;
+                            r ^= r >> 7;
+                            r ^= r << 17;
+                            x_rng = r;
+                        }
+                        let j = (r % n_u64) as usize;
+                        lib.swap(i, j);
+                    }
+                }
+            }
+        }
         // Round-28 EachOpponentMillsCards (3+ EoE cards). Mirrors the
         // round-24 EachOpponentDiscards / EachOpponentLosesLife
         // source-finder shape: 5-zone walk + stack scan to recover

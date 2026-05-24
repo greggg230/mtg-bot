@@ -2278,6 +2278,99 @@ def _ta_dict_to_python_effect(eff_dict: dict):
             )
         then = _ta_dict_to_python_effect(eff_dict["then"])
         return IfNot(condition=condition, then=then)
+    if kind == "conditional_if_cast_from_hand":
+        # **Weftwalking Cycle 1 composer bridge arm
+        # (conditional_if_cast_from_hand).**
+        # Mirrors Rust's
+        # ``Effect::ConditionalIfCastFromHand { inner: Box<Effect> }``
+        # (cards.rs). The parse_effect arm accepts the dict shape
+        # ``{"kind": "conditional_if_cast_from_hand",
+        # "inner": <effect_dict>}`` and recursively parses the inner
+        # Effect via the same ``parse_effect`` function. ``inner`` is
+        # REQUIRED on the Rust side (parse raises on missing); the
+        # bridge mirrors that contract — missing field raises
+        # KeyError here.
+        #
+        # Python's ``ConditionalIfCastFromHand(inner_effect: Effect)``
+        # from ``effects/combinators.py:1513`` carries the same shape:
+        # the "if you cast it" intervening-if gate on Weftwalking's
+        # ETB. Both engines degrade to "always run the inner effect"
+        # per the documented engine simplification at
+        # ``combinators.py:1518-1536`` — the wrapper is preserved so
+        # the printed gate isn't silently dropped, but the
+        # ``cast_via_hand`` flag is ephemeral (cleared by
+        # ``put_into_battlefield`` before ETB triggers fire), so
+        # neither engine has a reliable persistent provenance flag
+        # to consult at resolve time.
+        #
+        # **Recursive translation.** ``inner`` is itself an effect-
+        # dict; we recurse into ``_ta_dict_to_python_effect`` for it.
+        # Mirrors the ``may_do`` / ``if_you_do`` / ``if_not`` /
+        # ``sequence`` composer-arm precedent for nested-effect
+        # translation. Composer nesting unlocked for free.
+        #
+        # **Field-name translation: Rust ``inner`` -> Python
+        # ``inner_effect``.** Python's class names the field
+        # ``inner_effect`` (the same convention as ``MayDo``'s
+        # ``inner`` → ``MayDo(inner=...)`` rename, but here Python
+        # keeps ``inner_effect`` while Rust uses ``inner``). The
+        # bridge translates at this seam.
+        #
+        # **Real EoE consumer** unblocked by this arm:
+        # - Weftwalking: ETB trigger body
+        #   ``Sequence(ConditionalIfCastFromHand(Sequence(
+        #   ShuffleZonesIntoLibrary(("hand", "graveyard")),
+        #   DrawCards(7))))`` — see the trigger-parser wiring at
+        #   ``cards/parser/triggers.py:1461``.
+        from mtg_bot.effects.combinators import ConditionalIfCastFromHand
+        if "inner" not in eff_dict:
+            raise KeyError(
+                "conditional_if_cast_from_hand bridge arm: missing "
+                "required 'inner' field"
+            )
+        inner = _ta_dict_to_python_effect(eff_dict["inner"])
+        return ConditionalIfCastFromHand(inner_effect=inner)
+    if kind == "shuffle_zones_into_library":
+        # **Weftwalking Cycle 1 leaf bridge arm
+        # (shuffle_zones_into_library).**
+        # Mirrors Rust's
+        # ``Effect::ShuffleZonesIntoLibrary { zones: Vec<String> }``
+        # (cards.rs). The parse_effect arm accepts the dict shape
+        # ``{"kind": "shuffle_zones_into_library",
+        # "zones": [<str>, ...]}``. ``zones`` is REQUIRED on the
+        # Rust side (parse raises on missing); the bridge mirrors
+        # that contract — missing field raises KeyError here.
+        #
+        # Python's
+        # ``ShuffleZonesIntoLibrary(zones: tuple[str, ...] = ())``
+        # from ``effects/generic/zone_moves.py:405`` accepts a tuple
+        # of zone-name strings. Recognized values are ``"hand"`` and
+        # ``"graveyard"`` (other strings are silently skipped at
+        # resolve time on BOTH engines — permissive parse, narrow
+        # resolve, matches Python's class semantics at
+        # ``zone_moves.py:431-442``).
+        #
+        # **No recursion (leaf arm).** The ``zones`` payload is a
+        # flat list of strings; no nested effect-dict to translate.
+        # Sibling of ``deal_damage``, ``draw_cards`` etc.
+        #
+        # **Real EoE consumer** unblocked by this arm:
+        # - Weftwalking: ETB trigger body composes this leaf inside a
+        #   ``Sequence`` under a ``ConditionalIfCastFromHand`` gate;
+        #   the leaf carries the half-shuffle of "shuffle your hand
+        #   and graveyard into your library", while the sibling
+        #   ``DrawCards(7)`` leaf carries the "then draw seven cards"
+        #   half.
+        from mtg_bot.effects.generic.zone_moves import (
+            ShuffleZonesIntoLibrary,
+        )
+        if "zones" not in eff_dict:
+            raise KeyError(
+                "shuffle_zones_into_library bridge arm: missing "
+                "required 'zones' field"
+            )
+        zones = tuple(str(z) for z in eff_dict["zones"])
+        return ShuffleZonesIntoLibrary(zones=zones)
     if kind == "may_do":
         # **Phase 5 composer bridge arm (may_do).**
         # Mirrors Rust's ``Effect::MayDo { inner_effect: Box<Effect>,

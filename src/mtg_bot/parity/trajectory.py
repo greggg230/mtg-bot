@@ -4295,10 +4295,14 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
         ThreatenTargetCreatureUEOT,
     )
     from mtg_bot.effects.combinators import (
+        ConditionalIfCastFromHand,
         IfNot,
         IfYouDo,
         MayDo,
         OptionalSacAnotherForEffect,
+    )
+    from mtg_bot.effects.generic.zone_moves import (
+        ShuffleZonesIntoLibrary,
     )
     from mtg_bot.effects.conditions import (
         ControlsAnotherCreatureWithPowerAtMost,
@@ -4969,6 +4973,53 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
                 "condition_args": condition_args,
                 "then": then_dict,
             }
+        # **Weftwalking Cycle 1 — ``ConditionalIfCastFromHand``
+        # reverse-serializer leaf (2026-05-23).** Mirror of the Rust
+        # ``Effect::ConditionalIfCastFromHand { inner: Box<Effect> }``
+        # payload at ``rust/src/cards.rs``. Emits the dict shape
+        # consumed by ``cross_engine._ta_dict_to_python_effect``'s
+        # ``conditional_if_cast_from_hand`` arm and the Rust
+        # ``parse_effect`` ``conditional_if_cast_from_hand`` arm.
+        #
+        # **Field-name translation: Python ``inner_effect`` -> Rust
+        # ``inner``.** Python's class names the field ``inner_effect``
+        # while Rust uses ``inner``; the leaf translates at this
+        # seam.
+        #
+        # **Recursive ``inner_effect`` field.** Recurses via
+        # ``_leaf`` on the inner Effect (sibling of ``may_do``'s
+        # ``inner`` recursion, ``if_you_do``'s ``do_action`` /
+        # ``then_action`` recursion). Recurse-or-bail preserves the
+        # no-fallback-hybrid teeth.
+        if isinstance(eff, ConditionalIfCastFromHand):
+            inner_dict = _leaf(eff.inner_effect)
+            if inner_dict is None:
+                return None  # recurse-or-bail
+            return {
+                "kind": "conditional_if_cast_from_hand",
+                "inner": inner_dict,
+            }
+        # **Weftwalking Cycle 1 — ``ShuffleZonesIntoLibrary``
+        # reverse-serializer leaf (2026-05-23).** Mirror of the Rust
+        # ``Effect::ShuffleZonesIntoLibrary { zones: Vec<String> }``
+        # payload at ``rust/src/cards.rs``. Emits the dict shape
+        # consumed by ``cross_engine._ta_dict_to_python_effect``'s
+        # ``shuffle_zones_into_library`` arm and the Rust
+        # ``parse_effect`` ``shuffle_zones_into_library`` arm.
+        #
+        # **Flat-list leaf.** ``zones`` is a flat tuple of strings on
+        # Python; we emit it as a list of strings. No nested Effect
+        # to recurse on (sibling of leaves like ``draw_cards`` /
+        # ``deal_damage`` that carry only scalar payload). The
+        # narrow zone vocabulary (``"hand"`` / ``"graveyard"``) is
+        # enforced at resolve time on both engines, not at this
+        # serializer leaf — permissive emit keeps the round-trip
+        # byte-equal.
+        if isinstance(eff, ShuffleZonesIntoLibrary):
+            return {
+                "kind": "shuffle_zones_into_library",
+                "zones": [str(z) for z in eff.zones],
+            }
         # **Control-change-UEOT subsystem — Cycle 5 delayed-trigger
         # complement (2026-05-22).** Single-field
         # ``RemoveChargeCountersFromSourceDelayed(amount)`` leaf.
@@ -5624,6 +5675,29 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
                 "min_n": int(eff.min_n),
                 "max_n": int(eff.max_n),
             }
+        # **Weftwalking Cycle 1 — nested-``Sequence``-as-leaf
+        # (2026-05-23).** When a Sequence appears AS A CHILD of
+        # another composer (e.g. inside ``ConditionalIfCastFromHand
+        # .inner_effect`` for Weftwalking's ETB body), the outer
+        # leaf-walker needs to recurse into it the same way the
+        # top-level dispatcher does. Without this arm a Sequence
+        # nested inside a composer would bail with ``None``, blocking
+        # round-trip of any composer-wrapping-Sequence shape
+        # (Weftwalking is the first EoE consumer; future cards with
+        # the same nested-Sequence shape automatically unlock).
+        #
+        # Each child recurses via ``_leaf``; recurse-or-bail mirrors
+        # the top-level Sequence composer's discipline (a partially-
+        # serializable nested Sequence would silently drop a child
+        # on Rust).
+        if isinstance(eff, Sequence):
+            children: list[dict] = []
+            for child in eff.effects:
+                cd = _leaf(child)
+                if cd is None:
+                    return None
+                children.append(cd)
+            return {"kind": "sequence", "effects": children}
         return None
 
     # Sequence composer (Radiant Strike): recurse into each child

@@ -5305,6 +5305,76 @@ pub enum Effect {
         condition_args: Vec<i32>,
         then: Box<Effect>,
     },
+    /// **Weftwalking Cycle 1 — `ConditionalIfCastFromHand` combinator
+    /// (2026-05-23).** Run the wrapped `inner` Effect only if the
+    /// resolving source was cast as a spell from its controller's
+    /// hand. Mirrors Python's
+    /// `ConditionalIfCastFromHand(inner_effect: Effect)` at
+    /// `effects/combinators.py:1513` — the "if you cast it"
+    /// intervening-if gate on Weftwalking's ETB trigger.
+    ///
+    /// **Engine simplification (matches Python SoT).** Both engines
+    /// put enchantments onto the battlefield ONLY via the cast-from-
+    /// hand path today (no flicker-an-enchantment, no enchantment
+    /// token creation), so every fire of this wrapper is structurally
+    /// a "cast happened" — the gate degrades to "always run the
+    /// inner effect". The Python class documents the same
+    /// simplification at `combinators.py:1518-1536`; the
+    /// ephemeral `cast_via_hand` flag is cleared by
+    /// `put_into_battlefield` BEFORE ETB triggers fire, so neither
+    /// engine has a reliable "this-permanent-was-cast-as-a-spell"
+    /// persistent flag to consult at resolve time. The wrapper is
+    /// preserved (rather than dropped at parse time) so the printed
+    /// gate isn't silently dropped — a future engine that adds a
+    /// non-cast ETB path for enchantments + a persistent provenance
+    /// flag would land the conditional check here without re-touching
+    /// the parser or the bridge.
+    ///
+    /// **Recursive `inner` field.** `inner` is another boxed
+    /// `Effect`; parse + to_pydict recurse via `parse_effect` /
+    /// `effect_to_pydict` (sibling of `Effect::IfYouDo`'s recursive
+    /// `do_action` / `then_action` fields, `Effect::MayDo`'s
+    /// `inner_effect`, `Effect::Sequence`'s child list). The resolve
+    /// arm calls `apply_effect(state, inner, source_obj_id)`
+    /// unconditionally (per the simplification above) — full effect
+    /// composition in scope for free.
+    ConditionalIfCastFromHand {
+        inner: Box<Effect>,
+    },
+    /// **Weftwalking Cycle 1 — `ShuffleZonesIntoLibrary` Effect
+    /// (2026-05-23).** Shuffle one or more of the controller's owned
+    /// zones into their library, then re-shuffle the library.
+    /// Mirrors Python's
+    /// `ShuffleZonesIntoLibrary(zones: tuple[str, ...] = ())` at
+    /// `effects/generic/zone_moves.py:405` — the first half of
+    /// Weftwalking's ETB compound ("shuffle your hand and graveyard
+    /// into your library, then draw seven cards").
+    ///
+    /// **Field shape.** `zones` is a `Vec<String>` of recognized zone
+    /// names — `"hand"` and `"graveyard"` in scope for Cycle 1. The
+    /// resolve arm iterates the list in declaration order, moves each
+    /// card from the named zone into the controller's library
+    /// (stamping `ZONE_LIBRARY` on each object), clears the source
+    /// zone, then calls the shared library-shuffle path (same
+    /// dual-Python-`random.Random` / xorshift64 fallback as
+    /// `FamishedWorldsireLookTopXByPowerPutLandsTapped` and
+    /// `SearchLibraryForBasicLandTapped`).
+    ///
+    /// **Controller resolution.** Reuses the
+    /// `current_resolve_source_controller` transient + 5-zone
+    /// source-finder + stack fallback shape that `Effect::IfNot` /
+    /// `Effect::DiscardSelf` / `Effect::Mill` use — the "your"
+    /// in "shuffle your hand and graveyard into your library" is the
+    /// source's controller, NOT the active player.
+    ///
+    /// **Unknown zones silently skipped.** Per Python's class
+    /// (`zone_moves.py:431-442`), only `"hand"` and `"graveyard"`
+    /// are recognized; other zone names in the `zones` list are
+    /// no-ops. Same shape on Rust — keeps the parse arm permissive
+    /// while the resolve arm honors only the documented zones.
+    ShuffleZonesIntoLibrary {
+        zones: Vec<String>,
+    },
     /// Each opponent of the source's controller mills `count` cards
     /// (CR 701.13b — the per-opponent variant of `Mill`). Mirrors
     /// Python's `EachOpponentMillsCards(count: int = 1)` (3+ EoE
@@ -12566,6 +12636,66 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
                 then: Box::new(then),
             })
         }
+        "conditional_if_cast_from_hand" => {
+            // Weftwalking Cycle 1 — `ConditionalIfCastFromHand`
+            // combinator parse arm. Mirrors Python's
+            // `ConditionalIfCastFromHand(inner_effect: Effect)` at
+            // `combinators.py:1513`. Dict shape:
+            //   {"kind": "conditional_if_cast_from_hand",
+            //    "inner": <effect_dict>}
+            //
+            // Required nested `inner` field is itself an effect dict;
+            // recurse via `parse_effect` to land the inner Effect.
+            // No fields beyond the recursive inner — same flat shape
+            // as `Effect::MayDo`'s `inner_effect` (no prompt here)
+            // and `Effect::OptionalSacAnotherForEffect`'s
+            // `inner_effect` (no extra payload).
+            let inner_raw = dict.get_item("inner")?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "conditional_if_cast_from_hand: missing required \
+                     'inner' field",
+                )
+            })?;
+            let inner_dict = inner_raw.downcast::<PyDict>().map_err(|_| {
+                PyValueError::new_err(
+                    "conditional_if_cast_from_hand.inner must be a dict \
+                     (effect-shape)",
+                )
+            })?;
+            let inner = parse_effect(inner_dict)?;
+            Ok(Effect::ConditionalIfCastFromHand {
+                inner: Box::new(inner),
+            })
+        }
+        "shuffle_zones_into_library" => {
+            // Weftwalking Cycle 1 — `ShuffleZonesIntoLibrary` Effect
+            // parse arm. Mirrors Python's
+            // `ShuffleZonesIntoLibrary(zones: tuple[str, ...])` at
+            // `effects/generic/zone_moves.py:405`. Dict shape:
+            //   {"kind": "shuffle_zones_into_library",
+            //    "zones": [<str>, ...]}
+            //
+            // `zones` is required (no default to (); Python's class
+            // accepts an empty tuple but the bridge contract requires
+            // an explicit list to keep round-trips byte-equal).
+            // Unknown zone strings are not rejected at parse time —
+            // the resolve arm silently skips them, matching Python's
+            // permissive shape (`zone_moves.py:431-442` only acts on
+            // `"hand"` and `"graveyard"`; other strings are no-ops).
+            let zones_raw = dict.get_item("zones")?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "shuffle_zones_into_library: missing required \
+                     'zones' field (list of zone-name strings)",
+                )
+            })?;
+            let zones: Vec<String> = zones_raw.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "shuffle_zones_into_library.zones must be a list \
+                     of strings",
+                )
+            })?;
+            Ok(Effect::ShuffleZonesIntoLibrary { zones })
+        }
         "choose_one_mode" => {
             // Round-28 ModalChooseOne first-slice: resolve-time pick
             // only. Required nested 'modes' field is a list of effect
@@ -16242,6 +16372,29 @@ pub(crate) fn effect_to_pydict<'py>(
             let args_list: Vec<i32> = condition_args.clone();
             d.set_item("condition_args", args_list)?;
             d.set_item("then", effect_to_pydict(py, then)?)?;
+        }
+        Effect::ConditionalIfCastFromHand { inner } => {
+            // Weftwalking Cycle 1 — `ConditionalIfCastFromHand`
+            // to_pydict. Emits the dict shape consumed by the
+            // `conditional_if_cast_from_hand` parse arm above.
+            // `inner` recurses via `effect_to_pydict` — sibling of
+            // `if_you_do`'s `do_action` / `then_action` recursion,
+            // `may_do`'s `inner_effect` recursion, and `if_not`'s
+            // `then` recursion.
+            d.set_item("kind", "conditional_if_cast_from_hand")?;
+            d.set_item("inner", effect_to_pydict(py, inner)?)?;
+        }
+        Effect::ShuffleZonesIntoLibrary { zones } => {
+            // Weftwalking Cycle 1 — `ShuffleZonesIntoLibrary`
+            // to_pydict. Emits the dict shape consumed by the
+            // `shuffle_zones_into_library` parse arm above. The
+            // `zones` field round-trips as a Python list-of-strings
+            // (same idiom as `GrantKeywordsToTargetCreatureUntilEOT`'s
+            // `keywords` Vec<String>).
+            d.set_item("kind", "shuffle_zones_into_library")?;
+            let zones_list: Vec<&str> =
+                zones.iter().map(|s| s.as_str()).collect();
+            d.set_item("zones", zones_list)?;
         }
         Effect::EachOpponentMillsCards { count } => {
             d.set_item("kind", "each_opponent_mills_cards")?;

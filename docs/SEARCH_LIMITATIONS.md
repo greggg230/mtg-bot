@@ -16074,6 +16074,166 @@ to_pydict arm), `rust/src/state_ops_resolve.rs` (resolve arm),
 `tests/test_swarm_culler_parity.py` (probes). Per-card cycle
 LANDED; Swarm Culler is now PROBED at the per-card parity layer.
 
+
+## Weftwalking Cycle 1 LANDED — `Effect::ConditionalIfCastFromHand` (recursive `inner: Box<Effect>`) combinator + `Effect::ShuffleZonesIntoLibrary` (`zones: Vec<String>`) leaf Effect substrates shipped byte-equal on the ETB trigger body "if you cast it, shuffle your hand and graveyard into your library, then draw seven cards"
+
+**Single-cycle landing (2026-05-23,
+`feature/weftwalking-cycle-1-p1`).** Weftwalking — `{4}{U}{U}`
+Enchantment (sourced from EoE `data/edge_of_eternities.json` via the
+active `OracleParserCardSource`). The ETB trigger body the cycle
+closes: "When this enchantment enters, if you cast it, shuffle your
+hand and graveyard into your library, then draw seven cards." (The
+card also carries a static cost-reduction line about the first spell
+each turn — out of scope for this cycle's parity probe; the focus
+here is the ETB trigger body.) Parsed shape:
+`ConditionalIfCastFromHand(inner_effect=Sequence((
+ShuffleZonesIntoLibrary(zones=("hand", "graveyard")),
+DrawCards(amount=7))))`. Mirrors Python's two classes at
+`effects/combinators.py:1513` and
+`effects/generic/zone_moves.py:405`.
+
+The single cycle composed:
+
+  1. **Rust `Effect::ConditionalIfCastFromHand` combinator variant**
+     (`rust/src/cards.rs`) with the `{inner: Box<Effect>}` payload —
+     a recursive combinator whose inner Effect is fired
+     unconditionally at resolve time per the documented engine
+     simplification (the ephemeral `cast_via_hand` flag is cleared
+     by `put_into_battlefield` BEFORE ETB triggers fire, so neither
+     engine has a persistent provenance flag to consult at resolve
+     time). The wrapper is preserved (rather than dropped at parse
+     time) so the printed gate isn't silently dropped — a future
+     engine that adds a non-cast ETB path for enchantments + a
+     persistent provenance flag would land the conditional check
+     here without re-touching the parser or the bridge. Same
+     fidelity discipline as Python's documented simplification at
+     `combinators.py:1518-1536`. Parse arm + `to_pydict` arm in
+     `cards.rs`; resolve arm in `state_ops_resolve.rs`.
+  2. **Rust `Effect::ShuffleZonesIntoLibrary` Effect variant**
+     (`rust/src/cards.rs`) with the `{zones: Vec<String>}` payload —
+     moves each named owned zone's contents to the source's
+     controller's library, stamps `ZONE_LIBRARY`, clears the source
+     zones, then shuffles the library via the shared dual-Python-
+     `random.Random` / xorshift64 fallback (same shape as
+     `FamishedWorldsireLookTopXByPowerPutLandsTapped` /
+     `SearchLibraryForBasicLandTapped`). Recognized zones: `"hand"`
+     and `"graveyard"`; other names silently skipped at resolve time
+     (matches Python class semantics at `zone_moves.py:431-442`).
+     Controller resolution reuses the
+     `current_resolve_source_controller` transient + 5-zone source-
+     finder + stack fallback shape that `IfNot` / `DiscardSelf` /
+     `Mill` use.
+  3. **Cross-engine bridge dict→Python arms**
+     (`src/mtg_bot/parity/cross_engine.py::_ta_dict_to_python_effect`)
+     reconstruct the Python `ConditionalIfCastFromHand(inner_effect=
+     ...)` (recursive on `inner`) and the flat-leaf
+     `ShuffleZonesIntoLibrary(zones=(...))` (zones tuple) from their
+     dict shapes. **Field-name translation seam:** Rust's `inner`
+     ↔ Python's `inner_effect` (the bridge does the rename).
+  4. **Per-leaf Python→dict serializers**
+     (`src/mtg_bot/parity/trajectory.py::_python_spell_effect_to_dict`)
+     emit `{"kind": "conditional_if_cast_from_hand",
+     "inner": <eff_dict>}` and `{"kind": "shuffle_zones_into_
+     library", "zones": [<str>, ...]}`. The
+     `ConditionalIfCastFromHand` leaf recurses on `inner_effect`
+     (recurse-or-bail, no-fallback-hybrid teeth preserved). A
+     **nested-`Sequence`-as-leaf** arm was added in the same module
+     so a Sequence appearing as a child of another composer (e.g.
+     inside `ConditionalIfCastFromHand.inner_effect` for
+     Weftwalking's ETB body) round-trips correctly — without this
+     arm a Sequence nested inside a composer would bail with `None`,
+     blocking round-trip of any composer-wrapping-Sequence shape.
+  5. **Coverage 1:1 identity mapping.** The new Rust variant names
+     `ConditionalIfCastFromHand` and `ShuffleZonesIntoLibrary`
+     match the Python class names 1:1, so
+     `mtg_bot.parity.effect_coverage.covered_python_class_set()`
+     auto-includes both — closes the `effect_uncovered` classifier
+     gate at the covered-set level.
+
+**Multi-gated card; classifier multi-gate state stays True after the
+cycle.** Per the round-58 subsystem-attribution classifier,
+Weftwalking is multi-gated on `effect_uncovered +
+nonsafe_triggered_ability`. The cycle closes the `effect_uncovered`
+gate (both `ConditionalIfCastFromHand` and `ShuffleZonesIntoLibrary`
+Python classes flip from `missing_effect_classes` to covered), but
+the `nonsafe_triggered_ability` gate KEEPS the card multi-gated at
+the classifier level. The trajectory safe-trigger admit gate
+(`parity/trajectory.py::_python_ta_to_safe_dict`) is INTENTIONALLY
+NOT widened — that gate is about the production-deck bench admit
+set, a distinct concern from per-card real-EoE parity probes. **The
+card DOES move to PROBED tier through the dedicated per-card real-
+EoE byte-equal cross-engine probe** (`tests/test_weftwalking_
+parity.py`), the same precedent as Splitskin Doll / Boilerbilges
+Ripper / Possibility Technician / Friendly Teddy / Endstone /
+Terrapact / Vaultguard / Arabella / Attack-in-the-Box / Wickerfolk
+Thresher / Enduring Curiosity / Terrasymbiosis / Ouroboroid / Blade
+of the Swarm established.
+
+**Engine simplification — wrapper fires inner unconditionally.**
+Both engines put enchantments onto the battlefield ONLY via the
+cast-from-hand path today (no flicker-an-enchantment, no
+enchantment-token creation), so every fire of
+`ConditionalIfCastFromHand` is structurally a "cast happened" — the
+gate degrades to "always run the inner effect". The wrapper is
+preserved (not dropped at parse time) so the printed gate isn't
+silently dropped; the day a future engine grows a non-cast ETB path
+for enchantments + a persistent provenance flag, landing the actual
+conditional check is a one-line resolve-arm change with no parser
+or bridge churn.
+
+  * **Failure mode**: zero today (no non-cast ETB path for
+    enchantments exists in either engine). The future failure mode
+    is "flicker-an-enchantment lands the inner effect anyway"; in
+    that case the engine would need to ALSO add a persistent
+    `cast_via_hand_provenance` flag, and this wrapper would gate on
+    it.
+  * **Fix scope**: ~1 day if/when the future need arises. Add a
+    persistent flag on `GameObject`, set it in the cast pipeline,
+    preserve it through `put_into_battlefield`, and add the
+    conditional read in the resolve arm.
+  * **Impact estimate**: zero today. Strength impact is whatever
+    fraction of future flicker-an-enchantment effects need to
+    suppress the inner — currently <1 card across EoE.
+
+**Probe avoids the ETB-trigger-fan-out path.** The Cycle 1 scope
+landed ONLY the two Effect substrates; the full real-EoE ETB-
+trigger fan-out byte-equal probe through both engines's ETB-dispatch
+machinery (the Python-side `dispatch_event(Event.ENTERS)` ↔ Rust-
+side ETB-trigger-pushed-onto-stack timing coincidence) is honest-
+stopped at Cycle 1. The Rust resolve-arm pins drive the wrapper +
+inner through a synthetic carrier printing whose `effects` slot
+mirrors the parser-emitted dict shape; the dedicated per-card probe
+carries the byte-equal observable (hand → 7, graveyard → 0, library
+delta = +hand_start + gy_start − 7) directly via push-to-stack +
+resolve-top-of-stack on the synthetic carrier.
+
+**NO admit-set change — Equipment-style precedent does NOT apply.**
+Weftwalking is an Enchantment (not a non-creature instant /
+sorcery); the spell-card-bridge admit set
+(`trajectory.py::_python_spell_effect_to_dict` + its §2 teeth) gates
+non-creature instant/sorcery shapes today, and the cross-engine
+probe for Weftwalking lives in the dedicated per-card parity-test
+module per the established classifier-bypass convention.
+
+**Probe path location**: `rust/src/cards.rs::Effect::ConditionalIf
+CastFromHand` + `Effect::ShuffleZonesIntoLibrary` (Effect-class
+close + parse + to_pydict), `rust/src/state_ops_resolve.rs::
+apply_effect` (resolve arms — `current_resolve_source_controller`
+driven for the shuffle leaf; recursive `apply_effect` for the
+wrapper), `src/mtg_bot/parity/cross_engine.py::_ta_dict_to_python_
+effect` (bridge arms with field-name translation), `src/mtg_bot/
+parity/trajectory.py::_python_spell_effect_to_dict` (per-leaf
+Python→dict serializers + nested-`Sequence`-as-leaf arm + narrow
+imports), `tests/test_weftwalking_parity.py` (probes — parser SoT
+pin, per-Effect serializer round-trips, full-composite serializer
+round-trip, Rust `effect_to_pydict` round-trip, covered-set
+membership, Rust resolve `ShuffleZonesIntoLibrary` empty-hand-+-gy
+pin, Rust resolve `ConditionalIfCastFromHand` fires-inner pin, Rust
+resolve full Weftwalking-composite pin, real-EoE byte-equal cross-
+engine probe). Per-card cycle LANDED; Weftwalking is now PROBED at
+the per-card parity layer (despite the classifier multi-gate state
+staying True on `nonsafe_triggered_ability`).
+
 ---
 
 When you take a deliberate shortcut (heuristic, approximation,
