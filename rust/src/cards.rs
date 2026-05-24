@@ -6272,6 +6272,79 @@ pub enum Effect {
         toughness: i32,
         granted_subtype: Option<String>,
     },
+    /// **Synthesizer Labship Cycle 1 closure (2026-05-23).**
+    /// "Up to one other target artifact you control becomes an artifact
+    /// creature with base power and toughness `power`/`toughness` and
+    /// gains `granted_keywords` until end of turn." Mirrors Python's
+    /// `TargetArtifactBecomesCreatureUEOT(power, toughness,
+    /// granted_keywords)` at `effects/generic/become_type.py:36`.
+    ///
+    /// **Card context — Synthesizer Labship (EoE, `{U}` Artifact —
+    /// Spacecraft, 4/4).** The Effect is the body of Labship's 2+
+    /// tier BEGINNING_OF_COMBAT trigger: it animates ONE other target
+    /// artifact the controller controls into a 2/2 artifact creature
+    /// with flying UEOT. The animation can SHRINK an already-creature
+    /// artifact (a stationed Spacecraft target has its base P/T
+    /// overridden to 2/2 — pinned in Python at
+    /// `tests/test_synthesizer_labship_animation.py
+    /// ::test_already_creature_artifact_base_pt_overridden`).
+    ///
+    /// **Target binding — Phase-1 single-target ladder.**
+    /// `current_resolve_payload_target_id` carries the chosen artifact
+    /// id from push-time (`first_legal_trigger_target` seats the
+    /// deterministic-first eligible) or cast-time (no spell-cast path
+    /// — Labship's trigger is the only EoE consumer today). At
+    /// resolve, the arm re-locates the bound id on a battlefield and
+    /// re-validates the target (must be Artifact, on bf, NOT the
+    /// source itself per "other"). Stale binding → CR 608.2b silent
+    /// fizzle.
+    ///
+    /// **Schema mirror vs Python.** `granted_keywords: Vec<String>`
+    /// — list of lowercased keyword names matching the printing-side
+    /// keyword vocab (`flying`, `vigilance`, etc.). Parse-time
+    /// rejection on non-string / empty-string entries. The Python
+    /// class's frozenset semantics flatten to a list on the wire
+    /// dict (the order is fixed by the parse-time list — empty
+    /// frozenset becomes empty list; iteration order doesn't affect
+    /// the becomes-creature mechanic since keyword grants commute).
+    ///
+    /// **Mechanism.** Push ONE `UeotModifier::BecomesArtifactCreature
+    /// { power, toughness, granted_keywords }` onto the target's
+    /// `ueot_modifiers` Vec. Auto-expires at the next CR 514.3
+    /// UEOT-clear pass (cleanup step), reverting the artifact to its
+    /// pre-animation state. Effective-P/T readers + the effective-
+    /// creature predicate + the effective-keyword reader all consult
+    /// this variant via the union helpers
+    /// (`ueot_becomes_creature_pt`, `ueot_is_creature_via_become`,
+    /// `ueot_has_keyword`); the same readers the manland-animate
+    /// variant feeds.
+    ///
+    /// **Up-to-one semantics.** Python's class is
+    /// `target_count_range = (0, 1)` — declining is legal. Rust's
+    /// `lever_trigger_requires_target` does NOT list this variant,
+    /// so an empty legal-targets pool pushes the trigger via the
+    /// unchanged `new_trigger` path and the resolve arm no-ops
+    /// (byte-equal with Python's `if not targets: return`
+    /// early-return at `become_type.py:83-84`).
+    ///
+    /// **Substrate gating — Synthesizer Labship station-spacecraft
+    /// classifier gate stays OPEN.** This Effect substrate landing
+    /// does NOT close the multi-gated trigger admission set: the
+    /// Spacecraft Station charge-counter mechanism (the 2+ tier
+    /// condition that gates the trigger from firing) is campaign-
+    /// declined and not on Rust. Per the precedent set by Comet
+    /// Crawler / Sledge-Class Seedship cycles, the per-card
+    /// dedicated cross-engine probe drives the Effect directly
+    /// (via Rust's `push_triggered_ability` / Python's
+    /// `run_beginning_of_combat_triggers` after staging
+    /// charge_counters >= 2) — the classifier admit-set widen is
+    /// a separate cycle that needs the Station substrate to land
+    /// first.
+    TargetArtifactBecomesCreatureUEOT {
+        power: i32,
+        toughness: i32,
+        granted_keywords: Vec<String>,
+    },
     /// **Round 29 optional-mana-cost wrapper.** "You may pay {cost}. If
     /// you do, [inner_effect]." Mirrors Python's
     /// `OptionalManaCostThenEffect(cost_str, inner_effect)`
@@ -13450,8 +13523,72 @@ fn parse_effect(dict: &Bound<'_, PyDict>) -> PyResult<Effect> {
                 inner_effect: Box::new(inner),
             })
         }
+        "target_artifact_becomes_creature_ueot" => {
+            // **Synthesizer Labship Cycle 1 (2026-05-23).** Required
+            // `power` and `toughness` integer fields. Optional
+            // `granted_keywords` list of non-empty lowercased strings
+            // (missing or empty list legal — the parser may emit an
+            // empty frozenset). No-default on `power`/`toughness`;
+            // every Python emission of `TargetArtifactBecomesCreatureUEOT`
+            // spells them out explicitly (Synthesizer Labship emits
+            // `power=2, toughness=2`).
+            let power: i32 = dict
+                .get_item("power")?
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "target_artifact_becomes_creature_ueot: missing required 'power' field",
+                    )
+                })?
+                .extract()
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "target_artifact_becomes_creature_ueot.power must be an integer (got: {e})"
+                    ))
+                })?;
+            let toughness: i32 = dict
+                .get_item("toughness")?
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "target_artifact_becomes_creature_ueot: missing required 'toughness' field",
+                    )
+                })?
+                .extract()
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "target_artifact_becomes_creature_ueot.toughness must be an integer (got: {e})"
+                    ))
+                })?;
+            // `granted_keywords` is optional — Python's
+            // `frozenset[str]` flattens to a list on the wire dict and
+            // empty-frozenset is a legal shape. Parse to a Vec<String>;
+            // reject non-string / empty-string entries; preserve order
+            // (the becomes-creature mechanic commutes over keyword
+            // grants, so order doesn't affect behavior — but the
+            // round-trip dict-shape preserves the emitted list order
+            // for byte-equal cross-engine probes).
+            let granted_keywords: Vec<String> = match dict.get_item("granted_keywords")? {
+                Some(v) => v.extract().map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "target_artifact_becomes_creature_ueot.granted_keywords must be a list of strings (got: {e})"
+                    ))
+                })?,
+                None => Vec::new(),
+            };
+            for kw in &granted_keywords {
+                if kw.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "target_artifact_becomes_creature_ueot.granted_keywords entries must be non-empty strings",
+                    ));
+                }
+            }
+            Ok(Effect::TargetArtifactBecomesCreatureUEOT {
+                power,
+                toughness,
+                granted_keywords,
+            })
+        }
         other => Err(PyValueError::new_err(format!(
-            "unknown effect kind {other:?}; valid: deal_damage, draw_cards, gain_life, return_to_hand, mill, mill_target_player, exile_target, tap_target, untap_target, sacrifice, add_counters, discard_card, scry_n, destroy_target, damage_each_opponent, damage_each_creature, create_token, add_mana_to_pool, search_library_for_basic_land_tapped, put_plus_one_counter_on_self, surveil, counter_target_spell, return_creature_from_your_graveyard_to_battlefield, discard_self, each_opponent_loses_life, lose_life, target_opponent_loses_life, each_opponent_discards, destroy_all_creatures, destroy_target_nonland_permanent, destroy_target_artifact, destroy_target_land, focus_fire_effect, deal_damage_any_target, pump_self_until_eot, pump_target_creature_until_eot, sequence, pump_creatures_you_control_until_eot, return_creature_from_your_graveyard_to_hand, put_plus_one_counter_on_each_creature_you_control, put_plus_one_counter_on_creature_you_control, put_plus_one_counter_on_opponents_creature, return_target_permanent_you_control, add_n_mana_of_chosen_color, search_library_for_card, pump_creatures_opponents_control_until_eot, put_card_from_graveyard_on_bottom_of_library, move_self_counters_to_target_creature_you_control, deal_damage_equal_to_source_power_any_target, tap_target_artifact_or_creature, conditional_on_tapped_creatures, put_plus_one_counter_on_each_of_up_to_n_target_creatures, put_charge_counters_on_self, create_token_copy_of_target_creature_you_control, optional_sac_artifact_for_effect, owner_puts_target_artifact_or_creature_on_top_or_bottom_of_library, attach_to_target_creature_you_control, destroy_enchanted_permanent, tap_enchanted_permanent, put_stun_counter_on_tapped_creature, tap_target_opponent_permanent_and_stun_it, exile_target_creature_until_source_leaves, exile_opponents_nonland_permanent_until_leaves, exile_opponents_nonland_permanent_with_max_mv_until_leaves, may_do, look_top_n_put_one_in_hand_rest_to_graveyard, choose_one_mode, if_you_do, each_opponent_mills_cards, pump_target_artifact_or_creature_until_eot, each_opponent_sacrifices_creature, grant_keyword_to_target_creature_until_eot, grant_keywords_to_target_creature_until_eot, untap_target_other_permanent, tap_another_target_creature, return_all_creatures_from_your_graveyard_to_battlefield, set_base_pt_until_eot, manifest_dread, manifest_dread_then_attach_self, manifest_dread_then_put_plus_one_counters_on_it, conditional_if_void, deal_damage_to_opponent_creature, optional_mana_cost_then_effect, draw_cards_equal_to_resolving_combat_damage, draw_cards_equal_to_resolving_counter_amount, double_target_creatures_power_ueot, deal_damage_to_opponent_creature_by_artifact_count, put_plus_one_counters_on_self_per_other_creature_or_artifact, surveil_x_equal_to_artifact_count, deal_damage_to_opponent_creature_by_cards_in_hand, deal_damage_to_opponent_creature_by_lands_controlled, deal_damage_to_opponent_creature_by_creatures_you_control, mill_target_player_equal_to_your_life_total, create_token_each_player, each_opponent_loses_life_equal_to_artifact_count, gain_life_equal_to_artifact_count, deal_damage_to_opponent_creature_by_cards_in_graveyard, deal_damage_to_opponent_creature_by_life_total, exile_each_opponents_graveyard, diplomatic_relations_effect, defending_player_loses_half_life_rounded_up, conditional_if_you_gained_life_at_least, conditional_if_source_power_at_least, dyadrine_attack_effect, put_poison_counters_on_target_player, exile_all_artifacts_with_mana_value_at_most, deal_damage_to_target_tapped_creature, put_charge_counters_on_target_spacecraft_or_planet_you_control, return_up_to_n_small_creatures_from_graveyard_with_counters, zero_point_ballad_effect, create_x_tokens_of_target_permanent_with_haste_end_step_sac, sacrifice_source_delayed, return_up_to_n_nonland_permanent_cards_from_graveyard_to_hand, terminal_velocity_effect, deal_self_mv_damage_to_each_creature, optional_sac_another_for_pump_self_ueot, exile_target_creature, exile_target_creature_with_power_or_toughness_at_most, return_up_to_n_creatures_from_your_graveyard_to_hand, boilerbilges_ripper_etb_effect, each_player_draws, fanatic_of_the_harrowing_etb_effect, discard_hand_then_draw_n, terrapact_intimidator_etb_effect, territorial_bruntar_landfall_effect, schedule_self_sac_at_next_end_step, peek_top_may_battlefield_if_land_else_hand, put_plus_one_counters_on_each_creature_you_control_equal_to_source_power, optional_sac_another_for_effect"
+            "unknown effect kind {other:?}; valid: deal_damage, draw_cards, gain_life, return_to_hand, mill, mill_target_player, exile_target, tap_target, untap_target, sacrifice, add_counters, discard_card, scry_n, destroy_target, damage_each_opponent, damage_each_creature, create_token, add_mana_to_pool, search_library_for_basic_land_tapped, put_plus_one_counter_on_self, surveil, counter_target_spell, return_creature_from_your_graveyard_to_battlefield, discard_self, each_opponent_loses_life, lose_life, target_opponent_loses_life, each_opponent_discards, destroy_all_creatures, destroy_target_nonland_permanent, destroy_target_artifact, destroy_target_land, focus_fire_effect, deal_damage_any_target, pump_self_until_eot, pump_target_creature_until_eot, sequence, pump_creatures_you_control_until_eot, return_creature_from_your_graveyard_to_hand, put_plus_one_counter_on_each_creature_you_control, put_plus_one_counter_on_creature_you_control, put_plus_one_counter_on_opponents_creature, return_target_permanent_you_control, add_n_mana_of_chosen_color, search_library_for_card, pump_creatures_opponents_control_until_eot, put_card_from_graveyard_on_bottom_of_library, move_self_counters_to_target_creature_you_control, deal_damage_equal_to_source_power_any_target, tap_target_artifact_or_creature, conditional_on_tapped_creatures, put_plus_one_counter_on_each_of_up_to_n_target_creatures, put_charge_counters_on_self, create_token_copy_of_target_creature_you_control, optional_sac_artifact_for_effect, owner_puts_target_artifact_or_creature_on_top_or_bottom_of_library, attach_to_target_creature_you_control, destroy_enchanted_permanent, tap_enchanted_permanent, put_stun_counter_on_tapped_creature, tap_target_opponent_permanent_and_stun_it, exile_target_creature_until_source_leaves, exile_opponents_nonland_permanent_until_leaves, exile_opponents_nonland_permanent_with_max_mv_until_leaves, may_do, look_top_n_put_one_in_hand_rest_to_graveyard, choose_one_mode, if_you_do, each_opponent_mills_cards, pump_target_artifact_or_creature_until_eot, each_opponent_sacrifices_creature, grant_keyword_to_target_creature_until_eot, grant_keywords_to_target_creature_until_eot, untap_target_other_permanent, tap_another_target_creature, return_all_creatures_from_your_graveyard_to_battlefield, set_base_pt_until_eot, manifest_dread, manifest_dread_then_attach_self, manifest_dread_then_put_plus_one_counters_on_it, conditional_if_void, deal_damage_to_opponent_creature, optional_mana_cost_then_effect, draw_cards_equal_to_resolving_combat_damage, draw_cards_equal_to_resolving_counter_amount, double_target_creatures_power_ueot, deal_damage_to_opponent_creature_by_artifact_count, put_plus_one_counters_on_self_per_other_creature_or_artifact, surveil_x_equal_to_artifact_count, deal_damage_to_opponent_creature_by_cards_in_hand, deal_damage_to_opponent_creature_by_lands_controlled, deal_damage_to_opponent_creature_by_creatures_you_control, mill_target_player_equal_to_your_life_total, create_token_each_player, each_opponent_loses_life_equal_to_artifact_count, gain_life_equal_to_artifact_count, deal_damage_to_opponent_creature_by_cards_in_graveyard, deal_damage_to_opponent_creature_by_life_total, exile_each_opponents_graveyard, diplomatic_relations_effect, defending_player_loses_half_life_rounded_up, conditional_if_you_gained_life_at_least, conditional_if_source_power_at_least, dyadrine_attack_effect, put_poison_counters_on_target_player, exile_all_artifacts_with_mana_value_at_most, deal_damage_to_target_tapped_creature, put_charge_counters_on_target_spacecraft_or_planet_you_control, return_up_to_n_small_creatures_from_graveyard_with_counters, zero_point_ballad_effect, create_x_tokens_of_target_permanent_with_haste_end_step_sac, sacrifice_source_delayed, return_up_to_n_nonland_permanent_cards_from_graveyard_to_hand, terminal_velocity_effect, deal_self_mv_damage_to_each_creature, optional_sac_another_for_pump_self_ueot, exile_target_creature, exile_target_creature_with_power_or_toughness_at_most, return_up_to_n_creatures_from_your_graveyard_to_hand, boilerbilges_ripper_etb_effect, each_player_draws, fanatic_of_the_harrowing_etb_effect, discard_hand_then_draw_n, terrapact_intimidator_etb_effect, territorial_bruntar_landfall_effect, schedule_self_sac_at_next_end_step, peek_top_may_battlefield_if_land_else_hand, put_plus_one_counters_on_each_creature_you_control_equal_to_source_power, optional_sac_another_for_effect, target_artifact_becomes_creature_ueot"
         ))),
     }
 }
@@ -16670,6 +16807,26 @@ pub(crate) fn effect_to_pydict<'py>(
         // `cross_engine.py` consumes the same one-key shape.
         Effect::PeekTopMayBattlefieldIfLandElseHand => {
             d.set_item("kind", "peek_top_may_battlefield_if_land_else_hand")?;
+        }
+        // **Synthesizer Labship Cycle 1 (2026-05-23).** Three-field
+        // parameterized to_pydict arm — `kind` + `power` + `toughness`
+        // + `granted_keywords` list. Mirrors Python's
+        // `TargetArtifactBecomesCreatureUEOT(power, toughness,
+        // granted_keywords)` frozen-dataclass dict shape; the bridge
+        // dict→Python arm in `cross_engine.py` consumes the same
+        // four-key shape. The `granted_keywords` list serializes as a
+        // Python list-of-strings (the Python frozenset flattens to a
+        // list on the wire); empty list is legal.
+        Effect::TargetArtifactBecomesCreatureUEOT {
+            power,
+            toughness,
+            granted_keywords,
+        } => {
+            d.set_item("kind", "target_artifact_becomes_creature_ueot")?;
+            d.set_item("power", *power)?;
+            d.set_item("toughness", *toughness)?;
+            let kw_list: Vec<&str> = granted_keywords.iter().map(|s| s.as_str()).collect();
+            d.set_item("granted_keywords", kw_list)?;
         }
     }
     Ok(d)

@@ -16074,6 +16074,191 @@ to_pydict arm), `rust/src/state_ops_resolve.rs` (resolve arm),
 `tests/test_swarm_culler_parity.py` (probes). Per-card cycle
 LANDED; Swarm Culler is now PROBED at the per-card parity layer.
 
+
+## Synthesizer Labship Cycle 1 LANDED — `Effect::TargetArtifactBecomesCreatureUEOT { power, toughness, granted_keywords }` (parameterized) "up to one other target artifact you control becomes a P/T artifact creature with `<keywords>` UEOT" Effect class + companion `UeotModifier::BecomesArtifactCreature` shipped byte-equal on the animation observable; Spacecraft Station-tier 2+ trigger-fire dispatch honest-stopped on Rust (substrate-only probe)
+
+**Single-cycle landing (2026-05-23,
+`feature/synthesizer-labship-cycle-1-p1`).** Synthesizer Labship —
+`{U}` Artifact — Spacecraft (4/4, EoE; sourced from
+`data/edge_of_eternities.json` via the active
+`OracleParserCardSource`). Printed tier-2+ BEGINNING_OF_COMBAT
+trigger body: "Up to one other target artifact you control becomes
+an artifact creature with base power and toughness 2/2 and gains
+flying until end of turn." The parser (via the spacecraft station-
+tier oracle builder at `cards/parser/spacecraft_builder.py`) maps
+the rider line to `TargetArtifactBecomesCreatureUEOT(power=2,
+toughness=2, granted_keywords=frozenset({"flying"}))`. Mirrors
+Python's frozen dataclass at `effects/generic/become_type.py:36`.
+
+The single cycle composed:
+
+  1. **Rust `Effect::TargetArtifactBecomesCreatureUEOT { power: i32,
+     toughness: i32, granted_keywords: Vec<String> }`** — three-field
+     parameterized variant (`rust/src/cards.rs`), parse arm
+     (`parse_effect` dispatcher; round-trips the four-key dict
+     `{"kind": "target_artifact_becomes_creature_ueot", "power":
+     int, "toughness": int, "granted_keywords": [...]}` shape;
+     missing `granted_keywords` defaults to empty list — legal per
+     Python's `frozenset()` default), `to_pydict` arm (emits the
+     four-key shape preserving the keyword list order), and resolve
+     arm in `rust/src/state_ops_resolve.rs` that picks the FIRST
+     artifact on source-controller's bf that is NOT the source
+     itself (the "other" filter — CR 109.5 + Python's
+     `legal_targets` exclude at `become_type.py:62`), then pushes a
+     `UeotModifier::BecomesArtifactCreature { power, toughness,
+     granted_keywords }` onto its `ueot_modifiers`.
+  2. **`UeotModifier::BecomesArtifactCreature { power: i32,
+     toughness: i32, granted_keywords: Vec<String> }`** —
+     companion enum variant in `rust/src/state.rs`. Sibling of
+     `BecomesLandCreature` — same "this permanent is a creature
+     RIGHT NOW with base P/T (p, t)" semantics, but the
+     artifact-half is the printed type (already-artifact target),
+     so no land-subtype field. Granted keywords ride INSIDE this
+     variant rather than via a sibling `GrantKeyword` push — keeps
+     the UEOT modifier set atomic. Python composes
+     `ApplyEffect(BecomeType, EndOfTurn) +
+     ApplyEffect(GrantKeywords, EndOfTurn)`; Rust's flatter
+     representation bakes them together because the becomes-creature
+     half and the gains-keywords half always expire as one set in
+     the EoE Synthesizer-Labship-shape.
+  3. **Union reader extensions in `rust/src/state.rs`.** Three new /
+     widened readers:
+       - `ueot_becomes_creature_pt() -> Option<(i32, i32)>` — UNION
+         reader for BOTH `BecomesLandCreature` and
+         `BecomesArtifactCreature`; the most-recent push wins
+         (CR layer-7 last-applied uniform across both variants).
+       - `ueot_is_creature_via_become() -> bool` — widened to also
+         recognize `BecomesArtifactCreature` (the manland-only check
+         widened to the artifact-animate window too).
+       - `ueot_has_keyword(&str) -> bool` — widened to also fold
+         `BecomesArtifactCreature.granted_keywords` so combat
+         readers see the flying/etc. grant.
+     Effective-P/T readers in `state_ops_combat.rs`,
+     `state_ops_legal.rs`, and `state_ops_resolve.rs` now consult
+     `ueot_becomes_creature_pt` instead of the manland-specific
+     `ueot_becomes_land_creature_pt` (the manland-only method
+     remains as a kept sibling so existing call sites don't behavior-
+     shift; new readers should use the union method).
+  4. **Bridge dict→Python arm**
+     (`src/mtg_bot/parity/cross_engine.py::_ta_dict_to_python_effect`)
+     reconstructs the Python `TargetArtifactBecomesCreatureUEOT(
+     power, toughness, granted_keywords)` from the four-key dict
+     shape. Re-builds `granted_keywords` as a `frozenset[str]` from
+     the wire list.
+  5. **Per-leaf Python→dict serializer**
+     (`src/mtg_bot/parity/trajectory.py::_python_spell_effect_to_dict`)
+     emits the four-key dict for `TargetArtifactBecomesCreatureUEOT`
+     instances; emits `granted_keywords` as `sorted(eff.
+     granted_keywords)` for byte-equal determinism across cross-
+     engine probes (Python's frozenset has no canonical iteration
+     order).
+  6. **Coverage 1:1 identity mapping.** The new Rust variant name
+     `TargetArtifactBecomesCreatureUEOT` matches the Python class
+     name 1:1, so
+     `mtg_bot.parity.effect_coverage.covered_python_class_set()`
+     auto-includes the class — closes the `effect_uncovered`
+     classifier gate at the covered-set level.
+
+**Multi-gated card; classifier multi-gate state stays True after
+the cycle.** Per the round-58 subsystem-attribution classifier,
+Synthesizer Labship is multi-gated on `effect_uncovered +
+nonsafe_triggered_ability`. The cycle closes the `effect_uncovered`
+gate (the `TargetArtifactBecomesCreatureUEOT` Python class flips
+from `missing_effect_classes` to covered). The
+`nonsafe_triggered_ability` gate KEEPS the card multi-gated at the
+classifier level. The trajectory safe-trigger admit gate
+(`parity/trajectory.py::_python_ta_to_safe_dict`) is INTENTIONALLY
+NOT widened — that gate is about the production-deck bench admit
+set, a distinct concern from per-card real-EoE parity probes.
+**The card DOES move to PROBED tier through the dedicated per-card
+real-EoE byte-equal cross-engine probe**
+(`tests/test_synthesizer_labship_parity.py`), the same precedent as
+Burgeoning / Boilerbilges Ripper / Comet Crawler / Mutinous
+Massacre / Dyadrine Attack / Fanatic of the Harrowing / Terrapact
+Intimidator / Attack-in-the-Box / Hemosymbic Mite / Swarm Culler
+established.
+
+**Spacecraft Station-tier 2+ trigger-fire dispatch HONEST-STOPPED.**
+Rust has no Spacecraft Station charge-counter substrate today (cf.
+Comet Crawler / Sledge-Class Seedship cycles, all spacecraft cards
+share the same deferred-Cycle station-tier substrate gap). The
+Python trigger fires through `run_beginning_of_combat_triggers`
+after the station-tier 2+ check passes; no Rust analog for the
+Station-tier gate. The Effect substrate ships portable independent
+of the trigger-fire dispatch — the classifier-bypass per-card probe
+pattern (cf. Burgeoning's PLAYS_LAND chokepoint gap / Hemosymbic
+Mite's BECOMES_TAPPED-gated effect substrate) covers the PROBED
+tier flip directly on the Effect class via a synthetic Instant
+carrier. The full real-EoE BEGINNING_OF_COMBAT trigger-fan-out
+byte-equal probe with the station-tier 2+ gate active is a separate
+cycle that needs the Spacecraft Station charge-counter substrate
+to land first.
+
+**Animation semantics — already-creature target shrinks.** The
+post-2026-05-23-audit Python class (`b3544e8b Synthesizer Labship:
+restore "becomes a creature" animation rider`) replaces a previously
+restricted "+2/+2 + flying UEOT to a target artifact creature"
+shape with the true ``BecomeType + GrantKeywords`` composition
+applicable to non-creature artifacts too. The Rust variant matches
+the post-fix Python shape:
+
+  * Non-creature artifact target → becomes a 2/2 flying artifact
+    creature UEOT. Pinned in Python at
+    `tests/test_synthesizer_labship_animation.py::
+    test_lander_becomes_2_2_flying_creature_ueot`; pinned in Rust at
+    `test_rust_resolve_animates_first_other_artifact`.
+  * Already-creature artifact target → base P/T overridden to 2/2
+    (potentially a SHRINK — e.g. a stationed Sledge-Class Seedship
+    at 4/5 shrinks to 2/2). Pinned in Python at
+    `test_already_creature_artifact_base_pt_overridden`. The Rust
+    union reader `ueot_becomes_creature_pt` returns the LAST
+    BecomesArtifactCreature push's (p, t) per CR layer-7 last-
+    applied semantics; the effective-P/T readers honor this
+    override.
+
+**Documented residuals beyond Cycle 1.**
+
+  * Spacecraft Station charge-counter substrate gap — the trigger-
+    fire dispatch through the 2+ station-tier gate is not on Rust;
+    the per-card probe drives the Effect substrate directly via a
+    synthetic Instant carrier. Same per-card-probe precedent as
+    Burgeoning's PLAYS_LAND chokepoint gap.
+  * "Up to one" decline semantics — Python's
+    `target_count_range = (0, 1)` allows declining the target
+    entirely (an empty-targets resolve early-returns at
+    `become_type.py:75-76`). The Rust resolve mirrors this via the
+    silent-fizzle path when no eligible "other artifact" is on bf;
+    the explicit "decline despite eligible target" branch requires
+    an agent surface in `apply_effect` (currently honest-stopped —
+    same campaign-wide blocker as Boilerbilges Ripper / Optional-Sac
+    / Optional-Mana-Cost agent-driven arms).
+  * Self-exclusion at the legal-targets layer for the firing trigger
+    is pinned in Python at `test_labship_cannot_target_itself`; the
+    Rust resolve mirrors this via the `obj.id == source_obj_id`
+    exclude in the bf scan. Trigger-side "no legal target → don't
+    put on stack" is gated through Python's
+    `lever_trigger_requires_target` plumbing, which is not exercised
+    on the Rust per-card probe (the probe drives the Effect through
+    a synthetic Instant carrier, not the tier-trigger pipeline).
+
+**Location**: `rust/src/cards.rs` (enum variant + parse arm +
+to_pydict arm + unknown-kinds list extension),
+`rust/src/state.rs` (`UeotModifier::BecomesArtifactCreature`
+variant + union reader extensions), `rust/src/state_ops_combat.rs`
++ `rust/src/state_ops_legal.rs` + `rust/src/state_ops_resolve.rs`
+(reader call-site fanout to `ueot_becomes_creature_pt`),
+`rust/src/state_ops_resolve.rs` (resolve arm),
+`src/mtg_bot/parity/cross_engine.py` (dict→Python bridge arm),
+`src/mtg_bot/parity/trajectory.py` (reverse-serializer leaf),
+`tests/test_synthesizer_labship_parity.py` (12 probes — parser SoT
+pin, Python serializer round-trip including empty-keywords path,
+Rust to_pydict round-trip including empty-keywords path, covered-
+set membership, four resolve-arm unit pins, GENUINE real-EoE
+cross-engine byte-equal probe). Per-card cycle LANDED; Synthesizer
+Labship is now PROBED at the per-card parity layer (despite the
+classifier multi-gate state staying True on
+`nonsafe_triggered_ability`).
+
 ---
 
 When you take a deliberate shortcut (heuristic, approximation,

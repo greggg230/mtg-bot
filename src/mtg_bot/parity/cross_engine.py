@@ -2841,6 +2841,48 @@ def _ta_dict_to_python_effect(eff_dict: dict):
             OptionalPutLandFromHandOntoBattlefield,
         )
         return OptionalPutLandFromHandOntoBattlefield()
+    if kind == "target_artifact_becomes_creature_ueot":
+        # **Synthesizer Labship Cycle 1 (2026-05-23).** Rust's
+        # parameterized ``Effect::TargetArtifactBecomesCreatureUEOT
+        # { power, toughness, granted_keywords }`` round-trips to
+        # Python's ``TargetArtifactBecomesCreatureUEOT(power,
+        # toughness, granted_keywords)`` frozen dataclass at
+        # ``effects/generic/become_type.py:36``. Three-field
+        # parameterized — `power` and `toughness` required ints,
+        # `granted_keywords` optional list-of-strings (missing or
+        # empty list legal; the Python side flattens to a
+        # ``frozenset[str]``).
+        #
+        # **Real EoE consumer.** Synthesizer Labship ``{U}`` Artifact
+        # — Spacecraft (4/4, EoE). Tier-2+ BEGINNING_OF_COMBAT
+        # triggered ability body: "up to one other target artifact
+        # you control becomes an artifact creature with base power
+        # and toughness 2/2 and gains flying until end of turn." The
+        # parser at ``cards/parser/spacecraft_builder.py`` maps the
+        # spacecraft station-tier oracle line to
+        # ``TargetArtifactBecomesCreatureUEOT(power=2, toughness=2,
+        # granted_keywords=frozenset({"flying"}))``.
+        #
+        # **Frozenset round-trip.** Python's
+        # ``granted_keywords: frozenset[str]`` field flattens to a
+        # list on the wire dict (frozensets aren't directly
+        # JSON-/PyDict-serializable in a stable order, and the
+        # becomes-creature mechanic commutes over the keyword grant
+        # set). The bridge reconstructs the frozenset from the list.
+        # Missing key defaults to an empty frozenset (legal — Python's
+        # dataclass default is ``frozenset()``).
+        from mtg_bot.effects.generic.become_type import (
+            TargetArtifactBecomesCreatureUEOT,
+        )
+        power = int(eff_dict.get("power", 0))
+        toughness = int(eff_dict.get("toughness", 0))
+        kw_raw = eff_dict.get("granted_keywords") or []
+        granted_keywords = frozenset(str(k) for k in kw_raw)
+        return TargetArtifactBecomesCreatureUEOT(
+            power=power,
+            toughness=toughness,
+            granted_keywords=granted_keywords,
+        )
     if kind == "each_opponent_sacs_or_discards_or_takes_source_power_damage":
         # **Osseous Sticktwister Cycle 1 (2026-05-23).** Rust's field-free
         # ``Effect::EachOpponentSacsOrDiscardsOrTakesSourcePowerDamage``

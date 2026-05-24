@@ -4358,6 +4358,18 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
     from mtg_bot.effects.combinators import (
         OptionalPutLandFromHandOntoBattlefield,
     )
+    # **Synthesizer Labship Cycle 1 (2026-05-23).** Per-leaf
+    # serializer import for ``TargetArtifactBecomesCreatureUEOT(power,
+    # toughness, granted_keywords)`` — the parameterized
+    # becomes-an-artifact-creature-UEOT primitive for Synthesizer
+    # Labship's tier-2+ BEGINNING_OF_COMBAT trigger ("up to one other
+    # target artifact you control becomes a 2/2 artifact creature
+    # with flying UEOT"). Three-field — `power`/`toughness` ints +
+    # `granted_keywords` frozenset (flattens to a list on the wire
+    # dict).
+    from mtg_bot.effects.generic.become_type import (
+        TargetArtifactBecomesCreatureUEOT,
+    )
     # **Osseous Sticktwister Cycle 1 (2026-05-23).** Per-leaf serializer
     # import for ``EachOpponentSacsOrDiscardsOrTakesSourcePowerDamage()``
     # — the field-free per-opponent three-mode-choice + conditional
@@ -5416,6 +5428,24 @@ def _python_spell_effect_to_dict(spell_effect) -> Optional[dict]:
         ):
             return {
                 "kind": "optional_put_land_from_hand_onto_battlefield",
+            }
+        # **Synthesizer Labship Cycle 1 (2026-05-23).** Per-leaf
+        # serializer for ``TargetArtifactBecomesCreatureUEOT(power,
+        # toughness, granted_keywords)`` — the parameterized
+        # becomes-an-artifact-creature-UEOT primitive for Synthesizer
+        # Labship's tier-2+ BEGINNING_OF_COMBAT trigger ("up to one
+        # other target artifact you control becomes a 2/2 artifact
+        # creature with flying UEOT"). Three-field — emits `power` +
+        # `toughness` as ints + `granted_keywords` as a sorted
+        # list-of-strings (the Python frozenset has no canonical
+        # iteration order; sort for byte-equal determinism across
+        # cross-engine probes).
+        if isinstance(eff, TargetArtifactBecomesCreatureUEOT):
+            return {
+                "kind": "target_artifact_becomes_creature_ueot",
+                "power": int(eff.power),
+                "toughness": int(eff.toughness),
+                "granted_keywords": sorted(eff.granted_keywords),
             }
         # **Osseous Sticktwister Cycle 1 (2026-05-23).** Per-leaf
         # serializer for

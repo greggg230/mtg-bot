@@ -491,7 +491,7 @@ fn legal_effective_power(state: &GameState, obj_id: u32) -> i32 {
     let base = obj
         .ueot_base_pt_override()
         .map(|(p, _)| p)
-        .or_else(|| obj.ueot_becomes_land_creature_pt().map(|(p, _)| p))
+        .or_else(|| obj.ueot_becomes_creature_pt().map(|(p, _)| p))
         .unwrap_or(printed_base);
     base + obj.ueot_power_bonus() + obj.counters
 }

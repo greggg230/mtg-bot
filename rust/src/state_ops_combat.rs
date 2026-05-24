@@ -783,7 +783,7 @@ fn battlefield_creature_power(state: &GameState, obj_id: u32) -> i16 {
     let base = obj
         .and_then(|o| o.ueot_base_pt_override())
         .map(|(p, _)| p)
-        .or_else(|| obj.and_then(|o| o.ueot_becomes_land_creature_pt()).map(|(p, _)| p))
+        .or_else(|| obj.and_then(|o| o.ueot_becomes_creature_pt()).map(|(p, _)| p))
         .or_else(|| aura_set_base_pt_on(state, obj_id).map(|(p, _)| p))
         .or_else(|| dynamic_base_pt_pub(state, obj_id).map(|(p, _)| p))
         .unwrap_or(printed_base);
@@ -1092,7 +1092,7 @@ fn battlefield_creature_toughness(state: &GameState, obj_id: u32) -> i16 {
     let base = obj
         .and_then(|o| o.ueot_base_pt_override())
         .map(|(_, t)| t)
-        .or_else(|| obj.and_then(|o| o.ueot_becomes_land_creature_pt()).map(|(_, t)| t))
+        .or_else(|| obj.and_then(|o| o.ueot_becomes_creature_pt()).map(|(_, t)| t))
         .or_else(|| aura_set_base_pt_on(state, obj_id).map(|(_, t)| t))
         .or_else(|| dynamic_base_pt_pub(state, obj_id).map(|(_, t)| t))
         .unwrap_or(printed_base);

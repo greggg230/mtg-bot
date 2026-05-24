@@ -382,6 +382,39 @@ pub enum UeotModifier {
         toughness: i32,
         color_or_subtype: String,
     },
+    /// **Synthesizer Labship Cycle 1 closure (2026-05-23).**
+    /// CR 613.4 + 613.6 + 613.7b — "becomes a P/T artifact creature
+    /// UEOT (and gains <keywords>)" composite. Models Synthesizer
+    /// Labship's 2+ tier-trigger rider: "up to one other target
+    /// artifact you control becomes an artifact creature with base
+    /// power and toughness 2/2 and gains flying until end of turn"
+    /// (the `TargetArtifactBecomesCreatureUEOT` Effect's UEOT mint
+    /// site). Sibling of `BecomesLandCreature` — same "this object
+    /// is a creature RIGHT NOW with base P/T (p, t)" semantics, but
+    /// the Artifact half of the type union is the printed type
+    /// (already-artifact target), so no land-subtype field. Granted
+    /// keywords ride INSIDE this variant rather than via a sibling
+    /// `GrantKeyword` push — keeps the UEOT modifier set atomic
+    /// (Python composes `ApplyEffect(BecomeType, EndOfTurn)` +
+    /// `ApplyEffect(GrantKeywords, EndOfTurn)`; Rust's flatter
+    /// representation bakes them together because the
+    /// becomes-creature half and the gains-keywords half always
+    /// expire as one set in the EoE Synthesizer-Labship-shape).
+    ///
+    /// **Readers that consume this variant.**
+    ///   * `ueot_is_creature_via_become` — gate flag.
+    ///   * `ueot_becomes_creature_pt` — (power, toughness) readback
+    ///     (replaces `ueot_becomes_land_creature_pt` for both
+    ///     variants; the original is kept for the manland call
+    ///     sites, but `ueot_becomes_creature_pt` covers BOTH the
+    ///     land and artifact-creature animations).
+    ///   * `ueot_has_keyword` — folds `granted_keywords` into the
+    ///     keyword query so combat readers see flying/etc.
+    BecomesArtifactCreature {
+        power: i32,
+        toughness: i32,
+        granted_keywords: Vec<String>,
+    },
     /// CR 613.4 layer 7b — set base P/T (override). Models Python's
     /// `SetBasePTUntilEOT(power, toughness)` (Genemorph-Imago-shape
     /// "target creature has base power and toughness N/N until end of
@@ -523,6 +556,7 @@ impl GameObject {
             match m {
                 UeotModifier::PowerToughnessBonus { power, .. } => sum += *power,
                 UeotModifier::BecomesLandCreature { .. } => {}
+                UeotModifier::BecomesArtifactCreature { .. } => {}
                 UeotModifier::GrantKeyword { .. } => {}
                 UeotModifier::SetBasePT { .. } => {}
                 // Round-60 Perigee dies-rider marker: no P/T effect
@@ -541,6 +575,7 @@ impl GameObject {
             match m {
                 UeotModifier::PowerToughnessBonus { toughness, .. } => sum += *toughness,
                 UeotModifier::BecomesLandCreature { .. } => {}
+                UeotModifier::BecomesArtifactCreature { .. } => {}
                 UeotModifier::GrantKeyword { .. } => {}
                 UeotModifier::SetBasePT { .. } => {}
                 // Round-60 Perigee dies-rider marker: no P/T effect.
@@ -576,6 +611,14 @@ impl GameObject {
     /// creature RIGHT NOW with base P/T (p, t)". The land also stays
     /// a land for the duration (CR 305.3), but the type-union piece is
     /// handled at the type-set reader level, not on this method.
+    ///
+    /// **Sibling reader for the artifact-animation variant.** Use
+    /// `ueot_becomes_creature_pt` to read EITHER the land-animate or
+    /// the artifact-animate base-P/T override; this manland-specific
+    /// method is kept for the existing manland call sites that
+    /// semantically expect "land creature only" but functionally any
+    /// caller that just wants the override should prefer the union
+    /// reader.
     pub fn ueot_becomes_land_creature_pt(&self) -> Option<(i32, i32)> {
         let mut last: Option<(i32, i32)> = None;
         for m in &self.ueot_modifiers {
@@ -586,15 +629,55 @@ impl GameObject {
         last
     }
 
-    /// True iff some `UeotModifier::BecomesLandCreature` is on this
-    /// object — the "this permanent is a creature RIGHT NOW even if
-    /// its printing has no printed power" gate. Used by effective-P/T
-    /// readers and the effective-creature-type predicate to fold the
-    /// manland-animate window into combat-relevant queries.
+    /// **Synthesizer Labship Cycle 1 (2026-05-23) — UEOT
+    /// becomes-a-creature P/T override (union reader).** If EITHER a
+    /// `BecomesLandCreature` (manland-animate) OR a
+    /// `BecomesArtifactCreature` (`TargetArtifactBecomesCreatureUEOT`'s
+    /// mint) is on this object, return the `(power, toughness)` of
+    /// the LAST such entry in the Vec (most-recent push wins;
+    /// CR layer-7 last-applied semantics across BOTH variants
+    /// uniformly).
+    ///
+    /// Used by effective-P/T readers to read the becomes-a-creature
+    /// base-P/T override regardless of which animation flavor minted
+    /// it. The manland-specific `ueot_becomes_land_creature_pt`
+    /// remains as a kept sibling so existing call sites don't
+    /// behavior-shift; new readers (and any reader that just wants
+    /// the override value) should use THIS method.
+    pub fn ueot_becomes_creature_pt(&self) -> Option<(i32, i32)> {
+        let mut last: Option<(i32, i32)> = None;
+        for m in &self.ueot_modifiers {
+            match m {
+                UeotModifier::BecomesLandCreature {
+                    power, toughness, ..
+                }
+                | UeotModifier::BecomesArtifactCreature {
+                    power, toughness, ..
+                } => {
+                    last = Some((*power, *toughness));
+                }
+                _ => {}
+            }
+        }
+        last
+    }
+
+    /// True iff some `UeotModifier::BecomesLandCreature` OR
+    /// `UeotModifier::BecomesArtifactCreature` is on this object —
+    /// the "this permanent is a creature RIGHT NOW even if its
+    /// printing has no printed creature type" gate. Used by
+    /// effective-P/T readers and the effective-creature-type
+    /// predicate to fold the manland-animate AND the
+    /// `TargetArtifactBecomesCreatureUEOT` animation window into
+    /// combat-relevant queries.
     pub fn ueot_is_creature_via_become(&self) -> bool {
-        self.ueot_modifiers
-            .iter()
-            .any(|m| matches!(m, UeotModifier::BecomesLandCreature { .. }))
+        self.ueot_modifiers.iter().any(|m| {
+            matches!(
+                m,
+                UeotModifier::BecomesLandCreature { .. }
+                    | UeotModifier::BecomesArtifactCreature { .. }
+            )
+        })
     }
 
     /// True iff some `UeotModifier::GrantKeyword` on this object
@@ -603,12 +686,27 @@ impl GameObject {
     /// `parse_printing`). Used by combat readers as a "does this
     /// creature have haste/flying/... RIGHT NOW" gate that folds
     /// printed keywords with UEOT-granted keywords.
+    ///
+    /// **Synthesizer Labship Cycle 1 widen (2026-05-23).** Also
+    /// checks `BecomesArtifactCreature.granted_keywords` for the
+    /// `TargetArtifactBecomesCreatureUEOT` rider grants (e.g.
+    /// "becomes a 2/2 artifact creature with flying UEOT" — the
+    /// "flying" rides on the same UEOT modifier as the becomes-
+    /// creature flip, so this reader has to read both halves).
     pub fn ueot_has_keyword(&self, keyword: &str) -> bool {
         for m in &self.ueot_modifiers {
-            if let UeotModifier::GrantKeyword { keyword: k } = m {
-                if k == keyword {
+            match m {
+                UeotModifier::GrantKeyword { keyword: k } if k == keyword => {
                     return true;
                 }
+                UeotModifier::BecomesArtifactCreature {
+                    granted_keywords, ..
+                } => {
+                    if granted_keywords.iter().any(|k| k == keyword) {
+                        return true;
+                    }
+                }
+                _ => {}
             }
         }
         false

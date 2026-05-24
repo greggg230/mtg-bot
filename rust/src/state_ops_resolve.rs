@@ -1748,7 +1748,7 @@ fn read_battlefield_creature_power(state: &GameState, obj_id: u32) -> i16 {
     let base = obj
         .ueot_base_pt_override()
         .map(|(p, _)| p)
-        .or_else(|| obj.ueot_becomes_land_creature_pt().map(|(p, _)| p))
+        .or_else(|| obj.ueot_becomes_creature_pt().map(|(p, _)| p))
         .unwrap_or(printed_base);
     let bonus = obj.ueot_power_bonus();
     let effective = base + bonus;
@@ -1818,7 +1818,7 @@ fn read_doubling_power(state: &GameState, obj_id: u32) -> i32 {
         .ueot_base_pt_override()
         .map(|(p, _)| p)
         .or_else(|| {
-            obj.ueot_becomes_land_creature_pt().map(|(p, _)| p)
+            obj.ueot_becomes_creature_pt().map(|(p, _)| p)
         })
         .unwrap_or(printed_base);
     base + obj.ueot_power_bonus() + obj.counters
@@ -1877,7 +1877,7 @@ fn read_famished_source_power(state: &GameState, obj_id: u32) -> i32 {
         .ueot_base_pt_override()
         .map(|(p, _)| p)
         .or_else(|| {
-            obj.ueot_becomes_land_creature_pt().map(|(p, _)| p)
+            obj.ueot_becomes_creature_pt().map(|(p, _)| p)
         })
         .unwrap_or(printed_base);
     base + obj.ueot_power_bonus() + obj.counters
@@ -21600,6 +21600,118 @@ fn apply_effect(
             // unused on this arm. The compiler is satisfied by the
             // function's existing parameter binding.
             let _ = source_obj_id; // unused; silent no-op
+        }
+        // **Synthesizer Labship Cycle 1 (2026-05-23).** Resolve arm
+        // for ``TargetArtifactBecomesCreatureUEOT``. Mirrors Python's
+        // ``effects/generic/become_type.py:TargetArtifactBecomesCreatureUEOT.resolve``
+        // (the dataclass body at lines 36-108 of the file).
+        //
+        // **Target selection — deterministic first-pick.** Same
+        // shape as ``TapTargetArtifactOrCreature`` /
+        // ``SetBasePTUntilEOT`` / ``PumpTargetCreatureUntilEOT``:
+        // walk source-controller's battlefield in zone-iteration
+        // order; pick the FIRST artifact whose id != source_obj_id
+        // (the "other" filter — CR 109.5 + Python's
+        // ``legal_targets``-side ``o.id != source_id`` exclude at
+        // ``become_type.py:62``).
+        //
+        // No eligible target → silent fizzle (mirrors Python's
+        // ``if not targets: return`` early-return at
+        // ``become_type.py:75-76``; equivalently the bf scan
+        // yielding ``None``).
+        //
+        // **Mutation.** Push ONE
+        // ``UeotModifier::BecomesArtifactCreature { power, toughness,
+        // granted_keywords }`` onto the target's ``ueot_modifiers``
+        // Vec. The CR 514.3 cleanup pass clears all UEOT modifiers,
+        // reverting the artifact to its pre-animation state. The
+        // effective-P/T readers + the effective-creature-type
+        // predicate + the effective-keyword reader all consult
+        // ``BecomesArtifactCreature`` via the union helpers landed
+        // in ``state.rs`` (``ueot_becomes_creature_pt``,
+        // ``ueot_is_creature_via_become``, ``ueot_has_keyword``).
+        //
+        // **Source-controller resolution (5-zone walk).** The Effect
+        // semantics scope target eligibility to ``controller_id``'s
+        // battlefield; the controller is the player who owns the
+        // source GameObject at resolve time. Standard 5-zone walk
+        // (hand/library/battlefield/graveyard/exile) per the
+        // SetBasePT precedent. If the source is untrackable (zone-
+        // moved between push and resolve), silent fizzle.
+        Effect::TargetArtifactBecomesCreatureUEOT {
+            power,
+            toughness,
+            granted_keywords,
+        } => {
+            // Source-controller resolution (5-zone walk).
+            let mut src_controller: Option<u8> = None;
+            'outer_tabcu: for player in &state.players {
+                for zone in [
+                    &player.hand,
+                    &player.library,
+                    &player.battlefield,
+                    &player.graveyard,
+                    &player.exile,
+                ] {
+                    if let Some(obj) = zone.iter().find(|o| o.id == source_obj_id) {
+                        src_controller = Some(obj.controller);
+                        break 'outer_tabcu;
+                    }
+                }
+            }
+            // Stack-side controller fallback (the source may still be
+            // on the stack at the moment apply_effect runs — e.g. for
+            // bare-Effect probe paths that push a synthetic Instant
+            // carrier; same fallback pattern as
+            // ``ConditionalOnTappedCreatures``).
+            if src_controller.is_none() {
+                if let Some(item) = state
+                    .stack
+                    .iter()
+                    .find(|i| i.source_obj_id == source_obj_id)
+                {
+                    src_controller = Some(item.controller);
+                }
+            }
+            let Some(controller) = src_controller else {
+                return Ok(()); // source untrackable → silent fizzle
+            };
+            let cidx = controller as usize;
+            // Pick FIRST artifact on controller's bf that is NOT the
+            // source itself. "Other" filter — CR 109.5 + Python's
+            // legal_targets exclude.
+            let target_id: Option<u32> = {
+                let bf = &state.players[cidx].battlefield;
+                let registry = &state.registry;
+                bf.iter().find_map(|obj| {
+                    if obj.id == source_obj_id {
+                        return None;
+                    }
+                    let printing = registry.printings.get(obj.printing_id as usize)?;
+                    if printing.card_types.iter().any(|t| t == "Artifact") {
+                        Some(obj.id)
+                    } else {
+                        None
+                    }
+                })
+            };
+            let Some(target_id) = target_id else {
+                return Ok(()); // no eligible target → silent fizzle
+            };
+            // Push the UEOT modifier onto the target.
+            let zone: &mut Vec<GameObject> =
+                Arc::make_mut(&mut state.players[cidx].battlefield);
+            for obj in zone.iter_mut() {
+                if obj.id == target_id {
+                    obj.ueot_modifiers
+                        .push(UeotModifier::BecomesArtifactCreature {
+                            power: *power,
+                            toughness: *toughness,
+                            granted_keywords: granted_keywords.clone(),
+                        });
+                    break;
+                }
+            }
         }
     }
     Ok(())
