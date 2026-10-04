@@ -462,6 +462,230 @@ def _resolve_structured_dim(
     return nested.get(nested_key)
 
 
+# --------------------------------------------------------------------------
+# Metadata -> evaluator kwargs: the ONE place that decides how a
+# checkpoint's recorded value-head options are applied.
+#
+# Every path that turns registered weights into an evaluator --
+# ``NNEvaluator.from_metadata`` (calibrate-value, replay annotator),
+# ``NNPimcConfig.build`` (every worker self-play / eval game, iterate's
+# local arenas, ``mtg_bot ladder``, capture, bench) and the SHM eval
+# server -- goes through ``structured_kwargs_from_metadata`` (structured
+# trunks) or ``check_flat_metadata_value_options`` (MLP trunks). Before
+# 2026-10-04 ``NNPimcConfig.build`` read the trunk dims itself and never
+# passed ``value_calibration`` / ``value_head_input``, so every played
+# game (self-play, arenas, ladders) ran the value head uncalibrated
+# while the held-out gate graded the calibrated one.
+# --------------------------------------------------------------------------
+
+
+def _meta_field(metadata: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` off a ``ModelMetadata`` (or any attribute bag) or a
+    raw ``metadata.json`` dict. Missing / ``None`` -> ``default``."""
+    if isinstance(metadata, dict):
+        value = metadata.get(key, default)
+    else:
+        value = getattr(metadata, key, default)
+    return default if value is None else value
+
+
+def resolve_value_calibration(
+    metadata: Any,
+    *,
+    structured: bool = True,
+    apply_value_calibration: bool = True,
+) -> tuple[float, float]:
+    """``(temperature, bias)`` to apply to the value head's pre-tanh
+    logit, from ``metadata.value_calibration`` (falling back to
+    ``metadata.training.value_calibration``).
+
+    Absent / empty / ``identity`` -> ``(1.0, 0.0)``, i.e. bit-identical
+    to an uncalibrated head. ``apply_value_calibration=False`` returns
+    the identity unconditionally (the explicit ``+nocal`` opt-out; the
+    recorded fit is still validated so a corrupt record is not hidden
+    behind the flag).
+
+    Fails loudly (``ValueError``) on anything this builder cannot apply
+    exactly: the post-tanh ``output_shrink`` method, an unknown method,
+    an ``identity`` record carrying non-identity parameters, a
+    ``logit_temperature`` record with ``scale != 1``, or any non-identity
+    calibration on a flat MLP trunk (which has no logit hook). A
+    silently-dropped calibration changes the leaf values search backs
+    up, so "can't apply" must never degrade to "ignore".
+    """
+    from mtg_bot.training.value_calibration import (
+        CALIBRATION_IDENTITY,
+        CALIBRATION_LOGIT_TEMPERATURE,
+        CALIBRATION_OUTPUT_SHRINK,
+        ValueCalibration,
+    )
+
+    training = _meta_field(metadata, "training", {}) or {}
+    raw = (
+        _meta_field(metadata, "value_calibration", None)
+        or training.get("value_calibration")
+    )
+    calibration = ValueCalibration.from_dict(raw)
+    method = calibration.method
+    if method == CALIBRATION_OUTPUT_SHRINK:
+        raise ValueError(
+            "metadata.value_calibration uses the 'output_shrink' method, "
+            "which the evaluator cannot apply (it calibrates the "
+            "pre-tanh logit). Re-run `mtg_bot calibrate-value` for "
+            "this version."
+        )
+    if method not in (CALIBRATION_IDENTITY, CALIBRATION_LOGIT_TEMPERATURE):
+        raise ValueError(
+            f"metadata.value_calibration has unknown method {method!r}; "
+            f"expected {CALIBRATION_IDENTITY!r} or "
+            f"{CALIBRATION_LOGIT_TEMPERATURE!r}."
+        )
+    if method == CALIBRATION_IDENTITY:
+        if not (
+            calibration.temperature == 1.0
+            and calibration.bias == 0.0
+            and calibration.scale == 1.0
+        ):
+            raise ValueError(
+                "metadata.value_calibration says method 'identity' but "
+                f"carries temperature={calibration.temperature} "
+                f"bias={calibration.bias} scale={calibration.scale}; "
+                "refusing to guess which one is meant."
+            )
+        return 1.0, 0.0
+    # logit_temperature
+    if calibration.scale != 1.0:
+        raise ValueError(
+            "metadata.value_calibration 'logit_temperature' record "
+            f"carries scale={calibration.scale}; the evaluator applies "
+            "temperature/bias on the logit only."
+        )
+    temperature = float(calibration.temperature)
+    bias = float(calibration.bias)
+    if not apply_value_calibration:
+        return 1.0, 0.0
+    if not structured and not (temperature == 1.0 and bias == 0.0):
+        raise ValueError(
+            "metadata.value_calibration is set on a flat MLP checkpoint "
+            f"(temperature={temperature}, bias={bias}), but only the "
+            "structured trunk exposes the pre-tanh logit the "
+            "calibration applies to."
+        )
+    return temperature, bias
+
+
+def structured_kwargs_from_metadata(
+    metadata: Any,
+    *,
+    apply_value_calibration: bool = True,
+) -> dict[str, Any]:
+    """Every ``structured_*`` keyword of ``NNEvaluator`` /
+    ``SharedTensorNNEvalServer`` resolved from a structured checkpoint's
+    metadata (``ModelMetadata`` or the raw ``metadata.json`` dict):
+    trunk dims (flat ``training.structured_*`` or nested
+    ``training.structured_config``, see ``_resolve_structured_dim``),
+    the scalar schema, the value-head input and the post-hoc value
+    calibration (``resolve_value_calibration``).
+
+    ``None`` values mean "the model's default"; the constructors skip
+    them. An unsupported ``value_head_input`` is rejected by
+    ``StructuredModelConfig`` at build time (loud ``ValueError``).
+    """
+    training = _meta_field(metadata, "training", {}) or {}
+    _resolve = _resolve_structured_dim
+    # Scalar schema: a real ``ModelMetadata`` always carries
+    # ``scalar_schema_version`` (``from_dict`` defaults a missing key to
+    # 1 -- the pre-v2 3-slot layout). A raw ``metadata.json`` without
+    # the key, and with no ``training`` mirror of it, is a pre-v2
+    # checkpoint too, so it resolves to 1 as well; duck-typed stand-ins
+    # with neither fall through to ``StructuredModelConfig``'s default.
+    scalar_schema_version = _meta_field(metadata, "scalar_schema_version")
+    if scalar_schema_version is None:
+        scalar_schema_version = _resolve(
+            training,
+            "structured_scalar_schema_version",
+            "scalar_schema_version",
+        )
+    if scalar_schema_version is None and isinstance(metadata, dict):
+        scalar_schema_version = 1
+    temperature, bias = resolve_value_calibration(
+        metadata,
+        structured=True,
+        apply_value_calibration=apply_value_calibration,
+    )
+    return {
+        "structured_scalar_schema_version": (
+            int(scalar_schema_version)
+            if scalar_schema_version is not None else None
+        ),
+        "structured_value_head_input": _resolve(
+            training, "structured_value_head_input", "value_head_input",
+        ),
+        "structured_value_temperature": temperature,
+        "structured_value_bias": bias,
+        "structured_emb_dim": _resolve(
+            training, "structured_emb_dim", "emb_dim",
+        ),
+        "structured_n_heads": _resolve(
+            training, "structured_n_heads", "n_heads",
+        ),
+        "structured_n_layers": _resolve(
+            training, "structured_n_layers", "n_layers",
+        ),
+        "structured_hidden_dim": _resolve(
+            training, "structured_hidden_dim", "hidden_dim",
+        ),
+        "structured_action_history_n": _resolve(
+            training, "structured_action_history_n", "action_history_n",
+        ),
+        "structured_n_printings": _resolve(
+            training, "structured_n_printings", "n_printings",
+        ),
+        "structured_action_vocab_size": _resolve(
+            training, "structured_action_vocab_size", "action_vocab_size",
+        ),
+        "structured_enable_hand_belief_head": _resolve(
+            training,
+            "structured_enable_hand_belief_head",
+            "enable_hand_belief_head",
+        ),
+        "structured_dropout": _resolve(
+            training, "structured_dropout", "dropout",
+        ),
+    }
+
+
+def check_flat_metadata_value_options(
+    metadata: Any,
+    *,
+    apply_value_calibration: bool = True,
+) -> None:
+    """Refuse value-head options a flat MLP trunk cannot honour.
+
+    The MLP architectures (``shared`` / ``separate``) have neither a
+    pre-tanh logit hook nor alternative value-head inputs, so a
+    checkpoint whose metadata declares a non-identity calibration
+    (unless the caller explicitly opted out of applying it) or a
+    ``value_head_input`` other than the shared trunk raises here
+    instead of loading with those options silently dropped.
+    """
+    resolve_value_calibration(
+        metadata,
+        structured=False,
+        apply_value_calibration=apply_value_calibration,
+    )
+    training = _meta_field(metadata, "training", {}) or {}
+    head_input = _resolve_structured_dim(
+        training, "structured_value_head_input", "value_head_input",
+    )
+    if head_input not in (None, "trunk"):
+        raise ValueError(
+            f"metadata declares value_head_input={head_input!r} on a "
+            "flat MLP checkpoint; only the structured trunk supports "
+            "alternative value-head inputs."
+        )
+
+
 class NNEvaluator(Evaluator):
     """Wraps a ``_ValueMLP`` in the ``Evaluator`` interface.
 
@@ -1228,6 +1452,7 @@ class NNEvaluator(Evaluator):
         metadata: Any,
         *,
         device: str = "cpu",
+        apply_value_calibration: bool = True,
     ) -> "NNEvaluator":
         """Construct an evaluator dispatched on a
         ``ModelMetadata.architecture`` field.
@@ -1267,59 +1492,25 @@ class NNEvaluator(Evaluator):
         while the loader read flat, so any non-default-trunk bootstrap
         silently fell back to the defaults until the v13 attempt
         surfaced the resulting weight-shape mismatch.
+
+        ``metadata`` may be a ``ModelMetadata``, any attribute bag, or
+        the raw ``metadata.json`` dict (what ``NNPimcConfig.build``
+        reads next to the weights). The structured kwargs -- trunk
+        dims, scalar schema, ``value_head_input`` and the post-hoc
+        ``value_calibration`` -- come from
+        :func:`structured_kwargs_from_metadata`, the single resolver
+        every evaluator-construction path shares.
+        ``apply_value_calibration=False`` loads the head uncalibrated
+        (the ladder's ``+nocal`` control); the default applies it.
+        Value-head options the architecture cannot honour raise
+        ``ValueError`` (see :func:`resolve_value_calibration` /
+        :func:`check_flat_metadata_value_options`).
         """
-        architecture = getattr(metadata, "architecture", "shared")
-        action_encoding_version = getattr(
+        architecture = _meta_field(metadata, "architecture", "shared")
+        action_encoding_version = _meta_field(
             metadata, "action_encoding_version", "positional_v1",
         )
         if architecture == ARCHITECTURE_STRUCTURED:
-            training = getattr(metadata, "training", {}) or {}
-            _resolve = _resolve_structured_dim
-            # Scalar schema: a real ``ModelMetadata`` always carries
-            # ``scalar_schema_version`` (``from_dict`` defaults a
-            # missing key to 1 — the pre-v2 3-slot layout). Duck-typed
-            # stand-ins without the attribute fall back to the
-            # ``training`` dict (flat ``structured_scalar_schema_version``
-            # or nested ``structured_config.scalar_schema_version``,
-            # both written by ``mtg_bot train``) and finally to
-            # ``StructuredModelConfig``'s default.
-            scalar_schema_version = getattr(
-                metadata, "scalar_schema_version", None,
-            )
-            if scalar_schema_version is None:
-                scalar_schema_version = _resolve(
-                    training,
-                    "structured_scalar_schema_version",
-                    "scalar_schema_version",
-                )
-            # Post-hoc value calibration. Lives at the TOP level of
-            # metadata (``ModelMetadata.value_calibration``) because
-            # it is re-fittable without retraining — ``mtg_bot
-            # calibrate-value`` rewrites only that key. Absent /
-            # empty (every pre-2026-09-25 checkpoint) => identity,
-            # i.e. bit-identical inference to before.
-            from mtg_bot.training.value_calibration import (
-                CALIBRATION_OUTPUT_SHRINK,
-                ValueCalibration,
-            )
-
-            calibration = ValueCalibration.from_dict(
-                getattr(metadata, "value_calibration", None)
-                or training.get("value_calibration"),
-            )
-            if calibration.method == CALIBRATION_OUTPUT_SHRINK:
-                # A structured model always exposes its pre-tanh
-                # logit, so a structured checkpoint should never
-                # carry the post-tanh fallback fit. If one does, the
-                # temperature path cannot express it — say so loudly
-                # rather than silently shipping uncalibrated values.
-                raise ValueError(
-                    "metadata.value_calibration uses the "
-                    "'output_shrink' method, which the structured "
-                    "model cannot apply (it calibrates the pre-tanh "
-                    "logit). Re-run `mtg_bot calibrate-value` for "
-                    "this version."
-                )
             return cls(
                 weights_path=weights_path,
                 device=device,
@@ -1329,60 +1520,26 @@ class NNEvaluator(Evaluator):
                 # stamp is already merged in by Registry.load_metadata).
                 # Empty -> NNEvaluator resolves it next to weights_path
                 # and refuses an unstamped checkpoint.
-                card_vocab=(
-                    getattr(metadata, "card_vocab", None) or None
-                ),
-                structured_scalar_schema_version=scalar_schema_version,
-                structured_value_head_input=_resolve(
-                    training,
-                    "structured_value_head_input",
-                    "value_head_input",
-                ),
-                structured_value_temperature=calibration.temperature,
-                structured_value_bias=calibration.bias,
-                structured_emb_dim=_resolve(
-                    training, "structured_emb_dim", "emb_dim",
-                ),
-                structured_n_heads=_resolve(
-                    training, "structured_n_heads", "n_heads",
-                ),
-                structured_n_layers=_resolve(
-                    training, "structured_n_layers", "n_layers",
-                ),
-                structured_hidden_dim=_resolve(
-                    training, "structured_hidden_dim", "hidden_dim",
-                ),
-                structured_action_history_n=_resolve(
-                    training,
-                    "structured_action_history_n",
-                    "action_history_n",
-                ),
-                structured_n_printings=_resolve(
-                    training, "structured_n_printings", "n_printings",
-                ),
-                structured_action_vocab_size=_resolve(
-                    training,
-                    "structured_action_vocab_size",
-                    "action_vocab_size",
-                ),
-                structured_enable_hand_belief_head=_resolve(
-                    training,
-                    "structured_enable_hand_belief_head",
-                    "enable_hand_belief_head",
-                ),
-                structured_dropout=_resolve(
-                    training, "structured_dropout", "dropout",
+                card_vocab=(_meta_field(metadata, "card_vocab") or None),
+                **structured_kwargs_from_metadata(
+                    metadata,
+                    apply_value_calibration=apply_value_calibration,
                 ),
             )
         # MLP architectures (shared / separate). Hidden sizes default
         # to HIDDEN_SIZES when metadata's hidden_sizes is empty or
-        # absent (back-compat for v1-/v2-style metadata).
-        hidden_sizes_meta = getattr(metadata, "hidden_sizes", None) or ()
+        # absent (back-compat for v1-/v2-style metadata). No logit hook
+        # and no alternative value-head inputs: refuse metadata that
+        # declares either rather than dropping it.
+        check_flat_metadata_value_options(
+            metadata, apply_value_calibration=apply_value_calibration,
+        )
+        hidden_sizes_meta = _meta_field(metadata, "hidden_sizes", ()) or ()
         hidden_sizes = (
             tuple(hidden_sizes_meta) if hidden_sizes_meta else HIDDEN_SIZES
         )
-        with_policy = getattr(metadata, "with_policy", False)
-        training = getattr(metadata, "training", {}) or {}
+        with_policy = bool(_meta_field(metadata, "with_policy", False))
+        training = _meta_field(metadata, "training", {}) or {}
         policy_hidden_sizes_meta = (
             tuple(training.get("policy_hidden_sizes") or ()) or None
         )

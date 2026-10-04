@@ -39,7 +39,10 @@ from mtg_bot.search import (
 from mtg_bot.search.evaluator import Evaluator
 from mtg_bot.search.heuristic_evaluator import MtgHeuristicEvaluator
 from mtg_bot.search.nn_eval_server import NNEvalClient, NNServerHandle
-from mtg_bot.search.nn_evaluator import NNEvaluator
+from mtg_bot.search.nn_evaluator import (
+    NNEvaluator,
+    check_flat_metadata_value_options,
+)
 from mtg_bot.search.strategy import SearchStrategy
 
 
@@ -266,6 +269,14 @@ class NNPimcConfig:
     # ``torch.cuda.is_available()`` already primed the CUDA context
     # before the pool fork()ed.
     device: Optional[str] = None
+    # Apply the checkpoint's post-hoc value calibration
+    # (``metadata.value_calibration``: ``tanh(logit / T + b)``). True
+    # (default) is the correct behaviour and matches
+    # ``NNEvaluator.from_metadata``; False reproduces the pre-2026-10-04
+    # build path, which never applied it (``mtg_bot ladder`` label
+    # modifier ``+nocal``). Only consulted when a ``metadata.json`` sits
+    # next to ``weights_path``.
+    apply_value_calibration: bool = True
 
     def __post_init__(self) -> None:
         if self.use_belief_weighted and not self.use_ismcts:
@@ -324,76 +335,48 @@ class NNPimcConfig:
                 eval_kwargs["action_encoding_version"] = (
                     self.action_encoding_version
                 )
-            # Structured-architecture trunk hparams live in the
-            # version's metadata.json under ``training.structured_*``.
-            # NNPimcConfig itself doesn't carry these (the spec
-            # predates the structured trunk) so we discover them
-            # from the weights-path sibling. Without this discovery,
-            # NNEvaluator falls back to ``StructuredModelConfig``'s
-            # defaults (emb=128, layers=2, hidden=256) and any
-            # checkpoint trained with non-default dims fails with a
-            # state_dict shape mismatch on every worker.
-            if self.architecture == "structured":
-                meta_path = Path(self.weights_path).parent / "metadata.json"
-                if meta_path.is_file():
-                    try:
-                        import json as _json
-                        with meta_path.open("r", encoding="utf-8") as _f:
-                            _meta = _json.load(_f)
-                        _training = _meta.get("training") or {}
-                        # The trainer's canonical schema nests the
-                        # structured-trunk hparams under
-                        # ``training.structured_config`` (v5/v7/v8 all
-                        # use this). Newer versions may also surface
-                        # flat ``training.structured_<field>`` keys.
-                        # Read the nested dict first; fall back to flat.
-                        _sc = _training.get("structured_config") or {}
-                        # Scalar schema (token_scalars row layout).
-                        # Top-level ``scalar_schema_version`` is the
-                        # canonical ``ModelMetadata`` field; the
-                        # trainer also mirrors it into the nested /
-                        # flat ``training`` layouts. A metadata.json
-                        # with NONE of them is a pre-v2 checkpoint ->
-                        # schema 1 (the 3-slot layout), matching
-                        # ``ModelMetadata.from_dict``'s default.
-                        _ssv = _meta.get("scalar_schema_version")
-                        if _ssv is None:
-                            _ssv = _sc.get("scalar_schema_version")
-                        if _ssv is None:
-                            _ssv = _training.get(
-                                "structured_scalar_schema_version"
-                            )
-                        eval_kwargs["structured_scalar_schema_version"] = (
-                            int(_ssv) if _ssv is not None else 1
-                        )
-                        for _nest_key, _flat_key, _dst in (
-                            ("emb_dim", "structured_emb_dim",
-                             "structured_emb_dim"),
-                            ("n_heads", "structured_n_heads",
-                             "structured_n_heads"),
-                            ("n_layers", "structured_n_layers",
-                             "structured_n_layers"),
-                            ("hidden_dim", "structured_hidden_dim",
-                             "structured_hidden_dim"),
-                            ("action_history_n",
-                             "structured_action_history_n",
-                             "structured_action_history_n"),
-                            ("n_printings",
-                             "structured_n_printings",
-                             "structured_n_printings"),
-                        ):
-                            if _sc.get(_nest_key) is not None:
-                                eval_kwargs[_dst] = _sc[_nest_key]
-                            elif _training.get(_flat_key) is not None:
-                                eval_kwargs[_dst] = _training[_flat_key]
-                    except (OSError, ValueError):
-                        # Defensive: a malformed metadata.json should not
-                        # crash the worker. Fall through to the default
-                        # config; the resulting state_dict-shape error
-                        # is still a much better failure surface than
-                        # a silent wrong-config load.
-                        pass
-            evaluator = NNEvaluator(**eval_kwargs)
+            # The version's ``metadata.json`` next to the weights is
+            # the source of truth for everything NNPimcConfig itself
+            # doesn't carry: the structured trunk dims, scalar schema,
+            # value-head input and post-hoc value calibration. It goes
+            # through the SAME resolver as ``NNEvaluator.from_metadata``
+            # (``nn_evaluator.structured_kwargs_from_metadata``), so a
+            # worker / ladder / arena seat runs exactly the evaluator
+            # the held-out gate graded. (Before 2026-10-04 this branch
+            # read the trunk dims by hand and dropped the calibration
+            # and value_head_input -- every played game ran the value
+            # head uncalibrated.)
+            meta = _sibling_metadata(Path(self.weights_path))
+            architecture = self.architecture
+            if architecture is None and meta is not None:
+                architecture = meta.get("architecture")
+            if architecture == "structured" and meta is not None:
+                evaluator = NNEvaluator.from_metadata(
+                    Path(self.weights_path),
+                    _reconcile_metadata(
+                        meta,
+                        architecture=self.architecture,
+                        action_encoding_version=self.action_encoding_version,
+                        weights_path=self.weights_path,
+                    ),
+                    device=eval_kwargs.get("device", "cpu"),
+                    apply_value_calibration=self.apply_value_calibration,
+                )
+            else:
+                if meta is not None:
+                    # Flat MLP trunk: no logit hook, no alternative
+                    # value-head inputs -- refuse metadata declaring
+                    # either instead of silently dropping it.
+                    check_flat_metadata_value_options(
+                        meta,
+                        apply_value_calibration=(
+                            self.apply_value_calibration
+                        ),
+                    )
+                # No sidecar metadata (hand-built / test weights):
+                # nothing declared, nothing to apply -- the evaluator's
+                # defaults (identity calibration, shared value input).
+                evaluator = NNEvaluator(**eval_kwargs)
         if self.use_ismcts:
             total_iters = max(1, self.samples * self.inner_nodes)
             ismcts_kwargs: dict[str, Any] = {
@@ -469,6 +452,7 @@ class NNPimcConfig:
             "action_encoding_version": self.action_encoding_version,
             "root_dirichlet_alpha": self.root_dirichlet_alpha,
             "root_dirichlet_eps": self.root_dirichlet_eps,
+            "apply_value_calibration": self.apply_value_calibration,
         }
 
     @classmethod
@@ -500,7 +484,76 @@ class NNPimcConfig:
             action_encoding_version=d.get("action_encoding_version"),
             root_dirichlet_alpha=d.get("root_dirichlet_alpha"),
             root_dirichlet_eps=d.get("root_dirichlet_eps", 0.25),
+            apply_value_calibration=bool(
+                d.get("apply_value_calibration", True)
+            ),
         )
+
+
+def _sibling_metadata(weights_path: Path) -> Optional[dict[str, Any]]:
+    """The raw ``metadata.json`` next to ``weights_path`` (the registry
+    layout ``vN/{weights.pt,metadata.json}``; the worker weights cache
+    mirrors it), or ``None`` when there is none.
+
+    A present-but-unreadable file raises: it is the only record of the
+    checkpoint's trunk shape and value calibration, and loading without
+    it would silently run a different evaluator than the one trained.
+    """
+    import json
+
+    meta_path = weights_path.parent / "metadata.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"cannot read {meta_path}: {exc}. It records the "
+            "checkpoint's trunk dims and value calibration; refusing "
+            "to load the weights without it."
+        ) from exc
+    if not isinstance(meta, dict):
+        raise ValueError(
+            f"{meta_path} is not a JSON object (got "
+            f"{type(meta).__name__})"
+        )
+    return meta
+
+
+def _reconcile_metadata(
+    meta: dict[str, Any],
+    *,
+    architecture: Optional[str],
+    action_encoding_version: Optional[str],
+    weights_path: str,
+) -> dict[str, Any]:
+    """Merge the explicit ``NNPimcConfig`` fields into the sidecar
+    metadata for ``NNEvaluator.from_metadata``.
+
+    A field the sidecar lacks takes the config's value (minimal
+    hand-written sidecars omit ``architecture``); a field both carry
+    must agree -- a mismatched action encoding scrambles the policy
+    priors, a mismatched architecture loads the wrong model class --
+    so a disagreement raises instead of picking one silently.
+    """
+    merged = dict(meta)
+    for key, value in (
+        ("architecture", architecture),
+        ("action_encoding_version", action_encoding_version),
+    ):
+        if value is None:
+            continue
+        recorded = merged.get(key)
+        if recorded is None:
+            merged[key] = value
+        elif recorded != value:
+            raise ValueError(
+                f"NNPimcConfig.{key}={value!r} disagrees with "
+                f"{key}={recorded!r} in the metadata.json next to "
+                f"{weights_path}"
+            )
+    return merged
 
 
 @dataclass(frozen=True)
