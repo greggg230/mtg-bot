@@ -73,7 +73,6 @@ from mtg_bot.actions import (
     UnlockRoomHalf,
 )
 from mtg_bot.cards.base import CardPrinting
-from mtg_bot.cards.source import get_active_source
 from mtg_bot.game import (
     GameObject,
     GameState,
@@ -103,6 +102,7 @@ from mtg_bot.search.resolution_decisions import (
     ResolutionXDecision,
     ResolutionYesNoDecision,
 )
+from mtg_bot.training.card_vocab import current_card_vocab, row_for_raw_id
 from mtg_bot.training.structured_model import (
     ACTION_KIND_VOCAB_SIZE,
     CONTROLLER_VOCAB_SIZE,
@@ -271,34 +271,20 @@ STEP_NA = 0
 # Printing-id table
 # ---------------------------------------------------------------------
 
-# Build a stable name → id mapping from the active card source. Built
-# lazily on first use because the active source can be swapped by
-# tests via ``set_active_source``. id 0 is reserved as
-# ``PRINTING_NA``; printings start at id 1.
-
-_PRINTING_TO_ID_CACHE: Optional[dict[str, int]] = None
-_PRINTING_TO_ID_SOURCE: object = None
+# The name → id mapping is the active source's card vocabulary
+# (``mtg_bot.training.card_vocab``, scheme ``sorted_names_v1``): sorted
+# printing names, id 0 reserved as ``PRINTING_NA``, printings from 1.
+# ``card_vocab.current_card_vocab`` caches it per active-source object
+# (tests swap the source via ``set_active_source``). Every checkpoint
+# and training shard records this vocabulary so a pool change can never
+# silently renumber trained embeddings — see
+# ``docs/CARD_VOCAB_FINGERPRINT.md``.
 
 
 def _printing_to_id_map() -> dict[str, int]:
-    """Return a name → id mapping for printings in the active source.
-
-    Cached at module level keyed on the active-source identity so
-    test fixtures that swap the source (or extend a synthetic-test
-    source) get a fresh mapping. Sorted by printing name so the id
-    assignment is reproducible across runs without ordering churn.
-    """
-    global _PRINTING_TO_ID_CACHE, _PRINTING_TO_ID_SOURCE
-    source = get_active_source()
-    if _PRINTING_TO_ID_CACHE is None or _PRINTING_TO_ID_SOURCE is not source:
-        printings = source.get_printings()
-        ordered = sorted(printings.keys())
-        # id 0 is reserved as NA — start real printings at 1.
-        _PRINTING_TO_ID_CACHE = {
-            name: i + 1 for i, name in enumerate(ordered)
-        }
-        _PRINTING_TO_ID_SOURCE = source
-    return _PRINTING_TO_ID_CACHE
+    """Return the name → raw printing id mapping of the active source
+    (``card_vocab.current_card_vocab().id_map``)."""
+    return current_card_vocab().id_map
 
 
 def printing_id(
@@ -325,11 +311,10 @@ def printing_id(
     raw_id = pid_map.get(printing.name)
     if raw_id is None:
         return PRINTING_NA
-    if raw_id >= n_printings_cap:
-        # Collision-mode: bucket overflow into the high range
-        # excluding NA(0). Deterministic.
-        return 1 + ((raw_id - 1) % (n_printings_cap - 1))
-    return raw_id
+    # Collision-mode above the cap: bucket overflow into the high range
+    # excluding NA(0). Deterministic; single definition shared with the
+    # checkpoint remap (``card_vocab.row_for_raw_id``).
+    return row_for_raw_id(raw_id, n_printings_cap)
 
 
 # ---------------------------------------------------------------------

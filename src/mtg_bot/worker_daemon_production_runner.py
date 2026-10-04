@@ -369,6 +369,14 @@ def _encode_npz_bytes(
             "root_values": struct["root_values"],
             "game_ids": game_ids,
         }
+        # Stamp the id space this worker tokenised in (its card
+        # vocabulary + bucketing cap). A worker running a different
+        # card pool / parser than its peers produces a different stamp,
+        # and the trainer refuses to mix the two instead of training on
+        # scrambled printing ids.
+        from mtg_bot.training.data_gen import shard_card_vocab_entries
+
+        arrays.update(shard_card_vocab_entries())
     else:
         arrays = {
             "features": features,

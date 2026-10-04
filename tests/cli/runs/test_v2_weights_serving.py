@@ -73,3 +73,58 @@ def test_weights_rejects_unsafe_version(tmp_path):
     # filesystem traversal.
     res = client.get("/v2/weights/..%2Fetc")
     assert res.status_code in (400, 404)
+
+
+# ---------------------------------------------------------------------
+# Card-vocab stamping sidecars (pre-fingerprint checkpoints)
+# ---------------------------------------------------------------------
+
+
+def _version_with_metadata(tmp_path: Path, payload: dict) -> Path:
+    weights_dir = tmp_path / "trained_weights" / "v6"
+    weights_dir.mkdir(parents=True)
+    (weights_dir / "weights.pt").write_bytes(b"structured-weights")
+    (weights_dir / "metadata.json").write_text(json.dumps(payload))
+    return weights_dir
+
+
+def test_weights_metadata_without_sidecar_is_served_byte_identical(tmp_path):
+    app = _make_app(tmp_path)
+    raw = '{"architecture":"structured",  "version": "v6"}'
+    weights_dir = _version_with_metadata(tmp_path, {})
+    (weights_dir / "metadata.json").write_text(raw)
+    res = app.test_client().get("/v2/weights/v6/metadata")
+    assert res.status_code == 200
+    assert res.data == raw.encode()
+
+
+def test_weights_metadata_merges_a_valid_sidecar(tmp_path):
+    from mtg_bot.training.card_vocab import CardVocab, write_sidecar
+
+    app = _make_app(tmp_path)
+    payload = {"architecture": "structured", "version": "v6"}
+    weights_dir = _version_with_metadata(tmp_path, payload)
+    vocab = CardVocab.from_names(["Alpha", "Beta"])
+    write_sidecar(vocab, weights_dir / "weights.pt", provenance={"git_commit": "abc"})
+    before = (weights_dir / "metadata.json").read_bytes()
+    res = app.test_client().get("/v2/weights/v6/metadata")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["architecture"] == "structured"
+    assert CardVocab.from_dict(body["card_vocab"]) == vocab
+    assert body["card_vocab"]["provenance"] == {"git_commit": "abc"}
+    # The registry's own file is untouched.
+    assert (weights_dir / "metadata.json").read_bytes() == before
+
+
+def test_weights_metadata_with_invalid_sidecar_fails_loudly(tmp_path):
+    from mtg_bot.training.card_vocab import CardVocab, write_sidecar
+
+    app = _make_app(tmp_path)
+    weights_dir = _version_with_metadata(tmp_path, {"architecture": "structured"})
+    write_sidecar(CardVocab.from_names(["A"]), weights_dir / "weights.pt")
+    # Weights replaced after stamping: the stamp no longer applies.
+    (weights_dir / "weights.pt").write_bytes(b"different-weights-now")
+    res = app.test_client().get("/v2/weights/v6/metadata")
+    assert res.status_code == 500
+    assert "card-vocab sidecar" in res.get_json()["error"]

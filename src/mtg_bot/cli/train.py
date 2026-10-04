@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+import os
 import sys
 import tempfile
 import time
@@ -53,6 +54,12 @@ from mtg_bot.training import (
     train_value_network,
 )
 from mtg_bot.training.block_shuffle import DEFAULT_BLOCK_ROWS
+from mtg_bot.training.card_vocab import (
+    SHARD_CARD_VOCAB_ENV,
+    CardVocabError,
+    legacy_shard_vocab_from_arg,
+    resolve_shards_card_vocab,
+)
 from mtg_bot.training.structured_model import (
     SUPPORTED_VALUE_HEAD_INPUTS,
 )
@@ -915,6 +922,20 @@ def main(argv=None) -> None:
             "metadata.json and the progress JSON either way."
         ),
     )
+    parser.add_argument(
+        "--shard-card-vocab", type=str, default=None,
+        help=(
+            "Structured-trunk only. Card-vocabulary file (from `mtg_bot "
+            "card-vocab export`, a <weights>.card_vocab.json sidecar, or a "
+            "stamped metadata.json) ASSERTING the vocabulary that "
+            "pre-fingerprint training shards were generated under. "
+            "Shards written since the fingerprint landed record their "
+            "own vocabulary and need nothing; unstamped shards are "
+            "refused without this (never guessed). Default: "
+            f"${'{'}{SHARD_CARD_VOCAB_ENV}{'}'} if set. The trained model "
+            "is stamped with the shards' vocabulary."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.loader_timeout_sec is not None and args.loader_timeout_sec < 0:
         parser.error(
@@ -1496,6 +1517,37 @@ def _main_structured(args, parser) -> None:
     # list and load through a directory view restricted to it — see
     # :func:`select_window_files` / :class:`WindowedDataDir`.
     load_dir, data_files = _resolve_data_window(args)
+    # The shards' printing ids live in ONE card-vocabulary id space
+    # (or training refuses); the trained model is stamped with it.
+    # Resolved before the expensive flat-store build so a mixed or
+    # unstamped pool fails in seconds, not after the load.
+    shard_vocab = None
+    legacy_source = args.shard_card_vocab or os.environ.get(
+        SHARD_CARD_VOCAB_ENV,
+    )
+    if data_files:
+        try:
+            shard_vocab = resolve_shards_card_vocab(
+                [Path(args.data_dir) / name for name in data_files],
+                legacy_vocab=legacy_shard_vocab_from_arg(
+                    args.shard_card_vocab,
+                ),
+            )
+        except CardVocabError as exc:
+            sys.exit(f"card vocabulary: {exc}")
+    if shard_vocab is not None:
+        print(
+            f"# Structured-trainer: shards use card vocabulary "
+            f"{shard_vocab.vocab.short_sha} ({shard_vocab.vocab.size} "
+            f"names, n_printings cap {shard_vocab.n_printings_cap}; "
+            f"{shard_vocab.n_stamped} stamped / {shard_vocab.n_legacy} "
+            f"legacy files"
+            + (
+                f", legacy vocabulary asserted by {legacy_source}"
+                if shard_vocab.legacy_assumed else ""
+            )
+            + ")"
+        )
     try:
         dataset = load_structured_dataset(load_dir)
     except FileNotFoundError as exc:
@@ -1514,6 +1566,11 @@ def _main_structured(args, parser) -> None:
     n_samples = len(dataset)
     if n_samples == 0:
         sys.exit(f"No samples found in {args.data_dir}")
+    if shard_vocab is None:  # pragma: no cover - rows imply a resolution
+        sys.exit(
+            "card vocabulary: the loaded shards carry rows but no card "
+            "vocabulary could be resolved for them"
+        )
 
     device = args.device or auto_device()
     print(
@@ -1606,6 +1663,19 @@ def _main_structured(args, parser) -> None:
             f"{structured_config.scalar_width}. Regenerate the data "
             f"under the model's schema or pass a matching "
             f"--scalar-schema-version."
+        )
+    # The shards' printing ids were bucketed at their recorded cap; a
+    # model with a different table size would index rows the data never
+    # trained (or collide differently than the data assumes).
+    if (
+        shard_vocab is not None
+        and structured_config.n_printings != shard_vocab.n_printings_cap
+    ):
+        parser.error(
+            f"n_printings mismatch: the training shards' printing ids "
+            f"were tokenised with n_printings cap "
+            f"{shard_vocab.n_printings_cap}, but the model would have "
+            f"n_printings={structured_config.n_printings}."
         )
 
     train_config = {
@@ -1808,6 +1878,17 @@ def _main_structured(args, parser) -> None:
             # and both eval servers read CALIBRATED values. Empty
             # dict when nothing could be fit (no held-out rows).
             value_calibration=dict(holdout_metrics.calibration or {}),
+            # The card vocabulary the printing embeddings were trained
+            # on = the id space of the training shards (NOT this
+            # process's current pool: shards are pre-tokenised). Loaders
+            # remap it to whatever vocabulary is current at load time.
+            card_vocab=shard_vocab.vocab.to_dict(
+                provenance={
+                    **shard_vocab.provenance(legacy_source),
+                    "git_commit": _git_commit(),
+                    "stamped_at": _now_stamp(),
+                },
+            ),
             training={
                 "data_dir": str(args.data_dir),
                 "data_files": data_files,

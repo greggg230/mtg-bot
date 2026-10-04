@@ -35,6 +35,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from mtg_bot.training.card_vocab import (
+    CardVocab,
+    MissingCardVocabError,
+    effective_metadata_dict,
+)
 from mtg_bot.training.weights_io import (
     ensure_inheritance_enabled,
     preflight_readable_dir,
@@ -135,6 +140,19 @@ class ModelMetadata:
     # what every checkpoint registered before this field existed
     # behaved like, so old metadata.json files round-trip unchanged.
     value_calibration: dict[str, Any] = field(default_factory=dict)
+    # ``card_vocab`` is the card vocabulary a STRUCTURED network's
+    # printing embeddings were trained on (``mtg_bot.training.card_vocab``):
+    # ``{"format": 1, "id_scheme": "sorted_names_v1", "size": N,
+    #    "sha256": "<hex>", "names": [...], "provenance": {...}}``.
+    # Printing ids are positions in this sorted list, so a card-pool
+    # change renumbers them; loaders compare it with the current
+    # vocabulary and remap the embedding rows by card name. Required
+    # for structured checkpoints (``Registry.register`` refuses one
+    # without it; loaders refuse to guess). Pre-fingerprint checkpoints
+    # are stamped via a ``weights.pt.card_vocab.json`` sidecar, which
+    # ``Registry.load_metadata`` merges in here. Ignored for the
+    # flat-feature MLP architectures (no printing identity).
+    card_vocab: dict[str, Any] = field(default_factory=dict)
     # Training inputs and hyperparameters.
     training: dict[str, Any] = field(default_factory=dict)
     # Per-epoch loss series + summary, from TrainingHistory.
@@ -158,7 +176,7 @@ class ModelMetadata:
         known = {
             "version", "created_at", "feature_dim", "hidden_sizes",
             "with_policy", "architecture", "action_encoding_version",
-            "scalar_schema_version", "value_calibration",
+            "scalar_schema_version", "value_calibration", "card_vocab",
             "training", "training_history", "evaluation", "git_commit",
             "notes", "extra",
         }
@@ -195,6 +213,10 @@ class ModelMetadata:
             # key) loads as the identity calibration — bit-exact
             # pre-calibration inference.
             value_calibration=dict(d.get("value_calibration") or {}),
+            # Default {} = unstamped (every pre-fingerprint checkpoint).
+            # Structured loaders refuse an unstamped checkpoint rather
+            # than guess its vocabulary.
+            card_vocab=dict(d.get("card_vocab") or {}),
             training=dict(d.get("training", {})),
             training_history=dict(d.get("training_history", {})),
             evaluation=dict(d.get("evaluation", {})),
@@ -289,8 +311,13 @@ class Registry:
             raise FileNotFoundError(
                 f"metadata for version {version!r} not found at {path}"
             )
-        with path.open("r", encoding="utf-8") as f:
-            return ModelMetadata.from_dict(json.load(f))
+        # A ``weights.pt.card_vocab.json`` stamping sidecar (written next to a
+        # pre-fingerprint checkpoint by ``mtg_bot card-vocab stamp
+        # --sidecar``) is verified against weights.pt and merged into
+        # ``card_vocab``; the files on disk are not modified.
+        return ModelMetadata.from_dict(
+            effective_metadata_dict(self.root / version)
+        )
 
     # ---- mutation ----------------------------------------------------------
 
@@ -328,6 +355,18 @@ class Registry:
             raise ValueError(
                 f"version must match v\\d+ pattern, got {version!r}"
             )
+        if metadata.architecture == "structured":
+            # Every structured checkpoint records the card vocabulary
+            # its printing embeddings index. Refuse before writing
+            # anything so an unstamped checkpoint never enters a
+            # registry (see docs/CARD_VOCAB_FINGERPRINT.md).
+            if not metadata.card_vocab:
+                raise MissingCardVocabError(
+                    "refusing to register a structured checkpoint without "
+                    "metadata.card_vocab (the card vocabulary its printing "
+                    "embeddings were trained on)"
+                )
+            CardVocab.from_dict(metadata.card_vocab)
         # Preflight: confirm the registry root is writable BEFORE we
         # do the mkdir + write. Without this, a broken ACL on the root
         # surfaces as a generic WinError 5 several lines down, with no

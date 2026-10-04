@@ -788,6 +788,35 @@ def build_v2_blueprint(
             return jsonify({
                 "error": f"metadata not found for {version!r}",
             }), 404
+        from mtg_bot.training.card_vocab import (
+            SIDECAR_FILENAME,
+            CardVocabError,
+            effective_metadata_dict,
+        )
+
+        if (weights_root / version / SIDECAR_FILENAME).is_file():
+            # A pre-fingerprint checkpoint stamped with a weights.pt.card_vocab.json
+            # sidecar: serve the EFFECTIVE metadata (sidecar vocabulary
+            # merged in) so workers' weights caches receive the stamp.
+            # The served bytes change when a stamp lands, which makes
+            # every worker's coherency check re-fetch the pair.
+            try:
+                merged = effective_metadata_dict(weights_root / version)
+            except (CardVocabError, OSError, ValueError) as exc:
+                logger.error(
+                    "weights_metadata: card-vocab sidecar for %s is "
+                    "invalid: %s", version, exc,
+                )
+                return jsonify({
+                    "error": (
+                        f"card-vocab sidecar for {version!r} is invalid: "
+                        f"{exc}"
+                    ),
+                }), 500
+            return Response(
+                json.dumps(merged, indent=2, sort_keys=True),
+                mimetype="application/json",
+            )
         return send_file(
             str(target),
             mimetype="application/json",

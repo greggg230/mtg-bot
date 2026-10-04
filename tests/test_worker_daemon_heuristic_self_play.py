@@ -250,8 +250,17 @@ def test_real_heuristic_game_emits_nn_compatible_npz(tmp_path):
             "features", "outcomes", "policy_targets", "action_masks",
             "structured_token_type", "structured_token_emb_ids",
             "structured_token_scalars", "structured_attention_mask",
-            "root_values", "game_ids",
+            "root_values", "game_ids", "structured_card_vocab",
         }
+        from mtg_bot.training.card_vocab import (
+            current_card_vocab,
+            decode_shard_card_vocab,
+        )
+        from mtg_bot.training.data_gen import shard_n_printings_cap
+
+        assert decode_shard_card_vocab(data["structured_card_vocab"]) == (
+            current_card_vocab(), shard_n_printings_cap(),
+        )
         assert data["features"].shape[0] > 0
         # Dense value target (2026-09-26): the heuristic PIMC reports a
         # root Q at every searched sample point, so a real game lands

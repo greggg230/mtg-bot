@@ -387,6 +387,44 @@ prior lookups use the matching slot mapping.
   against it exist yet. The first real v2 training run will
   surface any inference-side wiring gap that the smoke missed.
 
+## Card vocabulary fingerprint
+
+The structured net indexes `printing_embed` (and the Step-4
+`hand_belief_queries`) by **printing id** = position in the sorted
+name list of the active card source (scheme `sorted_names_v1`,
+`mtg_bot.training.card_vocab`; rows above `n_printings - 1` fold by
+modulo). Any card-pool change, or the parser claiming one more card,
+renumbers those ids. Full design + runbook:
+[`docs/CARD_VOCAB_FINGERPRINT.md`](docs/CARD_VOCAB_FINGERPRINT.md).
+
+- **Every structured checkpoint records its vocabulary** in
+  `metadata.json` `card_vocab` (`{format, id_scheme, size, sha256,
+  names, provenance}`); `Registry.register` refuses one without it.
+  `mtg_bot train` stamps the vocabulary of its **training shards**;
+  `NNEvaluator.save` stamps a `<weights>.card_vocab.json` sidecar.
+- **Loaders remap, never guess**: every structured load
+  (`NNEvaluator`, `from_metadata`, `NNPimcConfig.build`, the SHM eval
+  server) goes through `card_vocab.load_structured_checkpoint`. Same
+  vocabulary → bit-identical load. Changed → embedding rows remapped by
+  card name (shared cards keep their trained rows, new cards get a
+  fresh model's init, dropped cards removed, table grown to
+  `len(vocab)+1`), logged at WARNING as `CARD VOCABULARY REMAP`.
+  No vocabulary → `MissingCardVocabError`.
+- **Pre-fingerprint checkpoints** (every `trained_weights_s2/v1`–`v26`
+  and `trained_weights/` version: the same 475-name vocabulary,
+  `25ac27bcad11`) are stamped once with `mtg_bot card-vocab stamp
+  --registry-root <R> --all-versions --use-metadata-commit --sidecar`
+  (writes only `vN/weights.pt.card_vocab.json`; `Registry.load_metadata`
+  and the coordinator's `/v2/weights/<v>/metadata` merge it in, so
+  workers receive it with no extra fetch).
+- **Shards** record their id space (`structured_card_vocab` npz key:
+  vocabulary + `n_printings_cap`). The trainer refuses mixed id spaces
+  and unstamped (pre-fingerprint) shards unless `--shard-card-vocab
+  FILE` / `$MTG_BOT_SHARD_CARD_VOCAB` asserts their vocabulary
+  (`mtg_bot card-vocab export --git-commit <sha> --out FILE`).
+- Not a v-chain break: the codec and the id scheme are unchanged. A new
+  id scheme must bump `card_vocab.id_scheme` (the fingerprint covers it).
+
 ## NN representation roadmap
 
 **Status (2026-05-17 — verified against `trained_weights/`): Steps 1

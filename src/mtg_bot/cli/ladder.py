@@ -94,6 +94,26 @@ def _split_label(label: str) -> tuple[str, Optional[str], Optional[int]]:
                 f"of {sorted(VARIANT_SUFFIXES)} or b<N> (leaf batch size)"
             )
     return base, variant, batch
+# ``<version>+nocal``: load the version WITHOUT its post-hoc value
+# calibration (``metadata.value_calibration``). Every NN seat applies
+# the calibration since 2026-10-04; before that ``NNPimcConfig.build``
+# silently dropped it, so ``+nocal`` reproduces every earlier ladder /
+# arena / self-play evaluator and measures what the calibration is
+# worth in play.
+NOCAL_MODIFIER = "nocal"
+
+
+def split_calibration_modifier(label: str) -> tuple[str, bool]:
+    """``"v22+nocal"`` -> ``("v22", False)``; ``"v22"`` -> ``("v22",
+    True)``. Returns the label with any ``+nocal`` removed (other
+    ``+`` modifiers keep their order) and whether the value
+    calibration is applied. ``+nocal`` twice is an error."""
+    parts = label.split("+")
+    kept = [parts[0]] + [m for m in parts[1:] if m != NOCAL_MODIFIER]
+    n_nocal = len(parts) - len(kept)
+    if n_nocal > 1:
+        raise ValueError(f"{label!r}: '+{NOCAL_MODIFIER}' given twice")
+    return "+".join(kept), n_nocal == 0
 
 RESULTS_FILENAME = "results.json"
 REPORT_FILENAME = "ladder.md"
@@ -148,19 +168,31 @@ def resolve_agent(
       version's ``metadata.json`` via :class:`Registry` exactly the
       way ``_eval_match`` / ``capture`` thread them into
       ``NNPimcConfig``; the ``structured`` architecture's trunk
-      hparams are discovered by ``NNPimcConfig.build`` from the
-      sibling metadata file in the worker.
+      hparams, value-head input and value calibration are discovered
+      by ``NNPimcConfig.build`` from the sibling metadata file in the
+      worker. ``<version>+nocal`` loads it without the calibration.
     """
     from mtg_bot.training import (
         HeuristicConfig, NNPimcConfig, PimcConfig, Registry,
     )
+
+    version, apply_value_calibration = split_calibration_modifier(label)
+    if not apply_value_calibration and version.split("+")[0] in (
+        RANDOM_LABEL, HEURISTIC_LABEL,
+    ):
+        raise ValueError(
+            f"{label!r}: '+{NOCAL_MODIFIER}' needs a registered version "
+            f"(it switches off a network's value calibration)"
+        )
 
     if label == RANDOM_LABEL:
         return AgentSpec(
             label=label, factory=RandomConfig().build,
             description={"kind": "random"},
         )
-    base, variant, batch = _split_label(label)
+    # ``+nocal`` is stripped first (``version``); the remaining
+    # modifiers are the head variant / leaf batch size.
+    base, variant, batch = _split_label(version)
     if base == HEURISTIC_LABEL:
         if variant is not None:
             raise ValueError(f"{label!r}: head variants need a registered version")
@@ -205,6 +237,7 @@ def resolve_agent(
         architecture=meta.architecture,
         policy_hidden_sizes=policy_hidden,
         action_encoding_version=meta.action_encoding_version,
+        apply_value_calibration=apply_value_calibration,
     )
     if variant == "heurvalue":
         from mtg_bot.search.hybrid_evaluator import HybridPimcConfig
@@ -234,6 +267,9 @@ def resolve_agent(
             "version": version,
             "git_commit": meta.git_commit,
             "created_at": meta.created_at,
+            # The recorded fit; ``apply_value_calibration`` (from
+            # cfg.to_dict) says whether this seat applies it.
+            "value_calibration": dict(meta.value_calibration or {}),
             **cfg.to_dict(),
         },
     )

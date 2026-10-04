@@ -2333,6 +2333,30 @@ def main(argv=None) -> None:  # pragma: no cover
     # reducing param count by ~95% per iteration and making the
     # acceptance gate impossible to clear.
     bootstrap_meta = registry.load_metadata(args.bootstrap_version)
+    if getattr(bootstrap_meta, "architecture", None) == "structured":
+        # Fail on the master in seconds rather than on every worker's
+        # first game: a structured bootstrap must record (or be
+        # stamped with) the card vocabulary its embeddings index.
+        from mtg_bot.training.card_vocab import (
+            CardVocabError,
+            resolve_checkpoint_card_vocab,
+        )
+
+        try:
+            # Resolved from the version dir itself (metadata.json, or
+            # the stamping sidecar) so the log names where it came from.
+            resolved = resolve_checkpoint_card_vocab(
+                registry.weights_path(args.bootstrap_version),
+            )
+        except CardVocabError as exc:
+            sys.exit(
+                f"Bootstrap version {args.bootstrap_version!r}: {exc}"
+            )
+        print(
+            f"[iterate] {args.bootstrap_version} card vocabulary "
+            f"{resolved.vocab.short_sha} ({resolved.vocab.size} names, "
+            f"from {resolved.origin})"
+        )
     iter_hidden_sizes = (
         tuple(bootstrap_meta.hidden_sizes)
         if getattr(bootstrap_meta, "hidden_sizes", None) else None

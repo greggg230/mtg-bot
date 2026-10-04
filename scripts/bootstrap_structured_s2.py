@@ -45,6 +45,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 import torch  # noqa: E402
 
 from mtg_bot.training.action_encoding import ACTION_VOCAB_SIZE  # noqa: E402
+from mtg_bot.training.card_vocab import current_card_vocab  # noqa: E402
 from mtg_bot.training.registry import ModelMetadata, Registry  # noqa: E402
 from mtg_bot.search.action_history import DEFAULT_ACTION_HISTORY_N  # noqa: E402
 from mtg_bot.training.structured_model import (  # noqa: E402
@@ -105,6 +106,11 @@ def main(argv: list[str] | None = None) -> int:
         architecture="structured",
         action_encoding_version="canonical_v2",
         scalar_schema_version=cfg.scalar_schema_version,
+        # A random-init net is born in the CURRENT card vocabulary
+        # (its printing rows are indexed by today's tokenizer ids).
+        card_vocab=current_card_vocab().to_dict(
+            provenance={"source": "random_init", "git_commit": _git_commit()},
+        ),
         training={
             "notes": "cold-start random init; no training data",
             "structured_config": dict(structured_config),

@@ -10,7 +10,7 @@ thread *kept running the game* inside the multiprocessing worker while
 the pool handed that same worker the next game. Two full games then
 ran concurrently in one process, sharing the interpreter, the numpy /
 torch runtimes, the module-level tokenizer caches
-(``state_tokenizer._PRINTING_TO_ID_CACHE``) and the process-global
+(``card_vocab.current_card_vocab``'s per-source cache) and the process-global
 search telemetry (``mtg_bot.search.eval_counters``).
 
 That is what the 2026-09-23 production run showed:

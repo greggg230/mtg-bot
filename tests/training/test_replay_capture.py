@@ -15,6 +15,7 @@ from mtg_bot.training import (
     heuristic_eval_annotator, random_choice_factory,
 )
 from tests._test_decks import simple_test_decklists, simple_test_deck_pool
+from tests._card_vocab_helpers import current_vocab_dict, stamp_current_vocab
 
 
 # ---------- ReplayRecorder ---------------------------------------------------
@@ -335,6 +336,7 @@ def test_capture_config_build_recorder_routes_structured_arch(
     weights_path = tmp_path / "structured_default.pt"
     model = StructuredModel(StructuredModelConfig())
     torch.save(model.state_dict(), weights_path)
+    stamp_current_vocab(weights_path)
 
     cfg = ReplayCaptureConfig(
         save_dir=str(tmp_path),
@@ -405,6 +407,7 @@ def test_capture_config_build_recorder_threads_metadata_for_nondefault_structure
         with_policy=True,
         architecture="structured",
         scalar_schema_version=nondefault_cfg.scalar_schema_version,
+        card_vocab=current_vocab_dict(),
         training={
             "structured_config": {
                 "emb_dim": nondefault_cfg.emb_dim,
@@ -482,6 +485,7 @@ def test_nn_eval_annotator_loads_nondefault_structured_via_metadata_path(
         with_policy=True,
         architecture="structured",
         scalar_schema_version=nondefault_cfg.scalar_schema_version,
+        card_vocab=current_vocab_dict(),
         training={
             "structured_config": {
                 "emb_dim": nondefault_cfg.emb_dim,

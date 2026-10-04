@@ -186,11 +186,22 @@ def test_heuristic_stage_drains_and_lands_nn_compatible_npzs(tmp_path):
         "structured_token_type", "structured_token_emb_ids",
         "structured_token_scalars", "structured_attention_mask",
         "root_values", "game_ids",
+        # The card vocabulary + cap the printing ids were tokenised in.
+        "structured_card_vocab",
     }
+    from mtg_bot.training.card_vocab import (
+        current_card_vocab,
+        decode_shard_card_vocab,
+    )
+    from mtg_bot.training.data_gen import shard_n_printings_cap
+
     total_rows = 0
     for p in npzs:
         with np.load(p) as d:
             assert set(d.files) == expected_cols, (p.name, set(d.files))
             assert d["structured_token_scalars"].shape[-1] == 29
+            assert decode_shard_card_vocab(d["structured_card_vocab"]) == (
+                current_card_vocab(), shard_n_printings_cap(),
+            )
             total_rows += int(d["features"].shape[0])
     assert total_rows > 0

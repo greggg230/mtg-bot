@@ -94,8 +94,11 @@ from mtg_bot.search.nn_evaluator import (
     _build_dual_head_model,
     _build_structured_model,
     _collate_structured_token_dicts,
+    _meta_field,
     _ValueMLP,
     _ValuePolicyMLP,
+    check_flat_metadata_value_options,
+    structured_kwargs_from_metadata,
 )
 
 
@@ -341,7 +344,57 @@ class SharedTensorNNEvalServer:
         server.stop()                  # joins dispatcher
 
     Or as a context manager: ``with server: ...``.
+
+    To host a REGISTERED checkpoint use :meth:`from_metadata`, which
+    resolves the trunk dims, value-head input and value calibration
+    through the same resolver as ``NNEvaluator.from_metadata`` /
+    ``NNPimcConfig.build``.
     """
+
+    @classmethod
+    def from_metadata(
+        cls,
+        weights_path: Path,
+        metadata: Any,
+        *,
+        apply_value_calibration: bool = True,
+        **server_kwargs: Any,
+    ) -> "SharedTensorNNEvalServer":
+        """Host ``weights_path`` with every model knob read from its
+        metadata (``ModelMetadata`` or the raw ``metadata.json`` dict)
+        via :func:`~mtg_bot.search.nn_evaluator.structured_kwargs_from_metadata`
+        (structured) or the MLP fields + the same refusal of value-head
+        options an MLP cannot honour. ``server_kwargs`` are the
+        server-only knobs (device, batch_size, n_slots, ...)."""
+        architecture = _meta_field(
+            metadata, "architecture", ARCHITECTURE_SHARED,
+        )
+        if architecture == ARCHITECTURE_STRUCTURED:
+            return cls(
+                weights_path=weights_path,
+                architecture=architecture,
+                card_vocab=(_meta_field(metadata, "card_vocab") or None),
+                **structured_kwargs_from_metadata(
+                    metadata,
+                    apply_value_calibration=apply_value_calibration,
+                ),
+                **server_kwargs,
+            )
+        check_flat_metadata_value_options(
+            metadata, apply_value_calibration=apply_value_calibration,
+        )
+        hidden = _meta_field(metadata, "hidden_sizes", ()) or ()
+        training = _meta_field(metadata, "training", {}) or {}
+        return cls(
+            weights_path=weights_path,
+            architecture=architecture,
+            with_policy=bool(_meta_field(metadata, "with_policy", False)),
+            hidden_sizes=tuple(hidden) if hidden else None,
+            policy_hidden_sizes=(
+                tuple(training.get("policy_hidden_sizes") or ()) or None
+            ),
+            **server_kwargs,
+        )
 
     def __init__(
         self,
@@ -419,6 +472,11 @@ class SharedTensorNNEvalServer:
         structured_value_head_input: Optional[str] = None,
         structured_value_temperature: Optional[float] = None,
         structured_value_bias: Optional[float] = None,
+        # Stored card vocabulary of a structured ``weights_path`` —
+        # same contract as ``NNEvaluator(card_vocab=...)``: ``None``
+        # resolves it next to the weights, an unstamped checkpoint is
+        # refused, a changed vocabulary is remapped by card name.
+        card_vocab: Any = None,
     ) -> None:
         # Deferred CUDA resolution: same pattern as PR #36's fix to
         # NNEvalServer. Don't call torch.cuda.is_available() in any
@@ -539,7 +597,22 @@ class SharedTensorNNEvalServer:
             )
         else:
             self._model = _ValueMLP(hidden_sizes=effective_hidden)
-        if weights_path is not None and model_factory is None:
+        self.card_vocab_report = None
+        if (
+            weights_path is not None and model_factory is None
+            and self._is_structured
+        ):
+            # Same load path as NNEvaluator: refuse an unstamped
+            # checkpoint, remap a changed card vocabulary by name.
+            from mtg_bot.training.card_vocab import (
+                load_structured_checkpoint,
+            )
+
+            self._model, self.card_vocab_report = load_structured_checkpoint(
+                self._model, Path(weights_path),
+                map_location=self._device, card_vocab=card_vocab,
+            )
+        elif weights_path is not None and model_factory is None:
             state_dict = torch.load(
                 weights_path,
                 map_location=self._device,

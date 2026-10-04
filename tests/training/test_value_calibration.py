@@ -412,6 +412,7 @@ def test_registry_set_value_calibration_rewrites_only_metadata(
     """``mtg_bot calibrate-value``'s storage primitive: metadata in,
     weights untouched."""
     from mtg_bot.training.registry import ModelMetadata, Registry
+    from tests._card_vocab_helpers import current_vocab_dict
 
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"not-really-a-checkpoint")
@@ -421,6 +422,7 @@ def test_registry_set_value_calibration_rewrites_only_metadata(
         ModelMetadata(
             version="", created_at="", feature_dim=51, hidden_sizes=[],
             architecture="structured",
+            card_vocab=current_vocab_dict(),
             training_history={"train_losses": [1.0]},
         ),
     )

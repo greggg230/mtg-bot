@@ -1393,6 +1393,10 @@ def _play_one_game_recording(
                 if structured_scalar_schema_version is None
                 else int(structured_scalar_schema_version)
             ),
+            # Explicit (== the tokenizer's default) because every shard
+            # records the cap its printing ids were bucketed at — see
+            # ``shard_n_printings_cap`` / ``save_dataset``.
+            "n_printings_cap": shard_n_printings_cap(),
         }
 
     samples: list[
@@ -1757,6 +1761,34 @@ def _sample_move_with_temperature(
     return rng.choices([d for d, _ in cands], weights=weights, k=1)[0]
 
 
+def shard_n_printings_cap() -> int:
+    """The printing-id bucketing cap data-gen tokenises at.
+
+    Training shards are tokenised independently of any model (a
+    heuristic corpus has none), at the tokenizer's default cap; the
+    trainer builds its model at the same ``n_printings``. Every
+    structured shard records this cap next to its card vocabulary
+    (``card_vocab.SHARD_KEY``) so a trainer can never silently read ids
+    bucketed for a different table size.
+    """
+    from mtg_bot.training.structured_model import DEFAULT_N_PRINTINGS
+
+    return int(DEFAULT_N_PRINTINGS)
+
+
+def shard_card_vocab_entries() -> dict[str, np.ndarray]:
+    """The npz entries stamping a structured shard written by THIS
+    process with the card vocabulary + cap its printing ids use."""
+    from mtg_bot.training.card_vocab import (
+        current_card_vocab,
+        shard_card_vocab_arrays,
+    )
+
+    return shard_card_vocab_arrays(
+        current_card_vocab(), shard_n_printings_cap(),
+    )
+
+
 def save_dataset(
     features: np.ndarray,
     outcomes: np.ndarray,
@@ -1801,6 +1833,11 @@ def save_dataset(
     - ``structured_token_emb_ids``  : ``(N, max_seq_len, N_EMB_FIELDS)`` int64
     - ``structured_token_scalars``  : ``(N, max_seq_len, N_SCALAR_FIELDS)`` float32
     - ``structured_attention_mask`` : ``(N, max_seq_len)`` bool
+    - ``structured_card_vocab``     : ``uint8`` utf-8 JSON — the card
+      vocabulary (names + sha256) and ``n_printings_cap`` the
+      structured printing ids were tokenised under
+      (``card_vocab.SHARD_KEY``; written whenever the structured
+      arrays are).
 
     Compressed — datasets are small even with policy supervision
     (zeros + bool masks compress aggressively).
@@ -1857,6 +1894,11 @@ def save_dataset(
                     f"{name} rows {arr.shape[0]} != features rows {n}"
                 )
             arrays[name] = arr
+        # Record the id space the structured printing ids live in (the
+        # card vocabulary + bucketing cap). The trainer refuses to mix
+        # shards from different id spaces and stamps the trained model
+        # with this vocabulary.
+        arrays.update(shard_card_vocab_entries())
     if root_values is not None:
         # ``(N,)`` float32 search root value from the row's viewer
         # perspective, NaN where unknown. Optional: files without it

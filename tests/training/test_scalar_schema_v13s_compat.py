@@ -17,6 +17,10 @@ from pathlib import Path
 
 import pytest
 
+from mtg_bot.training.card_vocab import (
+    MissingCardVocabError,
+    current_card_vocab,
+)
 from mtg_bot.training.registry import ModelMetadata
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -74,5 +78,17 @@ def test_v13s_weights_load_into_schema_1_model() -> None:
         pytest.skip("v13s weights.pt not available")
     with (d / "metadata.json").open("r", encoding="utf-8") as f:
         meta = ModelMetadata.from_dict(json.load(f))
+    if meta.card_vocab or (d / "weights.pt.card_vocab.json").is_file():
+        pytest.skip("v13s has been stamped; the unstamped pin no longer applies")
+    # Unstamped (predates the card-vocab fingerprint): refused, never
+    # guessed.
+    with pytest.raises(MissingCardVocabError):
+        NNEvaluator.from_metadata(weights, meta)
+    # With its vocabulary supplied explicitly it loads bit-for-bit.
+    # v13s was trained at 3af7edea, whose card vocabulary is the
+    # 475-name list main still uses (``mtg_bot card-vocab export
+    # --git-commit 3af7edea``); this pin is about the scalar width.
+    meta.card_vocab = current_card_vocab().to_dict()
     ev = NNEvaluator.from_metadata(weights, meta)
     assert ev.model.scalar_proj.in_features == 3
+    assert ev.card_vocab_report is not None

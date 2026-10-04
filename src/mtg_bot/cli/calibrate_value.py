@@ -129,6 +129,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json-out", type=Path, default=None,
         help="Also write the fitted calibration + metrics to this path.",
     )
+    parser.add_argument(
+        "--shard-card-vocab", type=str, default=None,
+        help=(
+            "Card-vocabulary file asserting the vocabulary of "
+            "pre-fingerprint (unstamped) shards, as for `mtg_bot train "
+            "--shard-card-vocab`. Default: $MTG_BOT_SHARD_CARD_VOCAB."
+        ),
+    )
     return parser
 
 
@@ -227,6 +235,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     model = evaluator.model
     model.eval()
+
+    # The held-out shards' printing ids must live in the loaded model's
+    # input space: the current card vocabulary (the loader remapped the
+    # checkpoint to it) bucketed at the model's n_printings. Scoring a
+    # model on ids from another id space would fit a temperature to
+    # scrambled card identities.
+    from mtg_bot.training.card_vocab import (
+        CardVocabError,
+        current_card_vocab,
+        legacy_shard_vocab_from_arg,
+        resolve_shards_card_vocab,
+    )
+    from mtg_bot.training.structured_dataset import _select_paths
+
+    try:
+        shard_vocab = resolve_shards_card_vocab(
+            _select_paths(Path(data_dir), max_files),
+            legacy_vocab=legacy_shard_vocab_from_arg(args.shard_card_vocab),
+        )
+    except CardVocabError as exc:
+        print(f"card vocabulary: {exc}", file=sys.stderr)
+        return 2
+    model_vocab = current_card_vocab()
+    model_cap = int(model.config.n_printings)
+    # ``None`` = no structured rows at all; the loader / "no samples"
+    # checks below report that case.
+    if shard_vocab is not None and (
+        shard_vocab.vocab.sha256 != model_vocab.sha256
+        or shard_vocab.n_printings_cap != model_cap
+    ):
+        print(
+            f"card vocabulary mismatch: the held-out shards use vocabulary "
+            f"{shard_vocab.vocab.short_sha} ({shard_vocab.vocab.size} "
+            f"names) at n_printings cap {shard_vocab.n_printings_cap}, but "
+            f"{args.version} is loaded in vocabulary "
+            f"{model_vocab.short_sha} ({model_vocab.size} names) at "
+            f"n_printings {model_cap}. Calibrate on shards generated "
+            f"under the current card vocabulary.",
+            file=sys.stderr,
+        )
+        return 2
 
     dataset = load_structured_dataset(Path(data_dir), max_files=max_files)
     try:

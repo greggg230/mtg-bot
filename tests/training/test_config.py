@@ -17,6 +17,8 @@ from mtg_bot.search import PIMC, RandomChoice
 from mtg_bot.search.heuristic_evaluator import MtgHeuristicEvaluator
 from mtg_bot.search.nn_eval_server import NNEvalServer
 from mtg_bot.search.nn_evaluator import NNEvaluator
+from mtg_bot.training.card_vocab import MissingCardVocabError
+from tests._card_vocab_helpers import current_vocab_dict, stamp_current_vocab
 from mtg_bot.training.config import (
     HeuristicConfig,
     NNPimcConfig,
@@ -231,6 +233,7 @@ def test_nn_pimc_config_build_picks_up_structured_meta(
             # Absent -> schema 1 (3-slot); the saved model is on the
             # config default, so record it.
             "scalar_schema_version": cfg.scalar_schema_version,
+            "card_vocab": current_vocab_dict(),
             "training": {
                 "structured_emb_dim": 64,
                 "structured_n_heads": 4,
@@ -273,7 +276,9 @@ def test_nn_pimc_config_build_picks_up_structured_meta_no_sidecar(
     weights = tmp_path / "v_test" / "weights.pt"
     weights.parent.mkdir(parents=True)
     torch.save(model.state_dict(), weights)
-    # Intentionally NO metadata.json next to weights.
+    # Intentionally NO metadata.json next to weights; the card
+    # vocabulary comes from the weights file's own stamp.
+    stamp_current_vocab(weights)
 
     pimc_cfg = NNPimcConfig(
         weights_path=str(weights),
@@ -282,6 +287,29 @@ def test_nn_pimc_config_build_picks_up_structured_meta_no_sidecar(
     )
     strategy = pimc_cfg.build(seed=0)
     assert isinstance(strategy, PIMC)
+
+
+def test_nn_pimc_config_build_refuses_unstamped_structured_weights(
+    tmp_path: Path,
+) -> None:
+    """The worker build path must never guess a structured
+    checkpoint's card vocabulary: no metadata ``card_vocab`` and no
+    stamp sidecar -> ``MissingCardVocabError``, not a silent load whose
+    printing embeddings may be indexed by a different card list."""
+    from mtg_bot.training.structured_model import (
+        StructuredModel, StructuredModelConfig,
+    )
+
+    weights = tmp_path / "v_test" / "weights.pt"
+    weights.parent.mkdir(parents=True)
+    torch.save(StructuredModel(StructuredModelConfig()).state_dict(), weights)
+    pimc_cfg = NNPimcConfig(
+        weights_path=str(weights),
+        samples=1, inner_nodes=2, batch_size=1, with_policy=True,
+        architecture="structured",
+    )
+    with pytest.raises(MissingCardVocabError, match="card vocabulary"):
+        pimc_cfg.build(seed=0)
 
 
 def test_nn_pimc_config_to_dict_with_explicit_hidden_sizes(
@@ -726,6 +754,7 @@ def test_nn_pimc_config_build_reads_scalar_schema_from_sidecar(
         _json.dump({
             "version": "v_legacy",
             "architecture": "structured",
+            "card_vocab": current_vocab_dict(),
             "training": {
                 "structured_config": {
                     "emb_dim": 32, "n_heads": 2, "n_layers": 1,
