@@ -347,18 +347,19 @@ class NNPimcConfig:
             # and value_head_input -- every played game ran the value
             # head uncalibrated.)
             meta = _sibling_metadata(Path(self.weights_path))
-            architecture = self.architecture
-            if architecture is None and meta is not None:
-                architecture = meta.get("architecture")
-            if architecture == "structured" and meta is not None:
+            if meta is not None:
+                # Config fields fill what the sidecar omits and must
+                # agree with what it records (raises otherwise).
+                meta = _reconcile_metadata(
+                    meta,
+                    architecture=self.architecture,
+                    action_encoding_version=self.action_encoding_version,
+                    weights_path=self.weights_path,
+                )
+            if meta is not None and meta.get("architecture") == "structured":
                 evaluator = NNEvaluator.from_metadata(
                     Path(self.weights_path),
-                    _reconcile_metadata(
-                        meta,
-                        architecture=self.architecture,
-                        action_encoding_version=self.action_encoding_version,
-                        weights_path=self.weights_path,
-                    ),
+                    meta,
                     device=eval_kwargs.get("device", "cpu"),
                     apply_value_calibration=self.apply_value_calibration,
                 )

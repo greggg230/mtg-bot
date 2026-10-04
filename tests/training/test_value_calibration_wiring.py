@@ -327,17 +327,8 @@ def test_nnpimc_build_defers_architecture_to_the_sidecar(
 def test_nnpimc_build_refuses_a_config_that_contradicts_the_sidecar(
     calibrated_version, field, value,
 ):
-    meta_path = calibrated_version.parent / "metadata.json"
-    cfg = _pimc(calibrated_version, **{field: value})
-    if field == "architecture":
-        # A flat config against a structured sidecar: the sidecar's
-        # calibration cannot be applied to an MLP -> loud.
-        with pytest.raises(ValueError, match="flat MLP"):
-            cfg.build(0)
-    else:
-        with pytest.raises(ValueError, match="disagrees"):
-            cfg.build(0)
-    assert meta_path.is_file()
+    with pytest.raises(ValueError, match="disagrees"):
+        _pimc(calibrated_version, **{field: value}).build(0)
 
 
 def test_nnpimc_build_fills_a_minimal_sidecar_from_the_config(
