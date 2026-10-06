@@ -317,6 +317,87 @@ s2 lineage retrains each cycle from scratch on its recent-shard window,
 so the extended checkpoint is what keeps the trained network in the
 loop: it drives the next cycles' self-play and is the gate's baseline.
 
-## 12. Measurements
+## 12. Measurements (2026-10-06, desktop i9-13900K, CPU)
 
-(filled in as they land)
+**Harness / codec sweeps (random play, real 17lands EoE decks).**
+Before the fixes: 198 / 200 games looped to the decision cap, 2 / 200
+crashed. After: 1000 / 1000 games end, 20,776 pauses, 42 overflow
+options (0.2 %, battlefield positions past 24 on random-play boards),
+0 codec collisions. A second 400-game sweep checked every pause:
+encode / decode round-trip exact, mask == encodable options, v2 mask
+empty at pauses, v3 prefix == v2 mask at every priority moment.
+
+**Extended v30 (v30r).** 480 real game states: 0 value differences,
+0 policy differences on the 517 old slots (bit-identical; the
+inference path scores `policy_slot_range=(0, 517)`). The full-width
+805-slot forward differs from v30's 517-slot one by at most 7.6e-6 in
+a logit (GEMM shape), which inference never uses. At pauses the new
+slots give near-uniform priors (e.g. 0.164-0.169 over six targets).
+
+**Old path unchanged.** The 20-game horizon census with both seats
+`+autotarget` (`analysis_runs/search_horizon_v30_autotarget_recheck`)
+replays the pre-branch run (`analysis_runs/search_horizon_v30`, git
+18848b7c) game for game: same per-game outcomes, 5114 agent decisions,
+identical blunder counts.
+
+**Self-play throughput** (production config, 40 games, 20 processes;
+`docs/BENCHMARKING_FINDINGS.md` §8D): 359 -> 399 s mean per game
+(+11 %), 200 -> 180 games / hour; 16.5 resolution policy rows per game
+(1178 vs 1169 rows per game in total).
+
+**Strength** (`docs/STRENGTH_LADDER.md`, 300 games per pair, nodes 200
+/ samples 2, same deals as `ladder_runs/s2_v30_diag_n200`):
+
+| pair | win rate [Wilson 95 %] |
+|---|---|
+| baseline v30+b1 vs heuristic, both auto-targeting | 53.0 % [47.4, 58.6] |
+| (a) v30r+b1 vs heuristic, both searched | 51.9 % [46.2, 57.5] |
+| (b) v30r+b1 searched vs heuristic+autotarget | 65.0 % [59.4, 70.2] |
+| (c) heuristic searched vs heuristic+autotarget | 63.1 % [57.5, 68.4] |
+
+**Blunder census** (horizon report, v30 seat vs heuristic, 20 games,
+same deals; before = `analysis_runs/search_horizon_v30` standard arm,
+after = `analysis_runs/search_horizon_v30r_resolution`, both seats
+searched):
+
+| per 20 games | before (auto-targeting) | after (searched) |
+|---|---|---|
+| harmful (damage / destroy / exile) targeted items | 17 | 21 |
+| ... aimed at own permanent / face, opponent target available | 1 | 0 |
+| ... aimed at own, only own targets legal | 1 | 0 |
+| chump attacks | 9 | 3 |
+| fizzles | 2 | 0 |
+| resolution decisions made by search (36 forced) | 0 | 135 |
+
+## 13. Rolling the s2 lineage onto canonical_v3
+
+1. Put the coordinator's checkout (the one `mtg_bot serve` / `iterate`
+   run from) on this branch (or on `s2/eoe-training` once it is merged
+   there); workers then `POST /v2/self_update` (no Rust change, so no
+   rebuild). Nothing else on the workers: the switch defaults ON and
+   their NN configs come from the version metadata.
+2. Extend the current best and make it the lineage's current best:
+
+   ```
+   mtg_bot extend-resolution-slots --registry-root trained_weights_s2        --version v30 --register --set-current-best
+   ```
+
+   registers the next id (v31 today) = v30 + 288 resolution rows (seed
+   recorded in `extra.resolution_extension`) and points
+   `trained_weights_s2/iterate_state.json` `current_best` at it.
+3. Set `MTG_BOT_LEGACY_POLICY_ENCODING=canonical_v2` in the
+   coordinator's environment (the `train_nn.py` subprocess inherits
+   it): the 6000-file training window still holds 517-wide shards,
+   which are then zero-padded explicitly; without it the first v3
+   training refuses the window.
+4. Resume the cycles unchanged (`configs/launch/s2.toml`; leave
+   `bootstrap_version` alone). `iterate` sees a canonical_v3
+   current_best on a canonical_v2 lineage and runs self-play, training
+   and eval under canonical_v3 (`resolve_lineage_action_encoding`).
+   New shards are 805 wide and stamped; each trained version is
+   805 wide; the first gate is v32 vs v31.
+5. Rollback: `MTG_BOT_SEARCH_RESOLUTION_DECISIONS=0` on coordinator and
+   workers restores auto-targeting for every game; v31 still plays
+   exactly like v30 there (its resolution slots are never consulted),
+   but the trainer keeps expecting canonical_v3 shards until
+   `current_best` points back at a canonical_v2 version.

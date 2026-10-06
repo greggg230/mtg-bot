@@ -8,6 +8,14 @@ blunders? And: does planning against the *public board only* (not
 imagining the opponent's hidden cards) play better than sampling a
 concrete opponent hand?
 
+**Update 2026-10-06**: resolution decisions (targets, modes, X, "may",
+...) are now searched in production (`feature/s2-resolution-decisions`,
+`docs/RESOLUTION_DECISIONS.md`); where this report says they are
+`DefaultTacticalAgent`'s, that describes the 2026-10-05 code. The
+census rerun with them searched is in `docs/RESOLUTION_DECISIONS.md`
+§12 (self-targeted removal 2 -> 0, chump attacks 9 -> 3, fizzles
+2 -> 0 per 20 games).
+
 Results: §Findings and §A/B below. Raw outputs:
 `analysis_runs/search_horizon_v30/` in the main checkout
 (`summary.json`, `report.md`, `decisions.jsonl.gz`, `trees/*.txt`).

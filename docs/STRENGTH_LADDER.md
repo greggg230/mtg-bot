@@ -357,3 +357,32 @@ in `ladder_runs/s2_v30_diag_n200`.
 Reading: no measurable effect either way (all inside the 300-game CI);
 the board-only searcher is not hurt by never seeing an opposing trick.
 Horizon / blunder measurements and the method: `docs/SEARCH_HORIZON.md`.
+
+
+### 2026-10-06 -- searched resolution decisions (nodes 200 / samples 2, 300 games per pair)
+
+`feature/s2-resolution-decisions` (`docs/RESOLUTION_DECISIONS.md`):
+targets, modes, X, "may", surveil, sacrifice, discard, tutor picks are
+search decisions by default; `+autotarget` restores the old
+`DefaultTacticalAgent` choices for that seat. `v30r` = v30 + the
+canonical_v3 resolution slots (`mtg_bot extend-resolution-slots`; no
+training -- bit-identical to v30 outside resolution pauses). Same
+deals (seed 0, heuristic seat first) as `ladder_runs/s2_v30_diag_n200`;
+9 + 9 + 6 workers concurrently, per-game timeout 1200 s; outputs
+`ladder_runs/s2_resolution_{a,b,c}_n200`.
+
+| pair | result | win rate [Wilson 95 %] | timeouts |
+|---|---|---|---|
+| baseline: v30+b1 vs heuristic, both auto-targeting | 158-140 | 53.0 % [47.4, 58.6] | 2 |
+| (a) v30r+b1 vs heuristic, both searched | 154-143 | 51.9 % [46.2, 57.5] | 3 |
+| (b) v30r+b1 (searched) vs heuristic+autotarget | 193-104 | 65.0 % [59.4, 70.2] | 3 |
+| (c) heuristic (searched) vs heuristic+autotarget | 188-110 | 63.1 % [57.5, 68.4] | 2 |
+
+Reading: searching the resolution choices is worth ~12-13 points of
+win rate against the same opponent for BOTH searchers -- (b) is +12.0
+points over the baseline [Newcombe 95 %: +4.1, +19.7; unpaired, so
+conservative], (c) +13.1 over 50 % -- about +90 Elo. With both seats
+searching (a) the net and the heuristic are back at parity (-1.2
+points vs baseline, [-9.1, +6.8]): the gain is the search's, not the
+untrained resolution slots' (they are near-uniform). No crashes in 900
+games; games 179 and 295 time out in every arm, as in the baseline.
