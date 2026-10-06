@@ -29,6 +29,7 @@ from pathlib import Path
 from mtg_bot.cli import _common
 from mtg_bot.cli._common import depth_parser, runtime_parser
 from mtg_bot.decks import decks_from_json
+from mtg_bot.search.determinize import OPPONENT_HIDDEN_MODELS
 from mtg_bot.training.config import NNPimcConfig
 from mtg_bot.training.data_gen import (
     ReplayCaptureConfig,
@@ -61,6 +62,16 @@ def main(argv=None) -> None:  # pragma: no cover
         help="Directory replays land in (created if missing).",
     )
     p.add_argument("--replay-prefix", default="game")
+    p.add_argument(
+        "--opponent-hidden-model", choices=OPPONENT_HIDDEN_MODELS,
+        default="sampled",
+        help=(
+            "How each seat's search models the opponent's hidden "
+            "cards: 'sampled' (default; imagine a hand from their deck) "
+            "or 'board_only' (inert placeholders -- see "
+            "mtg_bot.search.determinize)."
+        ),
+    )
     args = p.parse_args(argv)
     _common.resolve_per_game_timeout(args)
 
@@ -90,6 +101,7 @@ def main(argv=None) -> None:  # pragma: no cover
         hidden_sizes=hidden_sizes,
         architecture=arch,
         policy_hidden_sizes=policy_hidden,
+        opponent_hidden_model=args.opponent_hidden_model,
     )
 
     replay_cfg = ReplayCaptureConfig(
@@ -113,6 +125,7 @@ def main(argv=None) -> None:  # pragma: no cover
         f"[capture] {args.bootstrap_version} self-play, "
         f"n_games={args.n_games}, samples={args.samples}, "
         f"nodes={args.nodes}, workers={args.workers}, "
+        f"opponent_hidden_model={args.opponent_hidden_model}, "
         f"replays -> {args.replays_dir}"
     )
 

@@ -131,10 +131,15 @@ class HybridPimcConfig:
                 root_dirichlet_eps=eps,
             )
 
+        from mtg_bot.search.determinize import make_determinize_fn
         return PIMC(
             inner_factory=inner_factory,
             samples=self.samples,
             rng=random.Random(rng_seed_outer),
+            # The opponent model rides on the NN config (``+boardonly``).
+            determinize_fn=make_determinize_fn(
+                getattr(self.nn, "opponent_hidden_model", "sampled"),
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

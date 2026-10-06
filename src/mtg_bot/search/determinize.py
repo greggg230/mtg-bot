@@ -24,9 +24,39 @@ which.
 
 from __future__ import annotations
 
+import functools
 import random
+from typing import Callable
 
+from mtg_bot.cards.hidden import HIDDEN_CARD_PRINTING
 from mtg_bot.game import _CowList, GameObject, GameState, Zone
+
+
+# How the searching agent models the opponent's hidden cards:
+#
+# * ``"sampled"`` (default; the behaviour since PR 2): re-permute the
+#   opponent's unknown hand+library printings, i.e. imagine a concrete
+#   hand drawn from their deck.
+# * ``"board_only"``: don't imagine them at all -- every opponent
+#   hand / library card the viewer can't identify becomes the inert
+#   ``mtg_bot.cards.hidden.HIDDEN_CARD_PRINTING`` placeholder (never
+#   castable / playable / activatable; still counts toward hand size,
+#   discard, mill). The opponent can still act with everything public
+#   (attack, block, activate permanents). The viewer's OWN library is
+#   sampled exactly as under ``"sampled"`` (we know our decklist).
+#   See ``docs/SEARCH_LIMITATIONS.md`` ("Board-only opponent model").
+OPPONENT_HIDDEN_MODELS: tuple[str, ...] = ("sampled", "board_only")
+DEFAULT_OPPONENT_HIDDEN_MODEL = "sampled"
+
+
+def check_opponent_hidden_model(model: str) -> str:
+    """Validate an ``opponent_hidden_model`` value; returns it."""
+    if model not in OPPONENT_HIDDEN_MODELS:
+        raise ValueError(
+            f"opponent_hidden_model must be one of "
+            f"{list(OPPONENT_HIDDEN_MODELS)}, got {model!r}"
+        )
+    return model
 
 
 _PUBLIC_ZONES: frozenset[Zone] = frozenset(
@@ -67,6 +97,7 @@ def determinize(
     rng: random.Random | None = None,
     *,
     in_place: bool = False,
+    opponent_hidden_model: str = DEFAULT_OPPONENT_HIDDEN_MODEL,
 ) -> GameState:
     """Return a state consistent with what ``viewer_id`` knows.
 
@@ -97,13 +128,54 @@ def determinize(
     rollouts. The returned state's library order is then concrete, so
     no further chance-node modeling is required for card draws within
     the search.
+
+    ``opponent_hidden_model="board_only"`` replaces (instead of
+    permuting) every hidden opponent hand / library card with the inert
+    placeholder; the viewer's own hidden cards are still permuted. See
+    ``OPPONENT_HIDDEN_MODELS``.
     """
+    check_opponent_hidden_model(opponent_hidden_model)
+    board_only = opponent_hidden_model == "board_only"
     if rng is None:
         rng = random.Random()
     target = state if in_place else state.clone()
     for player in target.players:
-        _determinize_player(player, viewer_id, rng)
+        if board_only and player.id != viewer_id:
+            _blank_player(player, viewer_id)
+        else:
+            _determinize_player(player, viewer_id, rng)
     return target
+
+
+def make_determinize_fn(opponent_hidden_model: str) -> Callable:
+    """The ``determinize_fn`` for PIMC / ISMCTS under the given
+    opponent model. ``"sampled"`` returns :func:`determinize` itself
+    (so the default search is bit-identical to before the option
+    existed); ``"board_only"`` returns a picklable
+    ``functools.partial`` of it."""
+    check_opponent_hidden_model(opponent_hidden_model)
+    if opponent_hidden_model == DEFAULT_OPPONENT_HIDDEN_MODEL:
+        return determinize
+    return functools.partial(
+        determinize, opponent_hidden_model=opponent_hidden_model,
+    )
+
+
+def _blank_player(player, viewer_id: int) -> None:
+    """Board-only: give every hand / library card of ``player`` that
+    the viewer doesn't know the inert hidden-card placeholder. Same
+    CoW fork as ``_determinize_player`` (the library's GameObjects are
+    shared with the source state until forked)."""
+    library = player.library
+    if isinstance(library, _CowList):
+        library.fork()
+    for zone in (player.hand, player.library):
+        for card in zone:
+            if viewer_knows(card, viewer_id):
+                continue
+            card.printing = HIDDEN_CARD_PRINTING
+            if card.original_printing is not None:
+                card.original_printing = HIDDEN_CARD_PRINTING
 
 
 def _determinize_player(

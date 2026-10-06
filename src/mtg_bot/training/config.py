@@ -36,6 +36,11 @@ from mtg_bot.search import (
     PIMC,
     RandomChoice,
 )
+from mtg_bot.search.determinize import (
+    DEFAULT_OPPONENT_HIDDEN_MODEL,
+    check_opponent_hidden_model,
+    make_determinize_fn,
+)
 from mtg_bot.search.evaluator import Evaluator
 from mtg_bot.search.heuristic_evaluator import MtgHeuristicEvaluator
 from mtg_bot.search.nn_eval_server import NNEvalClient, NNServerHandle
@@ -98,6 +103,13 @@ class PimcConfig:
     # ``mtg_bot.training.self_play_evaluator``.
     root_dirichlet_alpha: Optional[float] = None
     root_dirichlet_eps: float = 0.25
+    # How each PIMC world models the opponent's hidden cards:
+    # ``"sampled"`` (default, unchanged behaviour) or ``"board_only"``
+    # (inert placeholders; see ``mtg_bot.search.determinize``).
+    opponent_hidden_model: str = DEFAULT_OPPONENT_HIDDEN_MODEL
+
+    def __post_init__(self) -> None:
+        check_opponent_hidden_model(self.opponent_hidden_model)
 
     def build(self, seed: int = 0) -> SearchStrategy:
         """Construct a fresh PIMC search strategy seeded for
@@ -125,6 +137,7 @@ class PimcConfig:
             inner_factory=inner_factory,
             samples=self.samples,
             rng=random.Random(rng_seed_outer),
+            determinize_fn=make_determinize_fn(self.opponent_hidden_model),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +148,7 @@ class PimcConfig:
             "batch_size": self.batch_size,
             "root_dirichlet_alpha": self.root_dirichlet_alpha,
             "root_dirichlet_eps": self.root_dirichlet_eps,
+            "opponent_hidden_model": self.opponent_hidden_model,
         }
 
     @classmethod
@@ -146,6 +160,9 @@ class PimcConfig:
             batch_size=d.get("batch_size", 1),
             root_dirichlet_alpha=d.get("root_dirichlet_alpha"),
             root_dirichlet_eps=d.get("root_dirichlet_eps", 0.25),
+            opponent_hidden_model=d.get(
+                "opponent_hidden_model", DEFAULT_OPPONENT_HIDDEN_MODEL,
+            ),
         )
 
 
@@ -277,8 +294,24 @@ class NNPimcConfig:
     # modifier ``+nocal``). Only consulted when a ``metadata.json`` sits
     # next to ``weights_path``.
     apply_value_calibration: bool = True
+    # How each search world models the opponent's hidden cards:
+    # ``"sampled"`` (default, unchanged behaviour) or ``"board_only"``
+    # (inert placeholders; see ``mtg_bot.search.determinize``). Each
+    # seat's config carries its own, so the two seats of a match are
+    # independent. ``mtg_bot ladder`` label modifier ``+boardonly``.
+    opponent_hidden_model: str = DEFAULT_OPPONENT_HIDDEN_MODEL
 
     def __post_init__(self) -> None:
+        check_opponent_hidden_model(self.opponent_hidden_model)
+        if (
+            self.use_belief_weighted
+            and self.opponent_hidden_model != DEFAULT_OPPONENT_HIDDEN_MODEL
+        ):
+            raise ValueError(
+                "use_belief_weighted=True samples the opponent's hand "
+                "from a belief model; it cannot be combined with "
+                f"opponent_hidden_model={self.opponent_hidden_model!r}"
+            )
         if self.use_belief_weighted and not self.use_ismcts:
             raise ValueError(
                 "use_belief_weighted=True requires use_ismcts=True; "
@@ -387,6 +420,10 @@ class NNPimcConfig:
                 "batch_size": self.batch_size,
                 "puct": self.puct,
             }
+            if self.opponent_hidden_model != DEFAULT_OPPONENT_HIDDEN_MODEL:
+                ismcts_kwargs["determinize_fn"] = make_determinize_fn(
+                    self.opponent_hidden_model,
+                )
             if self.use_belief_weighted:
                 from mtg_bot.search.belief import (
                     BeliefWeightedDeterminizer,
@@ -424,6 +461,7 @@ class NNPimcConfig:
             inner_factory=inner_factory,
             samples=self.samples,
             rng=random.Random(rng_seed_outer),
+            determinize_fn=make_determinize_fn(self.opponent_hidden_model),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -454,6 +492,7 @@ class NNPimcConfig:
             "root_dirichlet_alpha": self.root_dirichlet_alpha,
             "root_dirichlet_eps": self.root_dirichlet_eps,
             "apply_value_calibration": self.apply_value_calibration,
+            "opponent_hidden_model": self.opponent_hidden_model,
         }
 
     @classmethod
@@ -487,6 +526,9 @@ class NNPimcConfig:
             root_dirichlet_eps=d.get("root_dirichlet_eps", 0.25),
             apply_value_calibration=bool(
                 d.get("apply_value_calibration", True)
+            ),
+            opponent_hidden_model=d.get(
+                "opponent_hidden_model", DEFAULT_OPPONENT_HIDDEN_MODEL,
             ),
         )
 

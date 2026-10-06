@@ -411,6 +411,14 @@ class MCTS(SearchStrategy):
         self._action_encoding_version = getattr(
             evaluator, "action_encoding_version", "positional_v1",
         )
+        # Opt-in search diagnostics (``mtg_bot.search.horizon_probe``):
+        # when set, every ``choose_*`` call that actually builds a tree
+        # hands the finished root ``_Node`` and the root player to
+        # ``tree_observer(root, player_id)`` before the tree is
+        # dropped. ``None`` (default) costs one attribute check per
+        # search and changes nothing. Forced moves build no tree and
+        # are not reported.
+        self.tree_observer: Optional[Any] = None
 
     def choose(
         self, state: GameState, player_id: PlayerID
@@ -490,6 +498,8 @@ class MCTS(SearchStrategy):
                     root, player_id, budget, self.batch_size,
                 )
 
+            if self.tree_observer is not None:
+                self.tree_observer(root, player_id)
             candidates = [
                 {
                     "decision": child.decision,
@@ -577,6 +587,8 @@ class MCTS(SearchStrategy):
                 root, player_id, budget, self.batch_size,
             )
 
+        if self.tree_observer is not None:
+            self.tree_observer(root, player_id)
         candidates = self._walk_subtree(
             root,
             depth_remaining=tree_depth,
@@ -676,6 +688,8 @@ class MCTS(SearchStrategy):
                     root, player_id, budget, self.batch_size,
                 )
 
+            if self.tree_observer is not None:
+                self.tree_observer(root, player_id)
             return {c.decision: c.visits for c in root.children}
         finally:
             self._eval_cache = {}

@@ -112,6 +112,7 @@ single priority window the hash is recomputed and compared on every
 from __future__ import annotations
 
 from mtg_bot.actions import can_pay_cost
+from mtg_bot.cards.hidden import is_hidden_placeholder
 from mtg_bot.game import GameState
 from mtg_bot.turn import MAIN_STEPS, Step
 
@@ -168,6 +169,11 @@ def _sorcery_speed_castable_in_hand(
     for card in p.hand:
         pr = card.printing
         if pr.is_land:
+            continue
+        if is_hidden_placeholder(pr):
+            # Board-only search worlds: the inert hidden-card stand-in
+            # has no type, so ``legal_actions`` never offers it; don't
+            # let its {0} cost make the player "able to act".
             continue
         if pr.is_instant or "flash" in pr.keywords:
             # Already covered by the instant-speed sibling. Skip to

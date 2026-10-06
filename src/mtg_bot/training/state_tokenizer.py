@@ -73,6 +73,7 @@ from mtg_bot.actions import (
     UnlockRoomHalf,
 )
 from mtg_bot.cards.base import CardPrinting
+from mtg_bot.cards.hidden import is_hidden_placeholder
 from mtg_bot.game import (
     GameObject,
     GameState,
@@ -371,9 +372,20 @@ def _make_zone_card_token(
     only permanents and the global token carry board state.
     """
     emb = _empty_emb_row()
-    emb[EMB_FIELD_PRINTING] = printing_id(
-        card.printing, n_printings_cap=n_printings_cap,
-    )
+    if is_hidden_placeholder(card.printing):
+        # Board-only search worlds (``opponent_hidden_model=
+        # "board_only"``): an inert stand-in for a card the searcher
+        # can't see. Tokenized as redacted -- printing NA, non-public --
+        # from every perspective, including the opponent's own (their
+        # hand is "visible" to them when the search evaluates a prior
+        # at an opponent node). The name never maps to a vocab id
+        # anyway; this makes the redaction explicit.
+        emb[EMB_FIELD_PRINTING] = PRINTING_NA
+        public_mask = 0.0
+    else:
+        emb[EMB_FIELD_PRINTING] = printing_id(
+            card.printing, n_printings_cap=n_printings_cap,
+        )
     emb[EMB_FIELD_CONTROLLER] = controller_vocab_id
     emb[EMB_FIELD_STEP] = _step_id(state_step)
     scalars = _empty_scalar_row(scalar_width)
