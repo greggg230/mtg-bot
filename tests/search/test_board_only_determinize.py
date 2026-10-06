@@ -370,3 +370,35 @@ def _opp_casts_in_tree(model: str) -> int:
 def test_sampled_search_sees_opponent_removal_board_only_does_not():
     assert _opp_casts_in_tree("sampled") > 0
     assert _opp_casts_in_tree("board_only") == 0
+
+
+@pytest.mark.parametrize("flag", [
+    "playable_from_exile_this_turn",
+    "cast_from_exile_with_lightstall_surcharge",
+    "play_from_exile_requires_kavu",
+])
+def test_placeholder_in_exile_with_cast_permission_is_not_castable(flag):
+    """Regression (2026-10-05 horizon run): an impulse / Lightstall /
+    Kavu cast permission on an exiled placeholder only checked the
+    ({}) cost, so the search cast the placeholder and crashed resolving
+    it ("don't know how to resolve <hidden card>")."""
+    adapter = _main_phase_adapter()
+    eng = adapter.engine_state
+    active = eng.players[eng.active_player_idx]
+    card = eng.new_object(HIDDEN_CARD_PRINTING, active.id, Zone.EXILE)
+    setattr(card, flag, True)
+    active.exile.append(card)
+    for _ in range(2):  # pay the Lightstall {1} surcharge
+        land = eng.new_object(BASIC_LANDS["Forest"], active.id, Zone.BATTLEFIELD)
+        land.controller_id = active.id
+        eng.battlefield.append(land)
+    if flag == "play_from_exile_requires_kavu":
+        import dataclasses
+        kavu = eng.new_object(
+            dataclasses.replace(SYNTHETIC_CREATURES["Wild Bear"], subtypes=("Kavu",)),
+            active.id, Zone.BATTLEFIELD,
+        )
+        kavu.controller_id = active.id
+        eng.battlefield.append(kavu)
+    acts = legal_actions(eng, active.id)
+    assert not any(getattr(a, "card_id", None) == card.id for a in acts)

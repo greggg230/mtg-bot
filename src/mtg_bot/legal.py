@@ -14,6 +14,7 @@ from mtg_bot.actions import (
     can_pay_cost,
 )
 from mtg_bot.cards import ManaCost
+from mtg_bot.cards.hidden import is_hidden_placeholder
 from mtg_bot.game import GameObject, GameState
 from mtg_bot.turn import MAIN_STEPS
 
@@ -67,7 +68,14 @@ def _can_cast(
     don't have to reconstruct those three arguments on every check.
     ``sac_for_mana`` is always ``True`` — every spell-cast site permits
     Treasure-style sacrifice during cost payment.
+
+    The board-only search placeholder (``mtg_bot.cards.hidden``) is
+    never castable: hand casts are already type-gated, but the
+    exile / graveyard cast-permission paths (impulse, Lightstall,
+    Kavu) only check the cost, and the placeholder's cost is ``{}``.
     """
+    if is_hidden_placeholder(card.printing):
+        return False
     return can_pay_cost(
         state, player_id, cost,
         spell_kind=_spell_kinds_for_card(card),
