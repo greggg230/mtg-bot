@@ -110,7 +110,109 @@ decision) is summarised.
 
 ## Findings
 
-(filled in from `analysis_runs/search_horizon_v30/summary.json`)
+20 games per arm, `v30+b1` (standard) vs `v30+b1+boardonly`, both vs
+`heuristic`, nodes 200 / samples 2, git `0415d24d`. The 40 games are
+bit-reproducible (a rerun after a census-only fix replayed all 40
+identically). Numbers are standard / board-only.
+
+**Budget and depth.**
+
+| | standard | board-only |
+|---|---|---|
+| agent decision moments per game | 256 | 275 |
+| ... forced (1 option, no tree built) | 84.5 % | 85.2 % |
+| unforced decisions per game | 39.6 | 40.7 |
+| unforced with >= 90 % of root visits on one child ("near-forced") | 11.9 % | 15.0 % |
+| nodes per tree (budget 200; 2 trees per decision) | 189 | 188 |
+| deepest path, plies (mean) | 29.0 | 35.1 |
+| deepest path, real choices (mean / median) | 6.1 / 6 | 6.2 / 6 |
+| most-visited path: plies / real choices | 27.2 / 5.7 | 33.2 / 5.8 |
+| search wall per unforced decision (6 concurrent games + a 20-worker ladder) | 2.70 s | 2.64 s |
+
+- `--nodes 200 --samples 2` means **two trees of ~190 nodes**, not two
+  of 100: `Budget(max_nodes=inner_nodes)` is per determinization.
+- Only ~40 decisions per game are real choices; 85 % of the agent's
+  decision moments are forced priority passes that never reach the
+  search (PIMC's forced-move shortcut).
+
+**How far in game time the trees reach.**
+
+| | standard | board-only |
+|---|---|---|
+| trees whose deepest node is at least a later phase this turn | 94.9 % | 95.3 % |
+| ... at least the next turn | 78.5 % | 81.8 % |
+| ... two or more turns ahead | 17.0 % | 36.9 % |
+| share of all nodes still in the root's step | 12.6 % | 12.4 % |
+| share of all nodes in the next turn or later | 47.3 % | 51.7 % |
+| chosen attack: tree contains combat damage | 99.4 % (n=306) | 99.3 % (n=286) |
+| chosen block: tree contains combat damage | 98.3 % (n=120) | 100 % (n=140) |
+| chosen cast / activation: tree contains its resolution | 100 % (n=452) | 100 % (n=466) |
+
+The worry that ~100 nodes never reach the consequences of an action is
+**not** borne out: essentially every attack, block and cast tree
+contains the action's resolution, and four in five trees reach the next
+turn. The depth is bought with forced moves, though — see below — so
+"reaches the next turn" mostly means "follows one thin line there".
+
+**Where the nodes go.**
+
+| share of tree nodes | standard | board-only |
+|---|---|---|
+| spent at forced (single-option) decision points | 63.3 % | 68.1 % |
+| that are a `PassPriority` | 72.4 % | 75.4 % |
+| at opponent decision points | 51.0 % | 44.5 % |
+| that ARE an action of an imagined (determinized) opponent card | 7.2 % | 0 |
+| that sit BELOW such an action | 32.0 % | 0 |
+| trees containing at least one imagined opponent-card action | 71.7 % | 0 |
+
+- Two thirds of every tree is priority bookkeeping: a forced chain
+  between real choices is typically 2-24 plies (the dumps fold them as
+  `(+k forced)`). The deepest line holds ~6 real choices.
+- Under sampled determinization **a third of the search conditions on
+  an opponent hand that was sampled** (and is almost always not the real
+  one); board-only removes that, the opponent's turn collapses into
+  forced passes, and the same budget reaches two turns ahead twice as
+  often.
+- Opponent spells inside the tree are auto-targeted first-legal like
+  the agent's: the dumps show imagined opponent removal aimed at the
+  opponent's own creature (`OPP: Cast Embrace Oblivion -> Virus
+  Beetle(opp)` in a sampled world), i.e. the sampled model also
+  under-estimates the opponent's removal when it does imagine it.
+
+**Blunder census (per game; 20 games each).**
+
+| detector | standard | board-only |
+|---|---|---|
+| self-targeted damage / destroy / exile, opponent target was available | 0.05 (1) | 0.10 (2) |
+| ... only own targets were legal | 0.05 (1) | 0.05 (1) |
+| chump attack (blocked, died, no trade, no trample) | 0.45 (9) | 0.35 (7) |
+| ... and the defender lost no life that combat | 0.10 (2) | 0.15 (3) |
+| fizzle (all targets gone at resolution) | 0.10 (2) | 0.05 (1) |
+| passed main 2 with a castable creature | 0.45 (9) | 0.40 (8) |
+| passed main 2 with another castable sorcery-speed spell | 0.50 (10) | 0.70 (14) |
+| agent stack items with targets (all auto-targeted) / of them damage-destroy-exile | 80 / 17 | 75 / 17 |
+
+Gross blunders are rare in absolute terms, but **2-3 of the 17
+removal-type stack items per arm (12-18 %) hit the agent's own
+permanent**, and the causes are the tactical policy, not search depth:
+Nebula Dragon's ETB "3 damage to any target" went to the agent's own
+Oreplate Pangolin with opponent creatures available, Faller's Faithful's
+"destroy UP TO ONE other target creature" destroyed the agent's own
+Hullcarver (zero targets was legal), and board-only cast Gravkill with
+its auto-target on its own Faller's Faithful. Targets, modes, X,
+"may" and "up to" choices are `DefaultTacticalAgent` first-legal /
+always-yes (`SEARCH_LIMITATIONS.md`, expose_resolution_decisions entry);
+search can only decline to cast. Chump attacks are mostly 1/1s (Virus
+Beetle, Robot tokens) swinging into blockers; only ~0.1 per game with
+nothing else connecting.
+
+**Tree dumps** (`analysis_runs/search_horizon_v30/trees/`): an attack
+declaration and a block (game 0), a removal cast (game 1, Archenemy's
+Charm, in an already-lost position, Q ~ -0.8), and an instant-speed response
+(game 1, Divert Disaster countering Dockworker Drone), each for both
+arms: board, PIMC-aggregated root (`choose_with_subtree`, depth 3,
+top 3) and both determinized worlds' trees (5 levels, top 3, forced
+chains folded, Q from the actor's view).
 
 ## A/B
 
