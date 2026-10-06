@@ -385,9 +385,19 @@ def _obj_label(eng: Any, obj_id: Optional[int], viewer: int) -> str:
 
 
 def _target_label(eng: Any, target: tuple, viewer: int) -> str:
+    """Label one ``(kind, id)`` engine target. ``("stack", i)`` is a
+    stack INDEX (counterspells), every other non-player kind carries an
+    object id."""
     kind, tid = target
     if kind == "player":
         return "own face" if tid == viewer else "opp face"
+    if kind == "stack":
+        stack = getattr(eng, "stack", ())
+        if isinstance(tid, int) and 0 <= tid < len(stack):
+            item = stack[tid]
+            side = "own" if item.controller_id == viewer else "opp"
+            return f"spell {item.source.printing.name}({side})"
+        return f"stack[{tid}]"
     return _obj_label(eng, tid, viewer)
 
 

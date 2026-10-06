@@ -105,7 +105,7 @@ decision) is summarised.
 | `self_target_forced` | same, but only own targets were legal (casting it at all was the error; for triggers it isn't a choice) | same |
 | `chump_attack` | agent attacker blocked, left the battlefield that combat, no blocker left the battlefield (no trade), no trample | alpha strikes where the rest of the team got through; removal mid-combat counts as "died to block" |
 | `chump_attack_no_other_damage` | `chump_attack` and the defender lost no life that combat | removal mid-combat |
-| `fizzle` | agent spell / ability with object targets only, all gone when it resolved, not countered | none for "did nothing"; under-counts pointless-but-legal casts |
+| `fizzle` | agent spell / ability whose targets are all battlefield objects, all gone when it resolved, not countered (counterspells' stack targets out of scope) | none for "did nothing"; under-counts pointless-but-legal casts and countered-out counterspells |
 | `missed_play_creature` / `_other` | agent passed its own main 2 with an empty stack while a sorcery-speed `CastSpell` was legal (creature / other); once per turn | sandbagging; `_other` over-counts removal held because its only legal targets were own creatures (correct to hold) |
 
 ## Findings

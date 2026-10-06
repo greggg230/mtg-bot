@@ -31,12 +31,15 @@ so a rate can be read honestly — also in ``docs/SEARCH_HORIZON.md``):
     the defending player lost no life in that combat), a creature
     removed by an instant mid-combat (counted as died-to-block).
 
-``fizzle`` — an agent spell / ability with >= 1 object target where
-    every object target had already left the battlefield when the item
+``fizzle`` — an agent spell / ability whose targets are all
+    battlefield objects (creature / permanent / planeswalker / battle
+    tags) and every one had already left the battlefield when the item
     reached the top of the stack and resolved (CR 608.2b: it does
-    nothing). Countered items are excluded. FP risk: none known for
-    "did nothing"; it under-counts spells that resolve with a legal but
-    pointless target (e.g. a pump on a creature that is not in combat).
+    nothing). Countered items are excluded; counterspells (``stack``
+    targets) are out of scope. FP risk: none known for "did nothing";
+    it under-counts spells that resolve with a legal but pointless
+    target (e.g. a pump on a creature that is not in combat) and
+    countered-out counterspells.
 
 ``missed_play`` — the agent passed priority in its own second main
     phase with an empty stack while ``legal_actions`` offered a
@@ -67,6 +70,11 @@ DETECTORS: tuple[str, ...] = (
 )
 
 _STEP_INDEX = {s: i for i, s in enumerate(STEP_ORDER)}
+# Engine target tags whose id is a battlefield object. Others:
+# ``player``; ``stack`` (a stack INDEX) / ``stack_spell`` (counterspells);
+# ``exile_card``; ``any_damage_target`` (object OR player id -- ambiguous,
+# skipped).
+PERMANENT_TARGET_KINDS = frozenset({"creature", "permanent", "planeswalker", "battle"})
 _HARM_PREFIXES = ("DealDamage", "Destroy", "Exile", "MayHaveSourceDealDamage")
 # Classes whose name starts with a harmful prefix but that never hit a
 # chosen permanent / face of the caster's choosing (each-opponent,
@@ -279,7 +287,10 @@ class BlunderCensus:
                     self._check_self_target(eng, item)
             # Refresh last-seen facts used by the fizzle detector.
             targets = tuple(getattr(item, "targets", ()) or ())
-            obj_targets = [t for t in targets if t[0] != "player"]
+            # Only items whose every target is a battlefield object
+            # (counterspell ``stack`` / ``stack_spell`` targets,
+            # ``exile_card`` and players are out of scope).
+            obj_targets = [t for t in targets if t[0] in PERMANENT_TARGET_KINDS]
             info["all_obj_targets_gone"] = bool(obj_targets) and all(
                 not _on_battlefield(eng, t[1]) for t in obj_targets
             ) and len(obj_targets) == len(targets)
@@ -315,8 +326,10 @@ class BlunderCensus:
             own = tid == self.seat and any(
                 "Damage" in h for h in harm
             )
-        else:
+        elif kind in PERMANENT_TARGET_KINDS:
             own = _controller_of(eng, tid) == self.seat
+        else:
+            return  # stack / exile-card / ambiguous tags: out of scope
         if not own:
             return
         pool = []

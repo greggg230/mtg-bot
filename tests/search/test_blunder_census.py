@@ -219,3 +219,26 @@ def test_missed_play_negative_cases(mutate):
 
 def test_detector_names_are_stable():
     assert set(BlunderCensus(seat=0).counts) == set(DETECTORS)
+
+
+def test_counterspell_stack_target_is_not_a_fizzle_or_self_target():
+    """Regression (2026-10-05 horizon run): a counterspell's
+    ``("stack", index)`` target was read as an object id that is not
+    on the battlefield -> false fizzle."""
+    from mtg_bot.search import horizon_probe as hp
+    eng = _bare_state()
+    bear = eng.new_object(SYNTHETIC_CREATURES["Wild Bear"], 1, Zone.STACK)
+    eng.stack.append(StackItem(source=bear, controller_id=1))
+    counter = eng.new_object(
+        get_active_source().get_printings()["Divert Disaster"], 0, Zone.STACK,
+    )
+    item = StackItem(source=counter, controller_id=0, targets=(("stack", 0),))
+    eng.stack.append(item)
+    c = BlunderCensus(seat=0)
+    c.observe_moment(_view(eng))
+    assert hp._target_label(eng, ("stack", 0), 0) == "spell Wild Bear(opp)"
+    assert hp._target_label(eng, ("stack", 7), 0) == "stack[7]"
+    eng.stack.remove(item)
+    c.after_decision(_view(eng))
+    assert sum(c.counts.values()) == 0
+    assert c.targeted_items == 1 and c.harmful_targeted_items == 0
