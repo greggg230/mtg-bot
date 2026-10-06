@@ -58,7 +58,9 @@ from mtg_bot.cancellation import raise_if_cancelled
 from mtg_bot.search._lethal_detect import detect_lethal_attack
 from mtg_bot.search.budget import Budget
 from mtg_bot.search.combat_decisions import AttackerDecision
-from mtg_bot.search.determinize import determinize as _default_determinize
+from mtg_bot.search.determinize import (
+    determinize as _default_determinize, determinize_adapter_in_place,
+)
 from mtg_bot.search.engine_adapter import MtgGameStateAdapter
 from mtg_bot.search.evaluator import Evaluator
 from mtg_bot.search.info_set import info_set_key
@@ -872,11 +874,12 @@ class ISMCTS(SearchStrategy):
         """
         sub = source.clone()
         # Independent rng per iteration so iterations are reproducible
-        # from the outer rng alone.
+        # from the outer rng alone. At a resolution pause the helper
+        # also pins revealed cards and re-takes the pre-action
+        # snapshot (see ``determinize_adapter_in_place``).
         sub_seed = self.rng.randrange(1 << 62)
-        self._determinize(
-            sub.engine_state, viewer, random.Random(sub_seed),
-            in_place=True,
+        determinize_adapter_in_place(
+            sub, viewer, random.Random(sub_seed), self._determinize,
         )
         return sub
 
@@ -1129,7 +1132,7 @@ class ISMCTS(SearchStrategy):
         from mtg_bot.training import action_encoding as ae
         try:
             slot = ae.encode(
-                decision, pre_apply_sub.engine_state, viewer,
+                decision, pre_apply_sub, viewer,
                 version=self._action_encoding_version,
             )
         except ae.EncodingOverflowError:

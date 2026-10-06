@@ -1211,10 +1211,13 @@ class MCTS(SearchStrategy):
                         viewer=mover,
                     )
         from mtg_bot.training import action_encoding as ae
-        eng = getattr(parent.state, "engine_state", parent.state)
+        # Encode against the adapter itself (``encode`` unwraps the
+        # engine state for priority / combat decisions): a
+        # ``Resolution*Decision``'s slot was fixed at pause time and
+        # lives on the paused adapter, not in the engine state.
         try:
             slot = ae.encode(
-                decision, eng, mover,
+                decision, parent.state, mover,
                 version=self._action_encoding_version,
             )
         except ae.EncodingOverflowError:

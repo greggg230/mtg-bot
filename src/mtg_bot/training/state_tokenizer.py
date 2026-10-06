@@ -96,6 +96,7 @@ from mtg_bot.search.resolution_decisions import (
     ResolutionDevourLandsDecision,
     ResolutionDiscardDecision,
     ResolutionModeDecision,
+    ResolutionModesDecision,
     ResolutionSacrificeDecision,
     ResolutionShockLifeDecision,
     ResolutionSurveilDecision,
@@ -633,7 +634,11 @@ def _make_global_token(
 
 def _action_kind_name(action: Action) -> str:
     """Return the ACTION_KIND_VOCAB key for an action / decision
-    instance."""
+    instance. A "choose one or both" answer shares the mode kind (its
+    subset rides in the mana_cost_paid scalar) so the 22-kind vocab --
+    and every checkpoint's ``action_kind_embed`` -- stays unchanged."""
+    if isinstance(action, ResolutionModesDecision):
+        return "ResolutionModeDecision"
     return type(action).__name__
 
 
@@ -828,10 +833,48 @@ def _make_action_token(
         variant_id = VARIANT_NORMAL
 
     elif isinstance(action, ResolutionTargetDecision):
+        # Resolved like the policy codec (``resolution_slots``): a
+        # player target never looks up an OBJECT with the player's id;
+        # a stack target carries the stack item's source; other kinds
+        # are objects (battlefield / stack, then exile / graveyard),
+        # falling back to a player id for ``any_damage_target``-style
+        # kinds.
         if action.target is not None:
             kind, tid = action.target
-            target_kind_id = _target_kind_id(kind)
-            target_printing = _find_object_printing(state_at_action, tid)
+            if kind == "player":
+                target_kind_id = TARGET_KIND_PLAYER
+            elif kind == "stack":
+                target_kind_id = TARGET_KIND_STACK_ITEM
+                if 0 <= tid < len(state_at_action.stack):
+                    target_printing = (
+                        state_at_action.stack[tid].source.printing
+                    )
+            else:
+                target_printing = _find_object_printing(
+                    state_at_action, tid,
+                )
+                if target_printing is not None:
+                    target_kind_id = TARGET_KIND_PERMANENT
+                else:
+                    target_kind_id = _target_kind_id(kind)
+                    for p in state_at_action.players:
+                        for zone, zkind in (
+                            (p.exile, TARGET_KIND_EXILE_CARD),
+                            (p.graveyard, TARGET_KIND_NA),
+                        ):
+                            for c in zone:
+                                if c.id == tid:
+                                    target_printing = c.printing
+                                    target_kind_id = zkind
+                                    break
+                            if target_printing is not None:
+                                break
+                        if target_printing is not None:
+                            break
+                    if target_printing is None and any(
+                        p.id == tid for p in state_at_action.players
+                    ):
+                        target_kind_id = TARGET_KIND_PLAYER
         variant_id = VARIANT_NORMAL
 
     elif isinstance(action, ResolutionDiscardDecision):
@@ -858,9 +901,17 @@ def _make_action_token(
         variant_id = VARIANT_NORMAL
 
     elif isinstance(action, ResolutionModeDecision):
-        # Mode choice is public; mode_index is captured via variant
-        # cardinality only (no slot in the 8-entry variant vocab —
-        # the trunk learns mode semantics via source_printing).
+        # Mode choice is public; the index rides in the mana_cost_paid
+        # scalar (like X) so two different modes give two different
+        # tokens.
+        scalars[SCALAR_FIELD_MANA_COST_PAID] = action.mode_index / 10.0
+        variant_id = VARIANT_NORMAL
+
+    elif isinstance(action, ResolutionModesDecision):
+        # "Choose one or both": the chosen subset as a bitmask.
+        scalars[SCALAR_FIELD_MANA_COST_PAID] = (
+            sum(1 << i for i in set(action.mode_indices)) / 10.0
+        )
         variant_id = VARIANT_NORMAL
 
     elif isinstance(action, ResolutionSacrificeDecision):
@@ -889,7 +940,8 @@ def _make_action_token(
             public_mask = 0.0
 
     elif isinstance(action, ResolutionShockLifeDecision):
-        variant_id = VARIANT_NORMAL
+        # Pay vs don't, mirroring yes / no's variant convention.
+        variant_id = VARIANT_NORMAL if action.pay else VARIANT_CAST_FOR_FREE
 
     elif isinstance(action, ResolutionCardFromLibraryDecision):
         # Tutored card's identity is private to the actor. From the
@@ -935,6 +987,7 @@ def _make_action_token(
         variant_id = VARIANT_NORMAL if action.yes else VARIANT_CAST_FOR_FREE
 
     elif isinstance(action, ResolutionDevourLandsDecision):
+        scalars[SCALAR_FIELD_MANA_COST_PAID] = len(action.land_ids) / 10.0
         variant_id = VARIANT_NORMAL
 
     elif isinstance(action, PassPriority):

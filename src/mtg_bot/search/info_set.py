@@ -477,6 +477,10 @@ def _hash_adapter(h: _HashBuilder, adapter: Any) -> None:
     # determinism. Engine emits ints/tuples-of-ints/booleans; repr
     # is stable across runs for those.
     h.add_str(repr(adapter._resolution_options))
+    # Answers already given within the pending action (see the same
+    # note in ``canonical_state``).
+    channel = getattr(adapter, "_channel_agent", None)
+    h.add_str(repr(channel.queue) if channel is not None else "")
 
 
 __all__ = ["info_set_key"]

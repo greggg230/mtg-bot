@@ -54,6 +54,7 @@ from mtg_bot.search.resolution_decisions import (
     ResolutionDevourLandsDecision,
     ResolutionDiscardDecision,
     ResolutionModeDecision,
+    ResolutionModesDecision,
     ResolutionSacrificeDecision,
     ResolutionShockLifeDecision,
     ResolutionSurveilDecision,
@@ -131,6 +132,11 @@ def decision_to_json(d: Any) -> dict[str, Any]:
         return {"kind": "ResolutionDiscardDecision", "card_id": d.card_id}
     if isinstance(d, ResolutionModeDecision):
         return {"kind": "ResolutionModeDecision", "mode_index": d.mode_index}
+    if isinstance(d, ResolutionModesDecision):
+        return {
+            "kind": "ResolutionModesDecision",
+            "mode_indices": list(d.mode_indices),
+        }
     if isinstance(d, ResolutionSacrificeDecision):
         return {"kind": "ResolutionSacrificeDecision", "object_id": d.object_id}
     if isinstance(d, ResolutionXDecision):
@@ -219,6 +225,10 @@ def decision_from_json(d: dict[str, Any]) -> Any:
         return ResolutionDiscardDecision(card_id=d["card_id"])
     if kind == "ResolutionModeDecision":
         return ResolutionModeDecision(mode_index=d["mode_index"])
+    if kind == "ResolutionModesDecision":
+        return ResolutionModesDecision(
+            mode_indices=tuple(int(i) for i in d["mode_indices"]),
+        )
     if kind == "ResolutionSacrificeDecision":
         return ResolutionSacrificeDecision(object_id=d["object_id"])
     if kind == "ResolutionXDecision":

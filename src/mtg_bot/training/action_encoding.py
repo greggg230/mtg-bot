@@ -40,7 +40,19 @@ Slot taxonomy (see ``ACTION_VOCAB_SIZE`` total):
     [  507]                                            ATTACKER_SKIP
     [  508 ..  516]    9 slots   BLOCKER[attacker_pos in 0..7] (+ 1 skip)
 
-Total: 517 slots. ``ACTION_VOCAB_SIZE`` is the public constant.
+Total: 517 slots. ``ACTION_VOCAB_SIZE`` is the public constant (the
+``positional_v1`` / ``canonical_v2`` vocabulary).
+
+``canonical_v3`` appends the RESOLUTION block (280 slots, 517..796;
+``ACTION_VOCAB_SIZE_V3`` = 797): one family per mid-resolution choice
+kind (targets by zone and side, discard, mode(s), sacrifice, X,
+surveil, shock life, yes/no, tutor / opponent-hand picks, devour).
+Layout, caps and canonicalisation: ``mtg_bot.search.resolution_slots``
+and ``docs/RESOLUTION_DECISIONS.md``. Each option's slot is computed by
+the resolution channel agent from the live state at pause time and
+read back here from the paused adapter
+(``adapter.resolution_slot_offsets``). Use
+``action_vocab_size(version)`` for a version's width.
 
 Position conventions (referenced by all slot families above):
 
@@ -132,8 +144,18 @@ from mtg_bot.actions import (
 from mtg_bot.combat import eligible_attackers, eligible_blockers
 from mtg_bot.game import GameState as EngineGameState
 from mtg_bot.legal import legal_actions
+from mtg_bot.search import resolution_slots
 from mtg_bot.search.combat_decisions import AttackerDecision, BlockerDecision
 from mtg_bot.search.protocol import PlayerID
+from mtg_bot.search.resolution_decisions import (
+    ResolutionCardFromLibraryDecision,
+    ResolutionCardFromOpponentHandDecision,
+    ResolutionDevourLandsDecision, ResolutionDiscardDecision,
+    ResolutionModeDecision, ResolutionModesDecision,
+    ResolutionSacrificeDecision, ResolutionShockLifeDecision,
+    ResolutionSurveilDecision, ResolutionTargetDecision,
+    ResolutionXDecision, ResolutionYesNoDecision,
+)
 
 # ---------------------------------------------------------------------
 # Capacity caps. Picked once, pinned by tests. Going over a cap at
@@ -252,7 +274,16 @@ SLOT_BLOCKER_SKIP = SLOT_BLOCKER_BASE + BLOCK_ATTACKERS_CAP
 SLOT_BLOCKER_END = SLOT_BLOCKER_SKIP + 1
 
 ACTION_VOCAB_SIZE: int = SLOT_BLOCKER_END
-"""Total slot count. Pinned by a test."""
+"""Slot count of ``positional_v1`` / ``canonical_v2`` (517). Pinned by
+a test. ``canonical_v3`` extends it -- see ``action_vocab_size``."""
+
+SLOT_RESOLUTION_BASE: int = ACTION_VOCAB_SIZE
+"""First slot of the ``canonical_v3`` resolution block."""
+
+ACTION_VOCAB_SIZE_V3: int = (
+    SLOT_RESOLUTION_BASE + resolution_slots.RESOLUTION_BLOCK_SIZE
+)
+"""Slot count of ``canonical_v3`` (797). Pinned by a test."""
 
 
 # ---------------------------------------------------------------------
@@ -268,10 +299,58 @@ ACTION_ENCODING_VERSION_V2 = "canonical_v2"
 """Canonical sort-by-(printing.name, modifier_tuple, card.id) slot
 mapping. v17+ training runs opt in via metadata."""
 
+ACTION_ENCODING_VERSION_V3 = "canonical_v3"
+"""``canonical_v2`` + the resolution block (targets, modes, X, ...).
+v2's 517 slots keep their indices and meaning; see
+``docs/RESOLUTION_DECISIONS.md``."""
+
 SUPPORTED_ACTION_ENCODING_VERSIONS = (
     ACTION_ENCODING_VERSION_V1,
     ACTION_ENCODING_VERSION_V2,
+    ACTION_ENCODING_VERSION_V3,
 )
+
+_CANONICAL_ZONE_VERSIONS = frozenset({
+    ACTION_ENCODING_VERSION_V2, ACTION_ENCODING_VERSION_V3,
+})
+"""Versions whose hand / graveyard / exile positions are canonically
+sorted (v3 inherits v2's base families unchanged)."""
+
+_RESOLUTION_DECISION_TYPES = (
+    ResolutionTargetDecision, ResolutionDiscardDecision,
+    ResolutionModeDecision, ResolutionModesDecision,
+    ResolutionSacrificeDecision, ResolutionXDecision,
+    ResolutionSurveilDecision, ResolutionShockLifeDecision,
+    ResolutionYesNoDecision, ResolutionCardFromLibraryDecision,
+    ResolutionCardFromOpponentHandDecision,
+    ResolutionDevourLandsDecision,
+)
+
+
+def action_vocab_size(version: str) -> int:
+    """Policy-head width of an action-encoding version: 517 for
+    ``positional_v1`` / ``canonical_v2``, 797 for ``canonical_v3``."""
+    _check_version(version)
+    if version == ACTION_ENCODING_VERSION_V3:
+        return ACTION_VOCAB_SIZE_V3
+    return ACTION_VOCAB_SIZE
+
+
+def has_resolution_slots(version: str) -> bool:
+    """Whether ``version`` can encode ``Resolution*Decision``s."""
+    _check_version(version)
+    return version == ACTION_ENCODING_VERSION_V3
+
+
+def is_resolution_decision(decision: Any) -> bool:
+    """True for every search-side mid-resolution answer type."""
+    return isinstance(decision, _RESOLUTION_DECISION_TYPES)
+
+
+def _is_resolution_paused(state: Any) -> bool:
+    """Adapter at a mid-resolution pause (duck-typed; raw engine
+    states and the Rust provider never pause)."""
+    return bool(getattr(state, "_resolution_paused", False))
 
 
 def _check_version(version: str) -> None:
@@ -381,7 +460,7 @@ def _hand(
     differ only by card.id permutation produce the same slot mapping.
     """
     cards = list(eng.player_by_id(viewer).hand)
-    if version == ACTION_ENCODING_VERSION_V2:
+    if version in _CANONICAL_ZONE_VERSIONS:
         return sorted(cards, key=_canonical_zone_sort_key)
     return cards
 
@@ -391,7 +470,7 @@ def _graveyard(
     version: str = ACTION_ENCODING_VERSION_V1,
 ) -> list:
     cards = list(eng.player_by_id(viewer).graveyard)
-    if version == ACTION_ENCODING_VERSION_V2:
+    if version in _CANONICAL_ZONE_VERSIONS:
         return sorted(cards, key=_canonical_zone_sort_key)
     return cards
 
@@ -401,7 +480,7 @@ def _exile(
     version: str = ACTION_ENCODING_VERSION_V1,
 ) -> list:
     cards = list(eng.player_by_id(viewer).exile)
-    if version == ACTION_ENCODING_VERSION_V2:
+    if version in _CANONICAL_ZONE_VERSIONS:
         return sorted(cards, key=_canonical_zone_sort_key)
     return cards
 
@@ -524,6 +603,8 @@ def encode(
     Raises ``EncodingOverflowError`` if a referenced position exceeds
     its cap (see module-level cap constants)."""
     _check_version(version)
+    if is_resolution_decision(decision):
+        return _encode_resolution(decision, state, viewer, version)
     eng = _engine_state(state)
 
     if isinstance(decision, PassPriority):
@@ -765,10 +846,13 @@ def decode(
     than ``hand_pos``). Use ``legal_action_mask`` first if you want to
     avoid this — it's exact."""
     _check_version(version)
-    if slot_idx < 0 or slot_idx >= ACTION_VOCAB_SIZE:
+    vocab = action_vocab_size(version)
+    if slot_idx < 0 or slot_idx >= vocab:
         raise IllegalSlotError(
-            f"slot_idx={slot_idx} not in [0, {ACTION_VOCAB_SIZE})"
+            f"slot_idx={slot_idx} not in [0, {vocab}) for {version}"
         )
+    if slot_idx >= SLOT_RESOLUTION_BASE:
+        return _decode_resolution(slot_idx, state, viewer)
     eng = _engine_state(state)
 
     if slot_idx == SLOT_PASS:
@@ -1040,7 +1124,21 @@ def legal_action_mask(
     the only contract the mask supports.
     """
     _check_version(version)
-    mask = np.zeros(ACTION_VOCAB_SIZE, dtype=bool)
+    mask = np.zeros(action_vocab_size(version), dtype=bool)
+    if _is_resolution_paused(state):
+        # Mid-resolution pause: only the decider has decisions, and
+        # only ``canonical_v3`` has slots for them. Each option's slot
+        # was fixed at pause time; options without one (past a cap /
+        # outside the vocabulary) were counted then by
+        # ``resolution_slots`` and stay prior-0 search children.
+        if (
+            has_resolution_slots(version)
+            and viewer == getattr(state, "_resolution_player", None)
+        ):
+            for off in state._resolution_slot_offsets:
+                if off is not None:
+                    mask[SLOT_RESOLUTION_BASE + off] = True
+        return mask
     legals = _enumerate_legal(state, viewer)
     for d in legals:
         try:
@@ -1052,6 +1150,100 @@ def legal_action_mask(
             continue
         mask[slot] = True
     return mask
+
+
+def _resolution_option(decision: Any) -> Any:
+    """The engine-side option value a ``Resolution*Decision`` answers
+    with (the element of ``adapter.resolution_options`` it maps to)."""
+    if isinstance(decision, ResolutionTargetDecision):
+        return decision.target
+    if isinstance(decision, (
+        ResolutionDiscardDecision, ResolutionCardFromLibraryDecision,
+        ResolutionCardFromOpponentHandDecision,
+    )):
+        return decision.card_id
+    if isinstance(decision, ResolutionModeDecision):
+        return decision.mode_index
+    if isinstance(decision, ResolutionModesDecision):
+        return tuple(decision.mode_indices)
+    if isinstance(decision, ResolutionSacrificeDecision):
+        return decision.object_id
+    if isinstance(decision, ResolutionXDecision):
+        return decision.x_value
+    if isinstance(decision, ResolutionSurveilDecision):
+        return decision.mill
+    if isinstance(decision, ResolutionShockLifeDecision):
+        return decision.pay
+    if isinstance(decision, ResolutionYesNoDecision):
+        return decision.yes
+    if isinstance(decision, ResolutionDevourLandsDecision):
+        return tuple(decision.land_ids)
+    raise EncodingOverflowError(  # pragma: no cover - guarded by caller
+        f"not a resolution decision: {decision!r}"
+    )
+
+
+def _encode_resolution(
+    decision: Any, state: Any, viewer: PlayerID, version: str,
+) -> int:
+    """Slot of a ``Resolution*Decision`` at the adapter's current
+    pause. Raises ``EncodingOverflowError`` when the version has no
+    resolution block, the state is not paused for ``viewer``, the
+    decision is not one of the pause's options, or the option has no
+    slot (counted at pause time)."""
+    if not has_resolution_slots(version):
+        raise EncodingOverflowError(
+            f"{type(decision).__name__} has no slot under {version} "
+            f"(resolution decisions need {ACTION_ENCODING_VERSION_V3})"
+        )
+    if not _is_resolution_paused(state):
+        raise EncodingOverflowError(
+            f"{type(decision).__name__} encoded outside a resolution "
+            f"pause (pass the paused adapter, not its engine state)"
+        )
+    if viewer != getattr(state, "_resolution_player", None):
+        raise EncodingOverflowError(
+            f"P{viewer} is not the decider of the pending "
+            f"{state._resolution_kind} pause"
+        )
+    option = _resolution_option(decision)
+    for opt, off in zip(
+        state._resolution_options, state._resolution_slot_offsets,
+    ):
+        if type(opt) is type(option) and opt == option:
+            if off is None:
+                raise EncodingOverflowError(
+                    f"{decision!r} has no slot in the resolution block "
+                    f"(past a cap or outside the vocabulary; counted in "
+                    f"resolution_slots.overflow_counts())"
+                )
+            return SLOT_RESOLUTION_BASE + off
+    raise EncodingOverflowError(
+        f"{decision!r} is not an option of the pending "
+        f"{state._resolution_kind} pause"
+    )
+
+
+def _decode_resolution(slot_idx: int, state: Any, viewer: PlayerID) -> Any:
+    """Inverse of ``_encode_resolution``: the first option of the
+    pending pause whose slot is ``slot_idx``."""
+    if not _is_resolution_paused(state):
+        raise IllegalSlotError(
+            f"resolution slot {slot_idx} but the state is not paused"
+        )
+    if viewer != getattr(state, "_resolution_player", None):
+        raise IllegalSlotError(
+            f"resolution slot {slot_idx} but P{viewer} is not the decider"
+        )
+    off = slot_idx - SLOT_RESOLUTION_BASE
+    decisions = state._resolution_legal_decisions()
+    for d, o in zip(decisions, state._resolution_slot_offsets):
+        if o == off:
+            return d
+    raise IllegalSlotError(
+        f"resolution slot {slot_idx} is not an option of the pending "
+        f"{state._resolution_kind} pause"
+    )
 
 
 def _enumerate_legal(state: Any, viewer: PlayerID) -> list:
@@ -1082,6 +1274,14 @@ def _enumerate_legal(state: Any, viewer: PlayerID) -> list:
     # set to encode. Detected by the provider's marker attribute so
     # no isinstance import cycle is introduced.
     if getattr(state, "_is_rust_decision_provider", False):
+        return list(state.legal_decisions())
+
+    if _is_resolution_paused(state):
+        # Only the decider acts at a pause; its options are the
+        # adapter's resolution decisions (never the snapshot's
+        # priority actions).
+        if viewer != getattr(state, "_resolution_player", None):
+            return []
         return list(state.legal_decisions())
 
     eng = _engine_state(state)

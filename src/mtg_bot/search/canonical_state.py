@@ -24,7 +24,8 @@ Hashed (forward-relevant)
   ``_pending_blockers``, ``_chosen_blocks``, ``_combat_defender_id``,
   the resolution-pause block (``_resolution_paused``,
   ``_resolution_kind``, ``_resolution_player``, ``_resolution_options``,
-  ``_pending_replay_decision``). The scout flagged that
+  the channel agent's replay queue -- answers already given within the
+  pending action -- and ``_pending_replay_decision``). The scout flagged that
   engine-state-only hashing produces false-positive transpositions in
   mid-combat-declaration sub-states; we include the whole adapter-side
   decision sub-state to avoid that class of bug.
@@ -543,6 +544,15 @@ def _canonical_state_tuple(adapter: Any) -> tuple:
         # entirely when nothing's pending.
         res_opts = adapter._resolution_options
         res_opts_key = "" if not res_opts else repr(res_opts)
+        # Answers already given within the pending action: two
+        # different answers to a pause can lead to the SAME follow-up
+        # pause on the same pre-action snapshot, so the queue is part
+        # of the forward-relevant state.
+        channel = getattr(adapter, "_channel_agent", None)
+        res_queue_key = (
+            repr(channel.queue)
+            if channel is not None and channel.queue else ""
+        )
         pending_replay = adapter._pending_replay_decision
         adapter_block = (
             adapter._pass_count,
@@ -556,6 +566,7 @@ def _canonical_state_tuple(adapter: Any) -> tuple:
             adapter._resolution_kind,
             adapter._resolution_player,
             res_opts_key,
+            res_queue_key,
             repr(pending_replay) if pending_replay is not None else None,
         )
     else:

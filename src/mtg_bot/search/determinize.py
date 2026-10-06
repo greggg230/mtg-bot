@@ -98,6 +98,7 @@ def determinize(
     *,
     in_place: bool = False,
     opponent_hidden_model: str = DEFAULT_OPPONENT_HIDDEN_MODEL,
+    known_card_ids: frozenset = frozenset(),
 ) -> GameState:
     """Return a state consistent with what ``viewer_id`` knows.
 
@@ -133,18 +134,55 @@ def determinize(
     permuting) every hidden opponent hand / library card with the inert
     placeholder; the viewer's own hidden cards are still permuted. See
     ``OPPONENT_HIDDEN_MODELS``.
+
+    ``known_card_ids`` pins extra cards as known to the viewer (kept
+    out of the permutation pool and never blanked): the hidden cards a
+    paused resolution callback revealed to its decider -- a tutor's
+    matching library cards, an opponent's hand under a
+    Thoughtseize-style pick, the surveilled top card. See
+    :func:`determinize_adapter_in_place`.
     """
     check_opponent_hidden_model(opponent_hidden_model)
     board_only = opponent_hidden_model == "board_only"
     if rng is None:
         rng = random.Random()
     target = state if in_place else state.clone()
+    known = frozenset(known_card_ids)
     for player in target.players:
         if board_only and player.id != viewer_id:
-            _blank_player(player, viewer_id)
+            _blank_player(player, viewer_id, known)
         else:
-            _determinize_player(player, viewer_id, rng)
+            _determinize_player(player, viewer_id, rng, known)
     return target
+
+
+def determinize_adapter_in_place(
+    adapter, viewer_id: int, rng: random.Random,
+    determinize_fn: Callable = None,
+) -> None:
+    """Determinize a freshly-cloned search adapter for ``viewer_id``.
+
+    The PIMC / ISMCTS entry point. At a mid-resolution pause it also
+
+    * pins the hidden cards the pending callback revealed to the
+      decider (``adapter.resolution_revealed_ids``), so an option such
+      as "fetch card 41" names the same printing in every world, and
+    * re-takes the adapter's pre-action snapshot from the determinized
+      state (``resync_pause_snapshot``), so answering the pause rolls
+      back inside this world rather than to the true state.
+
+    ``determinize_fn`` defaults to :func:`determinize`; any
+    ``functools.partial`` of it works. ``known_card_ids`` is only
+    passed when there is something to pin, so plain custom
+    determinizers keep working away from pauses.
+    """
+    fn = determinize_fn if determinize_fn is not None else determinize
+    known = tuple(getattr(adapter, "resolution_revealed_ids", ()) or ())
+    kwargs = {"known_card_ids": frozenset(known)} if known else {}
+    fn(adapter.engine_state, viewer_id, rng, in_place=True, **kwargs)
+    resync = getattr(adapter, "resync_pause_snapshot", None)
+    if resync is not None:
+        resync()
 
 
 def make_determinize_fn(opponent_hidden_model: str) -> Callable:
@@ -161,7 +199,9 @@ def make_determinize_fn(opponent_hidden_model: str) -> Callable:
     )
 
 
-def _blank_player(player, viewer_id: int) -> None:
+def _blank_player(
+    player, viewer_id: int, known: frozenset = frozenset(),
+) -> None:
     """Board-only: give every hand / library card of ``player`` that
     the viewer doesn't know the inert hidden-card placeholder. Same
     CoW fork as ``_determinize_player`` (the library's GameObjects are
@@ -171,7 +211,7 @@ def _blank_player(player, viewer_id: int) -> None:
         library.fork()
     for zone in (player.hand, player.library):
         for card in zone:
-            if viewer_knows(card, viewer_id):
+            if viewer_knows(card, viewer_id) or card.id in known:
                 continue
             card.printing = HIDDEN_CARD_PRINTING
             if card.original_printing is not None:
@@ -179,7 +219,8 @@ def _blank_player(player, viewer_id: int) -> None:
 
 
 def _determinize_player(
-    player, viewer_id: int, rng: random.Random
+    player, viewer_id: int, rng: random.Random,
+    known: frozenset = frozenset(),
 ) -> None:
     """Permute printings among ``player``'s hand+library cards that the
     viewer doesn't know.
@@ -210,10 +251,10 @@ def _determinize_player(
 
     hidden: list[GameObject] = []
     for card in player.hand:
-        if not viewer_knows(card, viewer_id):
+        if not viewer_knows(card, viewer_id) and card.id not in known:
             hidden.append(card)
     for card in player.library:
-        if not viewer_knows(card, viewer_id):
+        if not viewer_knows(card, viewer_id) and card.id not in known:
             hidden.append(card)
     if len(hidden) <= 1:
         return

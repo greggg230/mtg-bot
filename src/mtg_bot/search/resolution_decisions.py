@@ -31,6 +31,7 @@ Covers all decision-making callbacks on ``Agent``:
 - ``ResolutionTargetDecision``             (← ``agent.choose_target``)
 - ``ResolutionDiscardDecision``            (← ``agent.choose_discard``)
 - ``ResolutionModeDecision``               (← ``agent.choose_mode``)
+- ``ResolutionModesDecision``              (← ``agent.choose_modes``)
 - ``ResolutionSacrificeDecision``          (← ``agent.choose_sacrifice``)
 - ``ResolutionXDecision``                  (← ``agent.choose_x``)
 - ``ResolutionSurveilDecision``            (← ``agent.choose_surveil``)
@@ -81,6 +82,17 @@ class ResolutionModeDecision:
     the ``mode_descriptions`` list the engine supplied."""
 
     mode_index: int
+
+
+@dataclass(frozen=True)
+class ResolutionModesDecision:
+    """Answer to an ``agent.choose_modes`` callback ("choose one or
+    both" / "choose one or more"). ``mode_indices`` is a non-empty
+    tuple of mode indices in printed (ascending) order -- the order
+    the modes resolve in. The adapter exposes every non-empty subset
+    of the modes."""
+
+    mode_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True)

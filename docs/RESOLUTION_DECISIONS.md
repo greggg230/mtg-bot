@@ -103,19 +103,23 @@ engine callback asked = `adapter.active_player()` at the pause).
 | `RES_TARGET_GY_OWN` / `_OPP` | 24 + 24 | position in that player's graveyard | `canonical_v2` zone sort |
 | `RES_TARGET_EXILE_OWN` / `_OPP` | 24 + 24 | position in that player's exile | `canonical_v2` zone sort |
 | `RES_TARGET_DECLINE` | 1 | target `None` | -- |
-| `RES_DISCARD` | 16 | decider's hand position | `canonical_v2` zone sort |
+| `RES_DISCARD` | 16 | rank among the pause's distinct options | `canonical_v2` key sort |
 | `RES_MODE` | 8 | mode index | -- |
 | `RES_MODES` | 15 | (bitmask of chosen modes) - 1, modes 0-3 | -- |
 | `RES_SACRIFICE` | 24 | decider's permanent position | canonical battlefield order |
+| `RES_SACRIFICE_CARD` | 8 | rank among the non-battlefield options | `canonical_v2` key sort |
 | `RES_X` | 21 | X = 0 .. 20 | -- |
 | `RES_SURVEIL` | 2 | 0 = mill, 1 = keep | -- |
 | `RES_SHOCK_LIFE` | 2 | 0 = pay, 1 = don't | -- |
 | `RES_YES_NO` | 2 | 0 = yes, 1 = no | -- |
 | `RES_CARD_FROM_LIBRARY` | 16 + 1 | rank among the distinct option keys (sorted); last = decline | `canonical_v2` key sort |
-| `RES_CARD_FROM_OPP_HAND` | 16 | opponent's hand position | `canonical_v2` zone sort |
+| `RES_CARD_FROM_OPP_HAND` | 16 | rank among the pause's distinct options | `canonical_v2` key sort |
 | `RES_DEVOUR` | 2 | 0 = none, 1 = all | -- |
 
-280 resolution slots; **vocab 517 -> 797**. Caps reuse the v2 constants
+288 resolution slots; **vocab 517 -> 805**. (`RES_SACRIFICE_CARD`
+exists because the engine reuses `choose_sacrifice` as a generic
+"pick an id" hook: Close Encounter designates a warped creature card in
+exile, Anticausal Vestige puts a card from hand onto the battlefield.) Caps reuse the v2 constants
 where a v2 family exists (hand 16, graveyard / exile / own battlefield
 24) and are pinned by `test_vocab_size_constant_is_fixed`.
 
@@ -219,10 +223,10 @@ logits for an extended checkpoint.
 ## 8. Versioning
 
 * `action_encoding_version`: `positional_v1` / `canonical_v2` -> 517
-  slots, no resolution slots; `canonical_v3` -> 797.
+  slots, no resolution slots; `canonical_v3` -> 805.
   `action_encoding.action_vocab_size(version)` is the single source;
   `ACTION_VOCAB_SIZE` stays 517 (the v1/v2 size every existing consumer
-  and test assumed) and `ACTION_VOCAB_SIZE_V3 = 797`.
+  and test assumed) and `ACTION_VOCAB_SIZE_V3 = 805`.
 * Loaders derive the policy-head width from the checkpoint's
   `action_encoding_version` unless metadata records
   `structured_action_vocab_size` explicitly; a mismatch with the
@@ -271,12 +275,12 @@ pin; ISMCTS's `_fresh_determinization` gets the same treatment.
 
 `mtg_bot extend-resolution-slots` (`mtg_bot.training.resolution_extension`)
 copies every parameter of a v2 structured checkpoint bit-exactly and
-appends 280 rows to `policy_slot_queries`, drawn N(0, 0.02) (the model's
+appends 288 rows to `policy_slot_queries`, drawn N(0, 0.02) (the model's
 own init) from a `torch.Generator` seeded deterministically (default
 seed recorded in metadata). Metadata keeps `value_calibration`,
 `card_vocab`, trunk dims and calibration; it switches
 `action_encoding_version` to `canonical_v3`, records
-`structured_action_vocab_size = 797` and an `extra.resolution_extension`
+`structured_action_vocab_size = 805` and an `extra.resolution_extension`
 provenance block (source version, source weights sha256, seed). The
 s2 lineage retrains each cycle from scratch on its recent-shard window,
 so the extended checkpoint is what keeps the trained network in the

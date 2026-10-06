@@ -59,12 +59,16 @@ def _build_adapter(seed: int) -> MtgGameStateAdapter:
 
 
 def test_version_constants_exposed() -> None:
-    """The two supported versions are public module-level constants
-    and the supported tuple lists exactly those two."""
+    """The supported versions are public module-level constants and
+    the supported tuple lists exactly those three (v3 = v2 + the
+    resolution block, ``docs/RESOLUTION_DECISIONS.md``)."""
+    from mtg_bot.training.action_encoding import ACTION_ENCODING_VERSION_V3
     assert ACTION_ENCODING_VERSION_V1 == "positional_v1"
     assert ACTION_ENCODING_VERSION_V2 == "canonical_v2"
+    assert ACTION_ENCODING_VERSION_V3 == "canonical_v3"
     assert set(SUPPORTED_ACTION_ENCODING_VERSIONS) == {
         ACTION_ENCODING_VERSION_V1, ACTION_ENCODING_VERSION_V2,
+        ACTION_ENCODING_VERSION_V3,
     }
 
 
