@@ -265,6 +265,9 @@ def test_label_decision_covers_every_kind():
     assert hp.label_decision(
         ActivateAbility(source_id=own.id, ability_index=0), adapter, None, 0,
     ) == f"Activate Wild Bear#{own.id}(own)[0]"
+    # Object id 0 is a real id (regression: it used to render as "-").
+    zero = hp.label_decision(ActivateAbility(source_id=0, ability_index=1), adapter, None, 0)
+    assert zero.startswith("Activate ") and not zero.startswith("Activate -")
     # Cast whose child state has a new targeted stack item.
     bombard = get_active_source().get_printings()["Bombard"]
     card = eng.new_object(bombard, 0, Zone.HAND)

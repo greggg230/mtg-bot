@@ -431,9 +431,17 @@ def label_decision(
         if getattr(decision, "kicked", False):
             label += " [kicked]"
     elif kind == "activate":
-        src = getattr(decision, "source_id", None) or getattr(
-            decision, "card_id", None,
-        ) or getattr(decision, "spacecraft_id", None)
+        # Explicit None checks: object id 0 is a real id.
+        src = next(
+            (
+                v for v in (
+                    getattr(decision, "source_id", None),
+                    getattr(decision, "card_id", None),
+                    getattr(decision, "spacecraft_id", None),
+                ) if v is not None
+            ),
+            None,
+        )
         label = f"Activate {_obj_label(eng, src, viewer)}"
         idx = getattr(decision, "ability_index", None)
         if idx is not None:
