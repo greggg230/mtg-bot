@@ -251,6 +251,9 @@ def test_real_heuristic_game_emits_nn_compatible_npz(tmp_path):
             "structured_token_type", "structured_token_emb_ids",
             "structured_token_scalars", "structured_attention_mask",
             "root_values", "game_ids", "structured_card_vocab",
+            # Policy-column encoding + resolution-supervision counters.
+            "action_encoding_version", "resolution_pause_samples",
+            "resolution_policy_rows", "resolution_overflow_visits",
         }
         from mtg_bot.training.card_vocab import (
             current_card_vocab,

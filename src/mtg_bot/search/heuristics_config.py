@@ -28,7 +28,8 @@ SEARCH_LIMITATIONS.md entries (#6, #7, #9, #10, #11).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import os
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Mapping
 
 # The single atomic-revert flip knob (B3 / SOT_FLIP_CUTOVER_PLAN
@@ -48,6 +49,38 @@ from typing import Any, Literal, Mapping
 DecisionSource = Literal["python", "rust", "rust_shadow"]
 _VALID_DECISION_SOURCES = ("python", "rust", "rust_shadow")
 DEFAULT_DECISION_SOURCE: DecisionSource = "python"
+
+# The production switch for searched resolution decisions (targets,
+# modes, X, "may", surveil, sacrifice, discard, tutor picks, ... --
+# ``docs/RESOLUTION_DECISIONS.md``). ON by default since 2026-10-06;
+# ``MTG_BOT_SEARCH_RESOLUTION_DECISIONS=0`` turns it off for every game
+# built from a default ``HeuristicsConfig`` in this process (data-gen,
+# self-play, the worker production runner, eval, ladder, capture), which
+# restores the old all-``DefaultTacticalAgent`` behaviour. Per-agent
+# opt-out for A/B runs: ``PimcConfig`` / ``NNPimcConfig``
+# ``search_resolution_decisions=False`` (ladder modifier ``+autotarget``).
+SEARCH_RESOLUTION_DECISIONS_ENV = "MTG_BOT_SEARCH_RESOLUTION_DECISIONS"
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
+
+
+def default_search_resolution_decisions() -> bool:
+    """The process-wide default of
+    ``HeuristicsConfig.search_resolution_decisions``: ``True`` unless
+    ``$MTG_BOT_SEARCH_RESOLUTION_DECISIONS`` says otherwise. An
+    unrecognised value raises (no silent guess)."""
+    raw = os.environ.get(SEARCH_RESOLUTION_DECISIONS_ENV)
+    if raw is None or raw.strip() == "":
+        return True
+    value = raw.strip().lower()
+    if value in _TRUE_STRINGS:
+        return True
+    if value in _FALSE_STRINGS:
+        return False
+    raise ValueError(
+        f"${SEARCH_RESOLUTION_DECISIONS_ENV}={raw!r}: expected one of "
+        f"{sorted(_TRUE_STRINGS | _FALSE_STRINGS)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -73,6 +106,12 @@ class HeuristicsConfig:
     skip_opp_postcombat_main_enabled: bool = True
     skip_dead_main1_enabled: bool = True
     decision_source: DecisionSource = DEFAULT_DECISION_SOURCE
+    # Searched resolution decisions (the game-level switch; see
+    # ``default_search_resolution_decisions``). NOT a training shortcut,
+    # so ``disabled()`` keeps the process default.
+    search_resolution_decisions: bool = field(
+        default_factory=default_search_resolution_decisions,
+    )
 
     def __post_init__(self) -> None:
         if self.decision_source not in _VALID_DECISION_SOURCES:
@@ -141,4 +180,9 @@ class HeuristicsConfig:
             decision_source=d.get(
                 "decision_source", DEFAULT_DECISION_SOURCE,
             ),
+            # Absent (a pre-2026-10-06 spec) = the process default.
+            search_resolution_decisions=bool(d.get(
+                "search_resolution_decisions",
+                default_search_resolution_decisions(),
+            )),
         )

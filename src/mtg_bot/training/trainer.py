@@ -1043,6 +1043,25 @@ def train_structured_model(
             f"matches the data (``mtg_bot train --scalar-schema-version N``)."
         )
 
+    # Policy-width gate: the dataset's policy columns must be the
+    # model's slot count (517 for positional_v1 / canonical_v2, 805 for
+    # canonical_v3). A mismatch would silently mis-align every slot (or
+    # crash deep inside the loss); ``load_structured_dataset`` already
+    # padded legacy shards explicitly when asked to.
+    dataset_policy_width = getattr(dataset, "policy_width", None)
+    if (
+        dataset_policy_width is not None
+        and dataset_policy_width != config.action_vocab_size
+    ):
+        raise ValueError(
+            f"policy width mismatch: the dataset's policy_targets / "
+            f"action_masks rows are {dataset_policy_width} wide but the "
+            f"model's policy head has {config.action_vocab_size} slots. "
+            f"Load the window with the model's action_encoding_version "
+            f"(load_structured_dataset(action_encoding_version=...)) or "
+            f"train with the matching --action-encoding-version."
+        )
+
     if device is None:
         device = auto_device()
     if device == "cpu":

@@ -109,7 +109,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from mtg_bot.training.action_encoding import ACTION_VOCAB_SIZE
+from mtg_bot.training.action_encoding import (
+    ACTION_ENCODING_VERSION_V2, ACTION_ENCODING_VERSION_V3,
+    ACTION_VOCAB_SIZE, SLOT_RESOLUTION_BASE, action_vocab_size,
+)
 from mtg_bot.training.data_gen import file_group_ids
 
 _log = logging.getLogger(__name__)
@@ -1096,6 +1099,27 @@ class StructuredDataset(Dataset):
         return self._n_total
 
     @property
+    def policy_width(self) -> int:
+        """Width of the policy-target / action-mask rows (517 for a
+        v1 / v2 window, 805 for canonical_v3)."""
+        return int(self._policy_targets.shape[1])
+
+    @property
+    def policy_report(self) -> dict:
+        """What the loader did with each file's policy columns
+        (``_PolicyWidthPlan.report``): target encoding / width, files
+        and rows zero-padded from the legacy 517 width, resolution
+        policy rows found. ``{}`` for stores built before 2026-10-06 or
+        by the in-memory constructors."""
+        path = Path(self._memmap_dir) / POLICY_REPORT_NAME
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):  # pragma: no cover - corrupt sidecar
+            return {}
+
+    @property
     def scalar_width(self) -> int:
         """Width of every ``token_scalars`` row in this dataset —
         ``N_SCALAR_FIELDS`` (3) for scalar-schema-v1 data,
@@ -1472,6 +1496,135 @@ class _FileScan:
     emb_width: int
     scalar_width: int
     policy_width: Optional[int]  # None = file carries no policy arrays
+    # Action-encoding version the policy columns were written under
+    # (``data_gen.resolution_stats_arrays``); None = legacy unstamped.
+    encoding_version: Optional[str] = None
+
+
+POLICY_REPORT_NAME = "policy_report.json"
+"""Flat-store sidecar recording the policy-width plan's report."""
+
+LEGACY_POLICY_ENCODING_ENV = "MTG_BOT_LEGACY_POLICY_ENCODING"
+"""Environment twin of ``mtg_bot train --legacy-policy-encoding``."""
+
+
+class PolicyWidthError(ValueError):
+    """The window's policy columns can't be lined up with the model's
+    action encoding (unknown width, a stamped version that differs, or
+    legacy 517-wide shards in a canonical_v3 window without the
+    ``--legacy-policy-encoding`` assertion)."""
+
+
+@dataclass
+class _PolicyWidthPlan:
+    """How each file's policy columns map into the store."""
+
+    width: int
+    pad_paths: set
+    report: dict
+
+
+def plan_policy_width(
+    scans: Sequence["_FileScan"],
+    *,
+    action_encoding_version: str,
+    legacy_policy_encoding: Optional[str] = None,
+) -> _PolicyWidthPlan:
+    """Resolve the store's policy width for a model trained under
+    ``action_encoding_version`` and decide, per file, copy vs explicit
+    zero-pad (``docs/RESOLUTION_DECISIONS.md`` §8).
+
+    * Files carrying no policy arrays, and zero-row files (crashed /
+      timed-out games), never constrain the width.
+    * A STAMPED file must be exactly its version's width; it is copied
+      when its version is the model's, zero-padded when it is
+      ``canonical_v2`` and the model ``canonical_v3`` (v3's first 517
+      slots ARE v2's), refused otherwise.
+    * An UNSTAMPED (legacy) file: copied when its width already is the
+      model's (the pre-2026-10-06 behaviour); a 517-wide legacy file in
+      a ``canonical_v3`` window is zero-padded ONLY when the operator
+      asserts ``legacy_policy_encoding="canonical_v2"`` -- width 517
+      cannot tell ``positional_v1`` from ``canonical_v2``, and padding a
+      v1 file would mislabel every slot. Anything else is refused.
+
+    The padded columns are the resolution block: those games had no
+    resolution supervision (they were played with auto-targeting), so
+    an all-zero target / all-False mask there is the fact, not a guess.
+    """
+    target = action_vocab_size(action_encoding_version)
+    pad_paths: set = set()
+    counts = {
+        "files": 0, "files_without_policy": 0, "zero_row_files": 0,
+        "stamped_files": 0, "legacy_files": 0,
+        "copied_files": 0, "padded_files": 0, "padded_rows": 0,
+    }
+    for scan in scans:
+        counts["files"] += 1
+        if scan.policy_width is None:
+            counts["files_without_policy"] += 1
+            continue
+        if scan.n_rows == 0:
+            counts["zero_row_files"] += 1
+            continue
+        stamped = scan.encoding_version
+        if stamped is not None:
+            counts["stamped_files"] += 1
+            expected = action_vocab_size(stamped)
+            if scan.policy_width != expected:
+                raise PolicyWidthError(
+                    f"{scan.path}: policy width {scan.policy_width} but "
+                    f"it is stamped {stamped!r} ({expected} slots)"
+                )
+            if stamped == action_encoding_version:
+                counts["copied_files"] += 1
+                continue
+            if (
+                stamped == ACTION_ENCODING_VERSION_V2
+                and action_encoding_version == ACTION_ENCODING_VERSION_V3
+            ):
+                pad_paths.add(scan.path)
+                counts["padded_files"] += 1
+                counts["padded_rows"] += scan.n_rows
+                continue
+            raise PolicyWidthError(
+                f"{scan.path}: stamped action encoding {stamped!r} can't "
+                f"train a {action_encoding_version!r} model"
+            )
+        counts["legacy_files"] += 1
+        if scan.policy_width == target:
+            counts["copied_files"] += 1
+            continue
+        if (
+            scan.policy_width == ACTION_VOCAB_SIZE
+            and action_encoding_version == ACTION_ENCODING_VERSION_V3
+        ):
+            if legacy_policy_encoding != ACTION_ENCODING_VERSION_V2:
+                raise PolicyWidthError(
+                    f"{scan.path}: legacy (unstamped) {ACTION_VOCAB_SIZE}-"
+                    f"wide policy columns in a {action_encoding_version} "
+                    f"window. Width {ACTION_VOCAB_SIZE} can't say whether "
+                    f"they are positional_v1 or canonical_v2; if they are "
+                    f"canonical_v2 (every s2-lineage shard is), assert it "
+                    f"with --legacy-policy-encoding canonical_v2 (or "
+                    f"${LEGACY_POLICY_ENCODING_ENV}=canonical_v2) and they "
+                    f"are zero-padded into the resolution block."
+                )
+            pad_paths.add(scan.path)
+            counts["padded_files"] += 1
+            counts["padded_rows"] += scan.n_rows
+            continue
+        raise PolicyWidthError(
+            f"{scan.path}: policy width {scan.policy_width} matches "
+            f"neither the {action_encoding_version!r} width {target} nor "
+            f"a paddable legacy width"
+        )
+    report = {
+        "action_encoding_version": action_encoding_version,
+        "policy_width": target,
+        "legacy_policy_encoding": legacy_policy_encoding,
+        **counts,
+    }
+    return _PolicyWidthPlan(width=target, pad_paths=pad_paths, report=report)
 
 
 def _require_structured(path: Path, members: dict[str, str]) -> None:
@@ -1507,6 +1660,11 @@ def _scan_structured_npz(path: Path) -> _FileScan:
         if "policy_targets" in members:
             p_shape, _ = _read_member_header(zf, members["policy_targets"])
             policy_width = int(p_shape[1]) if len(p_shape) > 1 else 1
+        encoding_version: Optional[str] = None
+        if "action_encoding_version" in members:
+            encoding_version = str(
+                _read_member(zf, members["action_encoding_version"]).item()
+            )
     n_rows = int(tt_shape[0])
     if mask.shape[0] != n_rows:
         raise ValueError(
@@ -1534,6 +1692,7 @@ def _scan_structured_npz(path: Path) -> _FileScan:
         emb_width=int(emb_shape[2]) if len(emb_shape) > 2 else 0,
         scalar_width=int(sca_shape[2]) if len(sca_shape) > 2 else 0,
         policy_width=policy_width,
+        encoding_version=encoding_version,
     )
 
 
@@ -1549,7 +1708,11 @@ class _StorePlan:
     row_offsets: np.ndarray
 
 
-def _plan_store(scans: Sequence[_FileScan]) -> _StorePlan:
+def _plan_store(
+    scans: Sequence[_FileScan],
+    *,
+    policy_plan: Optional[_PolicyWidthPlan] = None,
+) -> _StorePlan:
     """Resolve the global widths + row offsets from the per-file scans.
 
     Width conflicts raise here with the same message the old
@@ -1596,6 +1759,10 @@ def _plan_store(scans: Sequence[_FileScan]) -> _StorePlan:
         emb_width = scans[0].emb_width if scans else 0
     policy_label = ""
     for scan in scans:
+        if policy_plan is not None:
+            # ``plan_policy_width`` already validated every file
+            # against the model's encoding.
+            break
         if scan.policy_width is None:
             continue
         if policy_width is None:
@@ -1607,7 +1774,9 @@ def _plan_store(scans: Sequence[_FileScan]) -> _StorePlan:
                 f"files: {scan.path} has width {scan.policy_width} but "
                 f"{policy_label} has {policy_width}."
             )
-    if policy_width is None:
+    if policy_plan is not None:
+        policy_width = policy_plan.width
+    elif policy_width is None:
         policy_width = ACTION_VOCAB_SIZE
     elif (
         policy_width != ACTION_VOCAB_SIZE
@@ -1690,6 +1859,9 @@ class _FlatStoreBuilder:
         )
         self.has_policy = alloc("has_policy.npy", np.bool_, (n_rows,))
         self.group_ids = alloc("group_ids.npy", np.int64, (n_rows,))
+        # Rows whose policy TARGET has mass in the canonical_v3
+        # resolution block (counted while streaming; reported).
+        self.resolution_target_rows = 0
         # ``row_offsets`` is fully known from the sizing pass.
         row_offsets = alloc("row_offsets.npy", np.int64, (n_rows + 1,))
         row_offsets[:] = plan.row_offsets
@@ -1762,10 +1934,27 @@ class _FlatStoreBuilder:
         if not n:
             return
         start = row_start + chunk_offset
-        self.policy_targets[start:start + n] = chunk
+        # A legacy 517-wide chunk in an 805-wide store fills the
+        # leading (canonical_v2) columns; the resolution block keeps
+        # the store's zero-fill (explicit pad, ``plan_policy_width``).
+        self.policy_targets[start:start + n, :chunk.shape[1]] = chunk
         self.has_policy[start:start + n] = (
             np.ascontiguousarray(chunk, dtype=np.float32).sum(axis=1) > 0.5
         )
+        if chunk.shape[1] > SLOT_RESOLUTION_BASE:
+            res_mass = np.asarray(chunk)[:, SLOT_RESOLUTION_BASE:].sum(axis=1)
+            self.resolution_target_rows += int((res_mass > 0.5).sum())
+
+    def write_mask_rows(
+        self, row_start: int, chunk_offset: int, chunk: np.ndarray,
+    ) -> None:
+        """Action masks; a narrower (legacy) chunk fills the leading
+        columns like ``write_policy_rows``."""
+        n = int(chunk.shape[0])
+        if not n:
+            return
+        start = row_start + chunk_offset
+        self.action_masks[start:start + n, :chunk.shape[1]] = chunk
 
     def close(self) -> None:
         """Flush + unmap every array. Must run before the store dir is
@@ -1882,7 +2071,7 @@ def _stream_file_into_store(
             for offset, chunk in _iter_member_rows(
                 zf, members["action_masks"],
             ):
-                builder.write_rows("action_masks", row_start, offset, chunk)
+                builder.write_mask_rows(row_start, offset, chunk)
         game_ids = (
             _read_member(zf, members["game_ids"])
             if "game_ids" in members else None
@@ -1909,11 +2098,16 @@ def _select_paths(
     return sorted(all_paths)
 
 
-def _store_signature(paths: Sequence[Path]) -> str:
+def _store_signature(
+    paths: Sequence[Path], *, policy_key: str = "",
+) -> str:
     """Cache key: layout version + every source file's path, size and
-    mtime. Any add / remove / rewrite changes the key."""
+    mtime (+ the policy-width plan's target encoding and legacy
+    assertion). Any add / remove / rewrite changes the key."""
     h = hashlib.sha256()
     h.update(f"v{FLAT_STORE_VERSION}|vocab={ACTION_VOCAB_SIZE}\n".encode())
+    if policy_key:
+        h.update(f"policy={policy_key}\n".encode())
     for p in paths:
         st = p.stat()
         h.update(
@@ -1945,9 +2139,21 @@ def load_structured_dataset(
     max_files: Optional[int] = None,
     cache_dir: Optional[Path] = None,
     sweep_stale: bool = True,
+    action_encoding_version: Optional[str] = None,
+    legacy_policy_encoding: Optional[str] = None,
 ) -> StructuredDataset:
     """Load every ``*.npz`` in ``directory`` that contains the four
     structured-token arrays. Files missing those arrays raise.
+
+    ``action_encoding_version`` (the model's) makes the policy columns
+    follow ``plan_policy_width``: the store is that version's width,
+    ``canonical_v2`` files are explicitly zero-padded into a
+    ``canonical_v3`` store (legacy unstamped ones only under
+    ``legacy_policy_encoding="canonical_v2"``), everything else that
+    disagrees is refused (``PolicyWidthError``). The plan's report --
+    padded files / rows and resolution-target rows -- is logged and
+    exposed as ``dataset.policy_report``. ``None`` keeps the
+    pre-2026-10-06 behaviour (one shared width, inferred).
 
     ``max_files`` (default ``None`` = all) caps to the N most recent
     files by mtime. Same semantics as
@@ -1996,7 +2202,14 @@ def load_structured_dataset(
     if cache_dir is None:
         env_cache = os.environ.get(CACHE_DIR_ENV)
         cache_dir = Path(env_cache) if env_cache else None
-    signature = _store_signature(paths) if cache_dir is not None else ""
+    policy_key = (
+        f"{action_encoding_version}|legacy={legacy_policy_encoding}"
+        if action_encoding_version is not None else ""
+    )
+    signature = (
+        _store_signature(paths, policy_key=policy_key)
+        if cache_dir is not None else ""
+    )
     if cache_dir is not None:
         cached = Path(cache_dir) / signature
         if _store_is_complete(cached, signature):
@@ -2008,7 +2221,15 @@ def load_structured_dataset(
 
     # ---- pass 1: sizes only (headers + bool masks) -----------------
     scans = [_scan_structured_npz(p) for p in paths]
-    plan = _plan_store(scans)
+    policy_plan = (
+        plan_policy_width(
+            scans,
+            action_encoding_version=action_encoding_version,
+            legacy_policy_encoding=legacy_policy_encoding,
+        )
+        if action_encoding_version is not None else None
+    )
+    plan = _plan_store(scans, policy_plan=policy_plan)
 
     # ---- allocate the flat store at its final size -----------------
     if cache_dir is not None:
@@ -2035,6 +2256,27 @@ def load_structured_dataset(
             )
             row_cursor += scan.n_rows
             token_cursor += scan.n_tokens
+        if policy_plan is not None:
+            report = dict(policy_plan.report)
+            report["resolution_target_rows"] = int(
+                builder.resolution_target_rows
+            )
+            report["rows"] = int(plan.n_rows)
+            (build_dir / POLICY_REPORT_NAME).write_text(
+                json.dumps(report, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            _log.info(
+                "structured dataset policy columns (%s, width %d): "
+                "%d files copied, %d files / %d rows zero-padded from "
+                "the legacy %d width (legacy encoding asserted: %s), "
+                "%d rows with resolution-decision targets",
+                report["action_encoding_version"], report["policy_width"],
+                report["copied_files"], report["padded_files"],
+                report["padded_rows"], ACTION_VOCAB_SIZE,
+                report["legacy_policy_encoding"],
+                report["resolution_target_rows"],
+            )
         if row_cursor != plan.n_rows or token_cursor != plan.n_tokens:
             raise ValueError(  # pragma: no cover - defensive
                 f"flat-store fill mismatch: wrote {row_cursor}/"

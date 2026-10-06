@@ -1214,7 +1214,7 @@ def test_outcome_labels_correct_under_seat_alternation():
         )
         (
             features, outcomes, _policy, _mask, winner, _kind, _struct,
-            _game_ids,
+            _game_ids, _resolution_stats,
         ) = chunk
         if winner is None:
             continue  # draws label both viewers 0 — covered by other tests

@@ -46,6 +46,8 @@ def test_to_dict_keys_match_field_names():
         # B3-S1: the single atomic-revert decision-source flip knob
         # travels with the heuristics through the same serialization.
         "decision_source",
+        # 2026-10-06: the searched-resolution-decisions switch.
+        "search_resolution_decisions",
     }
     assert set(cfg.to_dict().keys()) == expected_keys
 

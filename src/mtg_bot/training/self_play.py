@@ -47,7 +47,9 @@ from mtg_bot.cancellation import raise_if_cancelled
 from mtg_bot.decks import Deck
 from mtg_bot.replay import save_replay
 from mtg_bot.search.engine_adapter import MtgGameStateAdapter
-from mtg_bot.search.engine_adapter_factory import make_game_state_adapter
+from mtg_bot.search.engine_adapter_factory import (
+    make_game_state_adapter, resolution_seats_for,
+)
 from mtg_bot.search.heuristics_config import HeuristicsConfig
 from mtg_bot.search.protocol import CHANCE_PLAYER, PlayerID
 from mtg_bot.simulate import setup_game
@@ -533,18 +535,22 @@ def _play_one_match_game(
         decks=[deck_p0.cards, deck_p1.cards],
         seed=engine_seed,
     )
-    # B3-S1: route through the single decision-source factory. Under
-    # decision_source="python" (the default, carried on `heuristics`)
-    # this returns the identical MtgGameStateAdapter built with the
-    # same args — byte-identical to pre-B3 behavior.
-    adapter = make_game_state_adapter(
-        engine, expose_combat_decisions=True,
-        heuristics=heuristics,
-    )
     strategies = {
         0: p0_factory(base_seed + 100 * game_idx),
         1: p1_factory(base_seed + 100 * game_idx + 50),
     }
+    # B3-S1: route through the single decision-source factory. Under
+    # decision_source="python" (the default, carried on `heuristics`)
+    # this returns the identical MtgGameStateAdapter built with the
+    # same args — byte-identical to pre-B3 behavior. Resolution
+    # decisions are searched per seat (``resolution_seats_for``).
+    adapter = make_game_state_adapter(
+        engine, expose_combat_decisions=True,
+        expose_resolution_decisions=resolution_seats_for(
+            strategies, heuristics,
+        ),
+        heuristics=heuristics,
+    )
     # Pin torch CPU threads to 1 in this worker process. Strategy
     # factories that use the NN evaluator have just imported torch;
     # without this pin, every worker inherits the default of "host

@@ -127,6 +127,30 @@ def split_calibration_modifier(label: str) -> tuple[str, bool]:
 BOARD_ONLY_MODIFIER = "boardonly"
 
 
+# ``<label>+autotarget``: this seat's mid-resolution choices (targets,
+# modes, X, "may", surveil, sacrifice, discard, tutor picks, ...) are
+# made by ``DefaultTacticalAgent`` (first legal / always yes / X = max),
+# i.e. the behaviour of every ladder before 2026-10-06. Without it every
+# seat SEARCHES them (``docs/RESOLUTION_DECISIONS.md``). Works for
+# ``heuristic``, ``random`` and every registered version; an NN seat
+# whose policy head has no resolution slots (canonical_v2, e.g. v30)
+# needs it -- or an extended checkpoint (``mtg_bot
+# extend-resolution-slots``).
+AUTOTARGET_MODIFIER = "autotarget"
+
+
+def split_autotarget_modifier(label: str) -> tuple[str, bool]:
+    """``"v30r+b1+autotarget"`` -> ``("v30r+b1", False)``; without the
+    modifier -> ``(label, True)``. The bool is the seat's
+    ``search_resolution_decisions``. Twice is an error."""
+    parts = label.split("+")
+    kept = [parts[0]] + [m for m in parts[1:] if m != AUTOTARGET_MODIFIER]
+    n = len(parts) - len(kept)
+    if n > 1:
+        raise ValueError(f"{label!r}: '+{AUTOTARGET_MODIFIER}' given twice")
+    return "+".join(kept), n == 0
+
+
 def split_search_modifiers(
     label: str, *, nodes: int, samples: int,
 ) -> tuple[str, str, int, int]:
@@ -187,8 +211,14 @@ class RandomConfig:
     bound ``build`` pickles across the ``mp.Pool`` boundary exactly
     like the other seat factories."""
 
+    search_resolution_decisions: bool = True
+
     def build(self, seed: int = 0) -> SearchStrategy:
-        return RandomChoice(rng=random.Random(seed))
+        strategy = RandomChoice(rng=random.Random(seed))
+        strategy.search_resolution_decisions = (
+            self.search_resolution_decisions
+        )
+        return strategy
 
 
 @dataclass(frozen=True)
@@ -227,7 +257,10 @@ def resolve_agent(
         HeuristicConfig, NNPimcConfig, PimcConfig, Registry,
     )
 
-    version, apply_value_calibration = split_calibration_modifier(label)
+    autotarget_free, search_resolution = split_autotarget_modifier(label)
+    version, apply_value_calibration = split_calibration_modifier(
+        autotarget_free,
+    )
     # ``+boardonly`` / ``+s<K>`` reshape this seat's search only.
     stripped, opponent_hidden_model, samples, nodes = split_search_modifiers(
         version, nodes=nodes, samples=samples,
@@ -246,10 +279,14 @@ def resolve_agent(
             f"(it switches off a network's value calibration)"
         )
 
-    if label == RANDOM_LABEL:
+    if version == RANDOM_LABEL:
+        rcfg = RandomConfig(search_resolution_decisions=search_resolution)
         return AgentSpec(
-            label=label, factory=RandomConfig().build,
-            description={"kind": "random"},
+            label=label, factory=rcfg.build,
+            description={
+                "kind": "random",
+                "search_resolution_decisions": search_resolution,
+            },
         )
     # ``+nocal`` is stripped first (``version``); the remaining
     # modifiers are the head variant / leaf batch size.
@@ -261,6 +298,7 @@ def resolve_agent(
             samples=samples, inner_nodes=nodes,
             heuristic=HeuristicConfig(), batch_size=batch or 1,
             opponent_hidden_model=opponent_hidden_model,
+            search_resolution_decisions=search_resolution,
         )
         return AgentSpec(
             label=label, factory=cfg.build,
@@ -301,14 +339,19 @@ def resolve_agent(
         action_encoding_version=meta.action_encoding_version,
         apply_value_calibration=apply_value_calibration,
         opponent_hidden_model=opponent_hidden_model,
+        search_resolution_decisions=search_resolution,
+    )
+    if variant == "heurvalue" and not meta.with_policy:
+        raise ValueError(
+            f"{label!r}: the heurvalue variant needs a policy head, "
+            f"but {version} was trained without one"
+        )
+    _check_resolution_priors(
+        label, cfg, meta.action_encoding_version,
+        uses_policy=cfg.puct or variant == "heurvalue",
     )
     if variant == "heurvalue":
         from mtg_bot.search.hybrid_evaluator import HybridPimcConfig
-        if not meta.with_policy:
-            raise ValueError(
-                f"{label!r}: the heurvalue variant needs a policy head, "
-                f"but {version} was trained without one"
-            )
         hcfg = HybridPimcConfig(
             nn=cfg, heuristic=HeuristicConfig(),
             samples=samples, inner_nodes=nodes,
@@ -335,6 +378,36 @@ def resolve_agent(
             "value_calibration": dict(meta.value_calibration or {}),
             **cfg.to_dict(),
         },
+    )
+
+
+def _check_resolution_priors(
+    label: str, cfg: Any, action_encoding_version: str, *,
+    uses_policy: bool,
+) -> None:
+    """Refuse up front (before any pool spins up) an NN seat that would
+    search resolution decisions on a policy head without resolution
+    slots -- the game constructor would refuse every game anyway
+    (``ResolutionPriorUnavailableError``)."""
+    from mtg_bot.search.heuristics_config import (
+        default_search_resolution_decisions,
+    )
+    from mtg_bot.training.action_encoding import has_resolution_slots
+
+    if not (
+        uses_policy
+        and cfg.search_resolution_decisions
+        and default_search_resolution_decisions()
+    ):
+        return
+    if has_resolution_slots(action_encoding_version):
+        return
+    raise ValueError(
+        f"{label!r}: action encoding {action_encoding_version!r} has no "
+        f"resolution-decision slots, but resolution decisions are searched "
+        f"by default. Use an extended checkpoint (mtg_bot "
+        f"extend-resolution-slots) or '{label}+{AUTOTARGET_MODIFIER}' for "
+        f"the old auto-targeting behaviour."
     )
 
 

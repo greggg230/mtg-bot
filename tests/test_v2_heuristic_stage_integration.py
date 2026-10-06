@@ -188,6 +188,10 @@ def test_heuristic_stage_drains_and_lands_nn_compatible_npzs(tmp_path):
         "root_values", "game_ids",
         # The card vocabulary + cap the printing ids were tokenised in.
         "structured_card_vocab",
+        # The action encoding the policy columns use + the game's
+        # resolution-supervision counters (2026-10-06).
+        "action_encoding_version", "resolution_pause_samples",
+        "resolution_policy_rows", "resolution_overflow_visits",
     }
     from mtg_bot.training.card_vocab import (
         current_card_vocab,

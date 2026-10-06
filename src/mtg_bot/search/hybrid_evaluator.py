@@ -132,7 +132,7 @@ class HybridPimcConfig:
             )
 
         from mtg_bot.search.determinize import make_determinize_fn
-        return PIMC(
+        strategy = PIMC(
             inner_factory=inner_factory,
             samples=self.samples,
             rng=random.Random(rng_seed_outer),
@@ -141,6 +141,19 @@ class HybridPimcConfig:
                 getattr(self.nn, "opponent_hidden_model", "sampled"),
             ),
         )
+        # Resolution-decision attributes ride on the NN config too
+        # (``+autotarget``); PUCT priors come from the NN policy head,
+        # so it needs resolution slots to search them.
+        from mtg_bot.training.action_encoding import has_resolution_slots
+        version = getattr(evaluator, "action_encoding_version", None)
+        strategy.search_resolution_decisions = bool(
+            getattr(self.nn, "search_resolution_decisions", True),
+        )
+        strategy.can_prior_resolution_decisions = bool(
+            version is not None and has_resolution_slots(version)
+        )
+        strategy.resolution_prior_note = "heurvalue hybrid seat"
+        return strategy
 
     def to_dict(self) -> dict[str, Any]:
         return {

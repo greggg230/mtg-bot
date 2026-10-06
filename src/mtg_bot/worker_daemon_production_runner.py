@@ -385,12 +385,39 @@ def _encode_npz_bytes(
             "action_masks": action_masks,
             "game_ids": game_ids,
         }
+    # Resolution-supervision stamp (``chunk[8]``, 2026-10-06+): the
+    # action-encoding version the policy columns were written under
+    # and the game's resolution-row counters, so the trainer can tell
+    # an 805-wide canonical_v3 shard from a legacy 517-wide one and
+    # log how much resolution supervision the window carries.
+    from mtg_bot.training.data_gen import resolution_stats_arrays
+
+    stats = chunk[8] if len(chunk) > 8 else None
+    arrays.update(resolution_stats_arrays(stats))
+    if stats:
+        log.info(
+            "[self_play_runner] game resolution supervision: %d rows "
+            "from %d sampled pauses, %d overflow visits (%s)",
+            int(stats.get("resolution_policy_rows", 0)),
+            int(stats.get("resolution_pause_samples", 0)),
+            int(stats.get("resolution_overflow_visits", 0)),
+            stats.get("action_encoding_version"),
+        )
     # Drop empty rows (crashed / timed-out games): save_dataset would
     # raise on FEATURE_DIM mismatch when features is a (0, FEATURE_DIM)
     # array. The save_dataset path validates; for raw bytes we just
     # round-trip via numpy.
     np.savez_compressed(buf, **arrays)
     return buf.getvalue()
+
+
+def _policy_width(action_encoding_version: Optional[str]) -> int:
+    """Policy-column width of a self-play shard (517 for v1 / v2, 805
+    for canonical_v3) -- also for the zero-row npz of a crashed /
+    timed-out game, so a window's files agree on it."""
+    from mtg_bot.training.action_encoding import action_vocab_size
+
+    return action_vocab_size(action_encoding_version or "positional_v1")
 
 
 def _play_self_play_game(
@@ -464,13 +491,13 @@ def _play_self_play_game(
             temperature_cutoff=temperature_cutoff,
         )
     except TimeoutError:
-        f, o, p, m = _empty_arrays()
+        f, o, p, m = _empty_arrays(_policy_width(action_encoding_version))
         chunk = (f, o, p, m, None, "timed_out", [], _empty_game_ids())
     except Exception:  # noqa: BLE001 - intentional broad catch
         log.exception(
             "[self_play_runner] game %d crashed; dropping", game_idx
         )
-        f, o, p, m = _empty_arrays()
+        f, o, p, m = _empty_arrays(_policy_width(action_encoding_version))
         chunk = (f, o, p, m, None, "crashed", [], _empty_game_ids())
 
     # ``chunk`` is now an 8-tuple ``(features, outcomes, policy_targets,

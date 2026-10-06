@@ -35,11 +35,61 @@ Rust ``GameState`` via :func:`make_rust_game_state_adapter`.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Mapping, Optional, Union
 
 from mtg_bot.search.heuristics_config import (
     DEFAULT_DECISION_SOURCE, HeuristicsConfig,
+    default_search_resolution_decisions,
 )
+
+
+class ResolutionPriorUnavailableError(ValueError):
+    """A seat whose resolution decisions are searched uses a policy
+    head (PUCT) that has no slots for them -- a ``positional_v1`` /
+    ``canonical_v2`` checkpoint. It would search every resolution pause
+    on all-zero priors. Extend the checkpoint (``mtg_bot
+    extend-resolution-slots``) or run the seat with
+    ``search_resolution_decisions=False`` (ladder ``+autotarget``)."""
+
+
+def strategy_searches_resolution(strategy: Any) -> bool:
+    """A built strategy's per-agent opt-in (``True`` unless its config
+    set ``search_resolution_decisions=False``)."""
+    return bool(getattr(strategy, "search_resolution_decisions", True))
+
+
+def resolution_seats_for(
+    strategies: Mapping[int, Any],
+    heuristics: Optional[HeuristicsConfig],
+) -> frozenset[int]:
+    """The seats whose mid-resolution choices this game searches: none
+    when the game-level switch
+    (``HeuristicsConfig.search_resolution_decisions``, default ON) is
+    off, else every seat whose strategy didn't opt out. Raises
+    ``ResolutionPriorUnavailableError`` for a searched seat whose PUCT
+    policy head has no resolution slots."""
+    enabled = (
+        heuristics.search_resolution_decisions
+        if heuristics is not None
+        else default_search_resolution_decisions()
+    )
+    if not enabled:
+        return frozenset()
+    seats: set[int] = set()
+    for seat, strategy in strategies.items():
+        if not strategy_searches_resolution(strategy):
+            continue
+        if not getattr(strategy, "can_prior_resolution_decisions", True):
+            raise ResolutionPriorUnavailableError(
+                f"seat {seat}: {getattr(strategy, 'resolution_prior_note', type(strategy).__name__)}"
+                f" searches resolution decisions with a PUCT policy head "
+                f"that has no resolution slots (all-zero priors). Extend "
+                f"the checkpoint (mtg_bot extend-resolution-slots) or run "
+                f"the seat with search_resolution_decisions=False "
+                f"(ladder +autotarget)."
+            )
+        seats.add(int(seat))
+    return frozenset(seats)
 
 
 def _resolve_decision_source(
@@ -63,7 +113,7 @@ def make_game_state_adapter(
     *,
     tactical_agent: Any = None,
     expose_combat_decisions: bool = True,
-    expose_resolution_decisions: bool = False,
+    expose_resolution_decisions: Union[bool, Iterable[int]] = False,
     heuristics: Optional[HeuristicsConfig] = None,
     decision_source: Optional[str] = None,
 ):

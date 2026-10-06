@@ -146,7 +146,9 @@ def play_instrumented_game(task: dict[str, Any]) -> dict[str, Any]:
 
 def _play(task: dict[str, Any]) -> dict[str, Any]:
     from mtg_bot.agents import RandomAgent
-    from mtg_bot.search.engine_adapter_factory import make_game_state_adapter
+    from mtg_bot.search.engine_adapter_factory import (
+        make_game_state_adapter, resolution_seats_for,
+    )
     from mtg_bot.simulate import setup_game
     from mtg_bot.training._worker_threads import pin_worker_torch_threads
     from mtg_bot.training.data_gen import _sample_decks_for_game
@@ -166,11 +168,16 @@ def _play(task: dict[str, Any]) -> dict[str, Any]:
          RandomAgent(rng=random.Random(engine_seed + 2))],
         decks=[deck_p0.cards, deck_p1.cards], seed=engine_seed,
     )
-    adapter = make_game_state_adapter(engine, expose_combat_decisions=True)
     strategies = {
         0: p0_factory(base_seed + 100 * g),
         1: p1_factory(base_seed + 100 * g + 50),
     }
+    # Same per-seat resolution-decision exposure as every production
+    # game (``self_play._play_one_match_game``).
+    adapter = make_game_state_adapter(
+        engine, expose_combat_decisions=True,
+        expose_resolution_decisions=resolution_seats_for(strategies, None),
+    )
     pin_worker_torch_threads()
     agent = strategies[agent_seat]
 

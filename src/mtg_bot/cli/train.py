@@ -53,7 +53,12 @@ from mtg_bot.training import (
     train_structured_model,
     train_value_network,
 )
+from mtg_bot.training.action_encoding import action_vocab_size
 from mtg_bot.training.block_shuffle import DEFAULT_BLOCK_ROWS
+from mtg_bot.training.structured_dataset import (
+    LEGACY_POLICY_ENCODING_ENV,
+    PolicyWidthError,
+)
 from mtg_bot.training.card_vocab import (
     SHARD_CARD_VOCAB_ENV,
     CardVocabError,
@@ -766,7 +771,7 @@ def main(argv=None) -> None:
     )
     parser.add_argument(
         "--action-encoding-version",
-        choices=["positional_v1", "canonical_v2"],
+        choices=["positional_v1", "canonical_v2", "canonical_v3"],
         default="positional_v1",
         help=(
             "Action-encoding slot mapping convention. "
@@ -774,10 +779,30 @@ def main(argv=None) -> None:
             "uses raw card.id-positional slots. 'canonical_v2' sorts "
             "hand/graveyard/exile by (printing.name, modifier_tuple, "
             "card.id) before slot assignment so two canonically-"
-            "equivalent states share their slot mappings. The choice "
+            "equivalent states share their slot mappings. "
+            "'canonical_v3' = canonical_v2 + the resolution-decision "
+            "slots (805-wide policy head; structured only; see "
+            "docs/RESOLUTION_DECISIONS.md). The choice "
             "is recorded in metadata.json so loaders thread it through "
             "to NNEvaluator at inference. Switching versions is a "
-            "v-chain break — old weights cannot be reused."
+            "v-chain break — old weights cannot be reused (extend a "
+            "canonical_v2 checkpoint with `mtg_bot "
+            "extend-resolution-slots` instead)."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-policy-encoding",
+        choices=["canonical_v2"],
+        default=None,
+        help=(
+            "Structured canonical_v3 training only. ASSERT that the "
+            "window's legacy (unstamped, 517-wide) shards were encoded "
+            "under canonical_v2, so they are explicitly zero-padded into "
+            "the resolution block (those games had no resolution "
+            "supervision). Without it a canonical_v3 window holding "
+            "legacy shards is refused -- width 517 can't tell "
+            "positional_v1 from canonical_v2. Default: "
+            "$MTG_BOT_LEGACY_POLICY_ENCODING if set."
         ),
     )
     # Structured-architecture (Step 1) hyperparameters. Only consumed
@@ -1548,8 +1573,22 @@ def _main_structured(args, parser) -> None:
             )
             + ")"
         )
+    legacy_policy_encoding = args.legacy_policy_encoding or (
+        os.environ.get(LEGACY_POLICY_ENCODING_ENV) or None
+    )
+    if legacy_policy_encoding not in (None, "canonical_v2"):
+        sys.exit(
+            f"${LEGACY_POLICY_ENCODING_ENV}={legacy_policy_encoding!r}: "
+            f"the only assertable legacy policy encoding is canonical_v2"
+        )
     try:
-        dataset = load_structured_dataset(load_dir)
+        dataset = load_structured_dataset(
+            load_dir,
+            action_encoding_version=args.action_encoding_version,
+            legacy_policy_encoding=legacy_policy_encoding,
+        )
+    except PolicyWidthError as exc:
+        sys.exit(f"policy columns: {exc}")
     except FileNotFoundError as exc:
         sys.exit(str(exc))
     except ValueError as exc:
@@ -1626,6 +1665,24 @@ def _main_structured(args, parser) -> None:
         )
     if args.value_head_input is not None:
         structured_overrides["value_head_input"] = args.value_head_input
+    # Policy-head width follows the action encoding (517 v1/v2, 805
+    # canonical_v3); the dataset was built at the same width.
+    structured_overrides["action_vocab_size"] = action_vocab_size(
+        args.action_encoding_version,
+    )
+    policy_report = dict(getattr(dataset, "policy_report", {}) or {})
+    if policy_report:
+        print(
+            f"# Structured-trainer: policy columns {policy_report.get('action_encoding_version')} "
+            f"(width {policy_report.get('policy_width')}): "
+            f"{policy_report.get('copied_files')} files copied, "
+            f"{policy_report.get('padded_files')} files / "
+            f"{policy_report.get('padded_rows')} rows zero-padded from the "
+            f"legacy 517 width (asserted: "
+            f"{policy_report.get('legacy_policy_encoding')}), "
+            f"{policy_report.get('resolution_target_rows')} rows with "
+            f"resolution-decision targets"
+        )
     dropout = (
         DEFAULT_STRUCTURED_DROPOUT if args.dropout is None
         else float(args.dropout)
@@ -1719,7 +1776,9 @@ def _main_structured(args, parser) -> None:
                 structured_config.scalar_schema_version
             ),
             "value_head_input": structured_config.value_head_input,
+            "action_vocab_size": structured_config.action_vocab_size,
         },
+        "policy_report": policy_report,
     }
     parent_run_id = _parent_run_id_from_notes(args.notes)
 
@@ -1940,6 +1999,12 @@ def _main_structured(args, parser) -> None:
                 "structured_value_head_input": (
                     structured_config.value_head_input
                 ),
+                "structured_action_vocab_size": (
+                    structured_config.action_vocab_size
+                ),
+                # How the window's policy columns were assembled
+                # (files copied / zero-padded, resolution rows).
+                "policy_report": policy_report,
             },
             training_history={
                 "train_losses": history.train_losses,

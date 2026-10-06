@@ -107,6 +107,13 @@ class PimcConfig:
     # ``"sampled"`` (default, unchanged behaviour) or ``"board_only"``
     # (inert placeholders; see ``mtg_bot.search.determinize``).
     opponent_hidden_model: str = DEFAULT_OPPONENT_HIDDEN_MODEL
+    # Whether this seat's mid-resolution choices are search decisions
+    # (when the game-level switch ``HeuristicsConfig.
+    # search_resolution_decisions`` is on). False = the old
+    # ``DefaultTacticalAgent`` behaviour for this seat only (ladder
+    # ``+autotarget``). UCB1 needs no priors, so the heuristic can
+    # always search them.
+    search_resolution_decisions: bool = True
 
     def __post_init__(self) -> None:
         check_opponent_hidden_model(self.opponent_hidden_model)
@@ -133,11 +140,18 @@ class PimcConfig:
                 root_dirichlet_eps=root_dirichlet_eps,
             )
 
-        return PIMC(
-            inner_factory=inner_factory,
-            samples=self.samples,
-            rng=random.Random(rng_seed_outer),
-            determinize_fn=make_determinize_fn(self.opponent_hidden_model),
+        return _tag_resolution(
+            PIMC(
+                inner_factory=inner_factory,
+                samples=self.samples,
+                rng=random.Random(rng_seed_outer),
+                determinize_fn=make_determinize_fn(
+                    self.opponent_hidden_model,
+                ),
+            ),
+            search=self.search_resolution_decisions,
+            can_prior=True,
+            note="heuristic PIMC",
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -149,6 +163,7 @@ class PimcConfig:
             "root_dirichlet_alpha": self.root_dirichlet_alpha,
             "root_dirichlet_eps": self.root_dirichlet_eps,
             "opponent_hidden_model": self.opponent_hidden_model,
+            "search_resolution_decisions": self.search_resolution_decisions,
         }
 
     @classmethod
@@ -163,7 +178,24 @@ class PimcConfig:
             opponent_hidden_model=d.get(
                 "opponent_hidden_model", DEFAULT_OPPONENT_HIDDEN_MODEL,
             ),
+            search_resolution_decisions=bool(
+                d.get("search_resolution_decisions", True),
+            ),
         )
+
+
+def _tag_resolution(
+    strategy: SearchStrategy, *, search: bool, can_prior: bool, note: str,
+) -> SearchStrategy:
+    """Stamp the per-agent resolution-decision attributes the game
+    constructor reads (``engine_adapter_factory.resolution_seats_for``):
+    ``search_resolution_decisions`` (the agent's opt-in) and
+    ``can_prior_resolution_decisions`` (False for a PUCT policy head
+    without resolution slots -- refused when the seat is searched)."""
+    strategy.search_resolution_decisions = bool(search)
+    strategy.can_prior_resolution_decisions = bool(can_prior)
+    strategy.resolution_prior_note = note
+    return strategy
 
 
 @dataclass(frozen=True)
@@ -300,6 +332,13 @@ class NNPimcConfig:
     # seat's config carries its own, so the two seats of a match are
     # independent. ``mtg_bot ladder`` label modifier ``+boardonly``.
     opponent_hidden_model: str = DEFAULT_OPPONENT_HIDDEN_MODEL
+    # This seat's mid-resolution choices are search decisions when the
+    # game-level switch is on (see ``PimcConfig``); False = the old
+    # auto-targeting for this seat only (ladder ``+autotarget``). A
+    # PUCT seat needs a policy head with resolution slots
+    # (``canonical_v3``) to search them -- otherwise the game refuses
+    # to start (``ResolutionPriorUnavailableError``).
+    search_resolution_decisions: bool = True
 
     def __post_init__(self) -> None:
         check_opponent_hidden_model(self.opponent_hidden_model)
@@ -411,6 +450,14 @@ class NNPimcConfig:
                 # nothing declared, nothing to apply -- the evaluator's
                 # defaults (identity calibration, shared value input).
                 evaluator = NNEvaluator(**eval_kwargs)
+        return _tag_resolution(
+            self._build_search(evaluator, seed),
+            search=self.search_resolution_decisions,
+            can_prior=_can_prior_resolution(evaluator, self.puct),
+            note=f"NN seat {self.weights_path}",
+        )
+
+    def _build_search(self, evaluator: Any, seed: int) -> SearchStrategy:
         if self.use_ismcts:
             total_iters = max(1, self.samples * self.inner_nodes)
             ismcts_kwargs: dict[str, Any] = {
@@ -493,6 +540,7 @@ class NNPimcConfig:
             "root_dirichlet_eps": self.root_dirichlet_eps,
             "apply_value_calibration": self.apply_value_calibration,
             "opponent_hidden_model": self.opponent_hidden_model,
+            "search_resolution_decisions": self.search_resolution_decisions,
         }
 
     @classmethod
@@ -530,7 +578,24 @@ class NNPimcConfig:
             opponent_hidden_model=d.get(
                 "opponent_hidden_model", DEFAULT_OPPONENT_HIDDEN_MODEL,
             ),
+            search_resolution_decisions=bool(
+                d.get("search_resolution_decisions", True),
+            ),
         )
+
+
+def _can_prior_resolution(evaluator: Any, puct: bool) -> bool:
+    """Whether a seat built on ``evaluator`` can search resolution
+    pauses: UCB1 (``puct=False``) needs no priors; PUCT needs a policy
+    head whose action encoding has resolution slots."""
+    if not puct:
+        return True
+    from mtg_bot.training.action_encoding import has_resolution_slots
+
+    version = getattr(evaluator, "action_encoding_version", None)
+    if version is None:
+        return False
+    return has_resolution_slots(version)
 
 
 def _sibling_metadata(weights_path: Path) -> Optional[dict[str, Any]]:
@@ -639,10 +704,17 @@ class NNServerPimcConfig:
                 puct=puct,
             )
 
-        return PIMC(
-            inner_factory=inner_factory,
-            samples=self.samples,
-            rng=random.Random(rng_seed_outer),
+        return _tag_resolution(
+            PIMC(
+                inner_factory=inner_factory,
+                samples=self.samples,
+                rng=random.Random(rng_seed_outer),
+            ),
+            search=True,
+            # The NN eval server path is 517 slots wide (no resolution
+            # block): fine under UCB1, refused when PUCT and searched.
+            can_prior=not self.puct,
+            note="NN-server seat",
         )
 
 

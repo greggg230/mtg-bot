@@ -783,6 +783,7 @@ def _self_play(  # pragma: no cover
             structured_token_scalars=structured_token_scalars,
             structured_attention_mask=structured_attention_mask,
             game_ids=game_ids,
+            action_encoding_version=action_encoding_version,
         )
     else:
         (
@@ -792,6 +793,7 @@ def _self_play(  # pragma: no cover
             features, outcomes, output,
             policy_targets=policy_targets, action_masks=action_masks,
             game_ids=game_ids,
+            action_encoding_version=action_encoding_version,
         )
     n_samples = features.shape[0]
     n_policy = int((policy_targets.sum(axis=-1) > 0.5).sum())

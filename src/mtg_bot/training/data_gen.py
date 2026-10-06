@@ -78,7 +78,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -88,7 +88,9 @@ from mtg_bot.decks import Deck
 from mtg_bot.features import FEATURE_DIM, extract_features
 from mtg_bot.replay import save_replay
 from mtg_bot.search.engine_adapter import MtgGameStateAdapter
-from mtg_bot.search.engine_adapter_factory import make_game_state_adapter
+from mtg_bot.search.engine_adapter_factory import (
+    make_game_state_adapter, resolution_seats_for,
+)
 from mtg_bot.search.heuristics_config import HeuristicsConfig
 from mtg_bot.search.protocol import CHANCE_PLAYER, Decision, PlayerID
 from mtg_bot.simulate import setup_game
@@ -444,20 +446,109 @@ class ReplayCaptureConfig:
         return ReplayRecorder(annotators=annotators)
 
 
-def _empty_arrays() -> tuple[
+def _empty_arrays(policy_width: Optional[int] = None) -> tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray,
 ]:
     """Empty arrays matching the post-A2.3 4-tuple schema. Use for
     the no-games / no-samples paths in the data-gen functions.
-    Lazy-imports ``ACTION_VOCAB_SIZE`` to avoid the ``training`` →
-    ``training.action_encoding`` dep at module-load time."""
+    ``policy_width`` defaults to ``ACTION_VOCAB_SIZE`` (517, the
+    v1 / v2 width); pass ``action_vocab_size(version)`` for a
+    ``canonical_v3`` run. Lazy-imports ``ACTION_VOCAB_SIZE`` to avoid
+    the ``training`` → ``training.action_encoding`` dep at module-load
+    time."""
     from mtg_bot.training.action_encoding import ACTION_VOCAB_SIZE
+    width = ACTION_VOCAB_SIZE if policy_width is None else int(policy_width)
     return (
         np.zeros((0, FEATURE_DIM), dtype=_DTYPE_FEATURES),
         np.zeros((0,), dtype=_DTYPE_OUTCOMES),
-        np.zeros((0, ACTION_VOCAB_SIZE), dtype=_DTYPE_POLICY),
-        np.zeros((0, ACTION_VOCAB_SIZE), dtype=np.bool_),
+        np.zeros((0, width), dtype=_DTYPE_POLICY),
+        np.zeros((0, width), dtype=np.bool_),
     )
+
+
+class ResolutionSupervisionError(RuntimeError):
+    """A game whose sampled resolution pauses produced ZERO encodable
+    resolution policy rows -- the silent no-op the SEARCH_LIMITATIONS
+    §5 analysis warned about (e.g. resolution decisions searched while
+    the run encodes with ``canonical_v2``, which has no resolution
+    slots). Raised instead of writing a shard that trains nothing at
+    those decisions; see ``docs/RESOLUTION_DECISIONS.md`` §5."""
+
+
+def new_resolution_stats(action_encoding_version: str) -> dict[str, Any]:
+    """Per-game resolution-supervision counters (filled by
+    ``_play_one_game_recording``, written to the shard by
+    ``save_dataset`` / the worker's npz writer)."""
+    return {
+        "action_encoding_version": action_encoding_version,
+        "resolution_pause_samples": 0,
+        "resolution_policy_rows": 0,
+        "resolution_overflow_visits": 0,
+    }
+
+
+RESOLUTION_STAT_KEYS = (
+    "resolution_pause_samples",
+    "resolution_policy_rows",
+    "resolution_overflow_visits",
+)
+"""Integer counters ``new_resolution_stats`` tracks; each is written
+to the shard as a 0-d int64 npz entry of the same name."""
+
+
+def resolution_stats_arrays(stats: Optional[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """npz entries for a game's (or a merged run's) resolution stats:
+    ``action_encoding_version`` (0-d unicode) + the integer counters.
+    Empty dict for ``None``."""
+    if not stats:
+        return {}
+    out: dict[str, np.ndarray] = {
+        "action_encoding_version": np.array(
+            str(stats["action_encoding_version"]),
+        ),
+    }
+    for key in RESOLUTION_STAT_KEYS:
+        out[key] = np.array(int(stats.get(key, 0)), dtype=np.int64)
+    return out
+
+
+def resolution_stats_from_masks(
+    action_encoding_version: str, action_masks: Optional[np.ndarray],
+) -> dict[str, Any]:
+    """Stats for a shard written without per-game counters: resolution
+    policy rows = rows whose mask has a legal resolution slot; the
+    pause / overflow counters are unknown (-1)."""
+    from mtg_bot.training.action_encoding import SLOT_RESOLUTION_BASE
+
+    stats = new_resolution_stats(action_encoding_version)
+    stats["resolution_pause_samples"] = -1
+    stats["resolution_overflow_visits"] = -1
+    if action_masks is not None and action_masks.shape[1] > SLOT_RESOLUTION_BASE:
+        stats["resolution_policy_rows"] = int(
+            action_masks[:, SLOT_RESOLUTION_BASE:].any(axis=1).sum()
+        )
+    return stats
+
+
+def merge_resolution_stats(
+    stats_list: Sequence[Optional[dict[str, Any]]],
+) -> Optional[dict[str, Any]]:
+    """Sum the counters of several games' stats (same encoding
+    version, else ``ValueError``); ``None`` when none carry stats."""
+    present = [s for s in stats_list if s]
+    if not present:
+        return None
+    versions = {s["action_encoding_version"] for s in present}
+    if len(versions) != 1:
+        raise ValueError(
+            f"games encoded under different action-encoding versions "
+            f"{sorted(versions)} cannot share a shard"
+        )
+    merged = new_resolution_stats(versions.pop())
+    for s in present:
+        for key in RESOLUTION_STAT_KEYS:
+            merged[key] += int(s.get(key, 0))
+    return merged
 
 
 def _now_iso() -> str:
@@ -1064,7 +1155,9 @@ def _generate_one_game_data(
 ) -> tuple:
     """Play one game and return its per-game chunk tuple
     ``(features, outcomes, policy_targets, action_masks, winner,
-    outcome_kind, struct_rows, game_ids)``. ``game_ids`` is an
+    outcome_kind, struct_rows, game_ids, resolution_stats)``.
+    ``resolution_stats`` is the ``new_resolution_stats`` dict (encoding
+    version + resolution-supervision counters). ``game_ids`` is an
     ``(N,)`` int32 array filled with ``game_idx`` — the per-row
     group id the trainer uses for game-level train/val splitting.
 
@@ -1121,19 +1214,25 @@ def _generate_one_game_data(
     if game_idx % 2 == 1:
         engine.active_player_idx = 1
         engine.priority_player_idx = 1
+    strategies = {
+        0: p0_factory(base_seed + 100 * game_idx),
+        1: p1_factory(base_seed + 100 * game_idx + 50),
+    }
     # B3-S1: route through the single decision-source factory. Under
     # decision_source="python" (the default, carried on `heuristics`)
     # this returns the identical MtgGameStateAdapter built with the
     # same args — byte-identical to pre-B3 behavior. The flag is read
     # once here at game construction (the single atomic-revert knob).
+    # Resolution decisions are searched for every seat whose strategy
+    # didn't opt out, unless the game-level switch is off
+    # (``docs/RESOLUTION_DECISIONS.md``).
     adapter = make_game_state_adapter(
         engine, expose_combat_decisions=True,
+        expose_resolution_decisions=resolution_seats_for(
+            strategies, heuristics,
+        ),
         heuristics=heuristics,
     )
-    strategies = {
-        0: p0_factory(base_seed + 100 * game_idx),
-        1: p1_factory(base_seed + 100 * game_idx + 50),
-    }
     # Pin torch CPU threads to 1 in this worker process. Strategy
     # factories that use the NN evaluator have just imported torch;
     # without this pin every worker inherits the default of "host
@@ -1159,6 +1258,7 @@ def _generate_one_game_data(
     tree_top_k = (
         replay_config.tree_top_k if replay_config is not None else None
     )
+    resolution_stats = new_resolution_stats(action_encoding_version)
     if per_game_timeout_sec is not None and per_game_timeout_sec > 0:
         from mtg_bot.training._timeout import run_with_timeout
         from mtg_bot.training._hang_progress import HangProgress
@@ -1170,7 +1270,8 @@ def _generate_one_game_data(
                  recorder, progress, tree_depth, tree_top_k,
                  action_encoding_version, structured_tokens,
                  structured_scalar_schema_version,
-                 move_temperature, temperature_cutoff),
+                 move_temperature, temperature_cutoff,
+                 resolution_stats),
                 per_game_timeout_sec,
             )
         except TimeoutError as exc:
@@ -1219,6 +1320,7 @@ def _generate_one_game_data(
             ),
             move_temperature=move_temperature,
             temperature_cutoff=temperature_cutoff,
+            stats=resolution_stats,
         )
 
     if recorder is not None and replay_config is not None:
@@ -1234,8 +1336,12 @@ def _generate_one_game_data(
         save_replay(replay, replay_config.replay_path(base_seed, game_idx))
 
     if not samples:
-        f, o, p, m = _empty_arrays()
-        return f, o, p, m, winner, "completed", [], _empty_game_ids()
+        from mtg_bot.training.action_encoding import action_vocab_size
+        f, o, p, m = _empty_arrays(action_vocab_size(action_encoding_version))
+        return (
+            f, o, p, m, winner, "completed", [], _empty_game_ids(),
+            resolution_stats,
+        )
     outcome_label = _outcome_label(winner)
     features = np.stack(
         [f for f, _, _, _ in samples], axis=0,
@@ -1255,7 +1361,7 @@ def _generate_one_game_data(
     )
     return (
         features, outcomes, policy_targets, action_masks, winner,
-        "completed", struct_rows, game_ids,
+        "completed", struct_rows, game_ids, resolution_stats,
     )
 
 
@@ -1284,7 +1390,8 @@ def _concat_chunks(
     Skips empty chunks (zero-decision games hit the cap)."""
     nonempty = [c for c in chunks if c[0].size > 0]
     if not nonempty:
-        return _empty_arrays() + (_empty_game_ids(),)
+        width = chunks[0][2].shape[1] if chunks else None
+        return _empty_arrays(width) + (_empty_game_ids(),)
     features = np.concatenate(
         [c[0] for c in nonempty], axis=0,
     ).astype(_DTYPE_FEATURES)
@@ -1328,6 +1435,7 @@ def _play_one_game_recording(
     structured_scalar_schema_version: Optional[int] = None,
     move_temperature: float = 1.0,
     temperature_cutoff: int = 30,
+    stats: Optional[dict[str, Any]] = None,
 ) -> tuple[
     PlayerID | None,
     list[tuple[np.ndarray, PlayerID, np.ndarray, np.ndarray]],
@@ -1373,12 +1481,26 @@ def _play_one_game_recording(
       slots that were legal at the sample point. All-False for
       rows without policy supervision (mask is irrelevant to
       value-only loss).
+
+    Both are ``action_vocab_size(action_encoding_version)`` wide (805
+    for ``canonical_v3``, whose resolution block supervises the
+    mid-resolution choices; 517 otherwise).
+
+    ``stats`` (optional dict from ``new_resolution_stats``) is filled
+    in place with the game's resolution-supervision counters. A game
+    with sampled resolution pauses but zero encodable resolution
+    policy rows raises ``ResolutionSupervisionError`` -- never a
+    silent no-op.
     """
     # Local import — action_encoding pulls in legal-action
     # enumeration, which is heavier than this file's outer surface.
     from mtg_bot.training.action_encoding import (
-        ACTION_VOCAB_SIZE, EncodingOverflowError, encode, legal_action_mask,
+        EncodingOverflowError, action_vocab_size, encode,
+        is_resolution_decision, legal_action_mask,
     )
+    vocab_size = action_vocab_size(action_encoding_version)
+    if stats is None:
+        stats = new_resolution_stats(action_encoding_version)
     if structured_tokens:
         # Local import — state_tokenizer pulls in the entire model
         # constant surface and ndarray construction helpers; only worth
@@ -1412,8 +1534,8 @@ def _play_one_game_recording(
     # ``mtg_bot.search.action_history``) and the NN evaluator reads
     # the same attribute at search time, so training rows and
     # inference tokenize from one source of truth by construction.
-    zero_policy = np.zeros(ACTION_VOCAB_SIZE, dtype=_DTYPE_POLICY)
-    zero_mask = np.zeros(ACTION_VOCAB_SIZE, dtype=np.bool_)
+    zero_policy = np.zeros(vocab_size, dtype=_DTYPE_POLICY)
+    zero_mask = np.zeros(vocab_size, dtype=np.bool_)
     # Skip the per-decision adapter clone for observe_action wiring
     # when no strategy implements it (the common case for PIMC /
     # heuristic / random self-play). Cloning is ~milliseconds per
@@ -1539,9 +1661,14 @@ def _play_one_game_recording(
                 # "policy" would be the active player's
                 # distribution viewed from the wrong seat).
                 engine = adapter.engine_state
+                at_pause = bool(
+                    getattr(adapter, "is_resolution_paused", False)
+                )
+                if at_pause and visits:
+                    stats["resolution_pause_samples"] += 1
                 if visits:
                     active_policy = np.zeros(
-                        ACTION_VOCAB_SIZE, dtype=_DTYPE_POLICY,
+                        vocab_size, dtype=_DTYPE_POLICY,
                     )
                     # Filter visits down to root-state legal decisions
                     # before encoding. PIMC aggregates visits across K
@@ -1567,14 +1694,23 @@ def _play_one_game_recording(
                         if d not in legal_now:
                             continue
                         try:
+                            # Encode against the adapter: a
+                            # resolution answer's slot lives on the
+                            # paused adapter (fixed at pause time).
                             slot = encode(
-                                d, engine, active,
+                                d, adapter, active,
                                 version=action_encoding_version,
                             )
                         except EncodingOverflowError:
+                            if is_resolution_decision(d):
+                                stats["resolution_overflow_visits"] += (
+                                    int(count)
+                                )
                             continue
                         active_policy[slot] += count
                         counted += count
+                    if counted > 0 and at_pause:
+                        stats["resolution_policy_rows"] += 1
                     if counted > 0:
                         active_policy /= counted
                         # Pass the adapter (not the raw engine) so
@@ -1717,6 +1853,20 @@ def _play_one_game_recording(
             except Exception:  # noqa: BLE001
                 # Diagnostic capture must never break the game loop.
                 pass
+    if (
+        stats["resolution_pause_samples"] > 0
+        and stats["resolution_policy_rows"] == 0
+    ):
+        raise ResolutionSupervisionError(
+            f"{stats['resolution_pause_samples']} sampled resolution "
+            f"pause(s) produced 0 encodable resolution policy rows under "
+            f"action encoding {action_encoding_version!r} "
+            f"({stats['resolution_overflow_visits']} visits overflowed). "
+            f"Resolution decisions are searched but this run cannot "
+            f"supervise them: encode with canonical_v3 (an extended / "
+            f"v3 checkpoint) or switch the search off "
+            f"(MTG_BOT_SEARCH_RESOLUTION_DECISIONS=0 / +autotarget)."
+        )
     winner = adapter.winner() if adapter.is_terminal() else None
     return winner, samples, struct_rows
 
@@ -1802,6 +1952,8 @@ def save_dataset(
     structured_attention_mask: Optional[np.ndarray] = None,
     game_ids: Optional[np.ndarray] = None,
     root_values: Optional[np.ndarray] = None,
+    resolution_stats: Optional[dict[str, Any]] = None,
+    action_encoding_version: Optional[str] = None,
 ) -> None:
     """Save ``(features, outcomes)`` plus optional policy
     supervision, structured-token, and game-id arrays to a single
@@ -1838,6 +1990,16 @@ def save_dataset(
       structured printing ids were tokenised under
       (``card_vocab.SHARD_KEY``; written whenever the structured
       arrays are).
+
+    - ``action_encoding_version`` (0-d str) + ``resolution_pause_samples``
+      / ``resolution_policy_rows`` / ``resolution_overflow_visits``
+      (0-d int64) -- written when ``resolution_stats`` is given
+      (``new_resolution_stats``), or derived from the masks when only
+      ``action_encoding_version`` is given (rows with a legal
+      resolution slot; pause / overflow counts unknown = -1). The
+      trainer reads the version to
+      tell a ``canonical_v3`` shard (805-wide policy) from a legacy
+      unstamped one and checks the policy width against it.
 
     Compressed — datasets are small even with policy supervision
     (zeros + bool masks compress aggressively).
@@ -1917,6 +2079,23 @@ def save_dataset(
                 f"game_ids must be shape ({n},); got {game_ids.shape}"
             )
         arrays["game_ids"] = game_ids.astype(_DTYPE_GAME_IDS)
+    if not resolution_stats and action_encoding_version is not None:
+        resolution_stats = resolution_stats_from_masks(
+            action_encoding_version, action_masks,
+        )
+    if resolution_stats:
+        from mtg_bot.training.action_encoding import action_vocab_size
+        version = str(resolution_stats["action_encoding_version"])
+        width = action_vocab_size(version)
+        if "policy_targets" in arrays and (
+            arrays["policy_targets"].shape[1] != width
+        ):
+            raise ValueError(
+                f"policy_targets are {arrays['policy_targets'].shape[1]} "
+                f"wide but the stamped action encoding {version!r} has "
+                f"{width} slots"
+            )
+        arrays.update(resolution_stats_arrays(resolution_stats))
     np.savez_compressed(path, **arrays)
 
 

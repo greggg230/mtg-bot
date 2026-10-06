@@ -1,7 +1,8 @@
 """Session-scoped card-source swap driven by ``MTG_BOT_CARD_SOURCE``,
 plus a session-scoped flip of all training-time priority short-circuit
 heuristic defaults to ``False`` so legacy tests written before the
-heuristics existed pass without modification.
+heuristics existed pass without modification, and of the searched-
+resolution-decisions switch to OFF (tests of the new default opt in).
 
 Default (env var unset) uses the production ``OracleParserCardSource``,
 so ``pytest`` runs unchanged. The env-var hook is preserved as a seam
@@ -145,6 +146,34 @@ def _shutdown_leaked_serve_apps():
         finally:
             for app in created:
                 _serve.shutdown_app(app)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _resolution_search_off_by_default_for_tests():
+    """Production searches resolution decisions by default
+    (``HeuristicsConfig.search_resolution_decisions``, default from
+    ``$MTG_BOT_SEARCH_RESOLUTION_DECISIONS``; see
+    ``docs/RESOLUTION_DECISIONS.md``). Same precedent as the heuristic
+    flip below: legacy tests -- seeded outcome pins, positional_v1
+    data-gen fixtures whose policy head has no resolution slots --
+    run with the switch OFF for the session, and the tests that cover
+    the new default turn it on explicitly
+    (``monkeypatch.setenv(..., "1")`` or
+    ``HeuristicsConfig(search_resolution_decisions=True)``). Set in
+    ``os.environ`` so spawned pool workers inherit it."""
+    from mtg_bot.search.heuristics_config import (
+        SEARCH_RESOLUTION_DECISIONS_ENV,
+    )
+
+    previous = os.environ.get(SEARCH_RESOLUTION_DECISIONS_ENV)
+    os.environ[SEARCH_RESOLUTION_DECISIONS_ENV] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(SEARCH_RESOLUTION_DECISIONS_ENV, None)
+        else:
+            os.environ[SEARCH_RESOLUTION_DECISIONS_ENV] = previous
 
 
 @pytest.fixture(scope="session", autouse=True)
