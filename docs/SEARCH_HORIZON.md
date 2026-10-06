@@ -111,9 +111,10 @@ decision) is summarised.
 ## Findings
 
 20 games per arm, `v30+b1` (standard) vs `v30+b1+boardonly`, both vs
-`heuristic`, nodes 200 / samples 2, git `0415d24d`. The 40 games are
-bit-reproducible (a rerun after a census-only fix replayed all 40
-identically). Numbers are standard / board-only.
+`heuristic`, nodes 200 / samples 2, git `18848b7c` (16 workers, 317 s
+for all 40 games). The 40 games are bit-reproducible: three runs on
+different commits (census / label fixes only) replayed all 40
+identically. Numbers are standard / board-only.
 
 **Budget and depth.**
 
@@ -127,7 +128,7 @@ identically). Numbers are standard / board-only.
 | deepest path, plies (mean) | 29.0 | 35.1 |
 | deepest path, real choices (mean / median) | 6.1 / 6 | 6.2 / 6 |
 | most-visited path: plies / real choices | 27.2 / 5.7 | 33.2 / 5.8 |
-| search wall per unforced decision (6 concurrent games + a 20-worker ladder) | 2.70 s | 2.64 s |
+| search wall per unforced decision (16 interleaved games) | 2.06 s | 2.02 s |
 
 - `--nodes 200 --samples 2` means **two trees of ~190 nodes**, not two
   of 100: `Budget(max_nodes=inner_nodes)` is per determinization.
@@ -214,6 +215,42 @@ arms: board, PIMC-aggregated root (`choose_with_subtree`, depth 3,
 top 3) and both determinized worlds' trees (5 levels, top 3, forced
 chains folded, Q from the actor's view).
 
+A ninth dump, `v30_b1_boardonly__removal_target_gravkill__g7.txt`
+(produced by replaying game 7 with a dump trigger on the Gravkill
+decision), shows the search choosing `Cast Gravkill -> Faller's
+Faithful(own)` at N=315 / Q=+0.78: the opponent is at 1 life and every
+explored line after the cast wins in combat, so the self-exile costs
+nothing here -- the census flags it correctly by definition, but this
+instance is harmless.
+
 ## A/B
 
-(filled in from `ladder_runs/s2_v30_boardonly_n200`)
+`mtg_bot ladder` from this branch, `heuristic` vs each arm, nodes 200,
+samples 2, 300 seat-alternated games, seed 0 (the same deals as the
+`ladder_runs/s2_v30_diag_n200` baseline pairing), per-game timeout
+1200 s, 20 workers, `--registry-root <main>/trained_weights_s2`, deck
+pool `data/17lands/eoe_decks.json.gz`. Output:
+`ladder_runs/s2_v30_boardonly_n200`.
+
+| arm | v30 wins / decided | win rate [Wilson 95 %] | minus baseline [Newcombe 95 %] | timeouts | wall |
+|---|---|---|---|---|---|
+| `v30+b1` (baseline, sampled, 2 worlds x 200 nodes) | 158 / 298 | 53.0 % [47.4, 58.6] | -- | 2 | 3879 s |
+| `v30+b1+boardonly` (2 worlds x 200 nodes) | 156 / 298 | 52.3 % [46.7, 58.0] | -0.7 pts [-8.6, +7.3] | 2 | 2986 s |
+| `v30+b1+boardonly+s1` (1 world x 400 nodes) | 164 / 297 | 55.2 % [49.5, 60.8] | +2.2 pts [-5.8, +10.1] | 3 | 2842 s |
+
+The difference CIs are unpaired (the ladder records counts, not
+per-game outcomes) and therefore conservative; the deals are identical
+and the same long games (179, 295) time out in every arm.
+
+**Reading.** Not imagining the opponent's hand is strength-neutral at
+this budget (-0.7 pts, well inside noise), and collapsing to one world
+with all 400 nodes is +2.2 pts -- also inside noise; 300 games cannot
+resolve effects below ~8 points. What the A/B does rule out is a large
+cost: planning against the public board only, with the opponent unable
+to ever cast anything in the tree, does not lose measurably to a
+searcher that spends a third of its tree under imagined opposing
+casts. Equivalently: at nodes 200 the sampled opponent hand buys
+nothing measurable. The wall-clock column is confounded (the baseline
+pair shared the machine with test runs part of the time); the clean
+compute comparison is the interleaved horizon run: 2.06 s vs 2.02 s per
+unforced decision (-2 %).
