@@ -251,6 +251,12 @@ def preferred_mp_context() -> "mp.context.BaseContext":
     return mp.get_context("spawn")
 
 
+def _structured_v1v2_vocab() -> int:
+    from mtg_bot.training.action_encoding import ACTION_VOCAB_SIZE
+
+    return int(ACTION_VOCAB_SIZE)
+
+
 @dataclasses.dataclass
 class SharedTensorServerHandle:
     """Lightweight handle a worker uses to attach to the server.
@@ -569,6 +575,22 @@ class SharedTensorNNEvalServer:
         effective_hidden = (
             tuple(hidden_sizes) if hidden_sizes is not None else HIDDEN_SIZES
         )
+        if (
+            structured_action_vocab_size is not None
+            and int(structured_action_vocab_size) != _structured_v1v2_vocab()
+        ):
+            # The shared policy / mask slots are allocated at the
+            # positional_v1 / canonical_v2 width (517). A canonical_v3
+            # (resolution-slot) checkpoint is not supported here --
+            # refuse instead of mis-sizing the shared tensors. This
+            # server is not on any production path
+            # (docs/BENCHMARKING_FINDINGS.md §5).
+            raise NotImplementedError(
+                f"SharedTensorNNEvalServer supports {_structured_v1v2_vocab()}"
+                f"-slot policy heads only; got structured_action_vocab_size="
+                f"{structured_action_vocab_size} (canonical_v3). Use the "
+                f"per-process NNEvaluator path."
+            )
         if model_factory is not None:
             self._model = model_factory()
         elif self._is_structured:

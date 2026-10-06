@@ -845,3 +845,34 @@ PYTHONPATH=src python scripts/bench_block_shuffle_io.py \
     --rows 262144 --batch-size 256 --block-rows 65536 --workers 2
 # add --cold for purged-cache epochs (win32 only)
 ```
+
+
+## 8D. Searched resolution decisions -- self-play throughput (2026-10-06)
+
+`feature/s2-resolution-decisions` (`docs/RESOLUTION_DECISIONS.md`). The
+production self-play configuration on the desktop (i9-13900K, CPU,
+torch 1 thread per process): NN-PIMC nodes 200 / samples 2 / leaf
+batch 1, root Dirichlet 0.5 / 0.25, move temperature 1.0 for 30
+decisions, structured tokens, every decision a sample point; 40 games
+(same seeds + decks, `base_seed` 4242) on a 20-process pool, nothing
+else running. Harness: the scratch script that calls
+`data_gen._generate_one_game_data` per game (same body as the worker
+production runner).
+
+| | before (v30, canonical_v2, auto-targeting) | after (v30r = v30 + resolution slots, searched) |
+|---|---|---|
+| completed / timed out (1200 s) | 40 / 0 | 39 / 1 |
+| mean per-game wall | 359 s | 399 s (+11 %) |
+| median / max per-game wall | 331 / 828 s | 355 / 901 s |
+| steady-state games per hour (20 x 3600 / mean wall) | 200 | 180 (-10 %) |
+| training rows per game (both viewers) | 1178 | 1169 |
+| resolution-decision policy rows per game | 0 | 16.5 |
+
+Where the extra time goes: every exposed `apply` snapshots the engine
+state (one clone) before the action, each resolution answer replays
+the action from that snapshot, the trees branch on both players'
+resolution choices, and a pause root in PIMC replays once per world to
+validate it (`determinize.determinized_clone`). The one timeout (game
+8) is a 37-turn game under the new behaviour (938 s run alone; the
+auto-targeting version of that deal ends on turn 20) -- not a hang.
+Production's per-game timeout is 4.5 x nodes x samples = 1800 s.

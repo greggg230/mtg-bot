@@ -137,3 +137,15 @@ def test_pimc_answers_a_pause_with_a_legal_resolution_decision():
         paused, 0,
     )
     assert choice in set(paused.legal_decisions())
+
+
+def test_shm_eval_server_refuses_a_canonical_v3_head():
+    from mtg_bot.search.nn_evaluator import ARCHITECTURE_STRUCTURED
+    from mtg_bot.search.shm_nn_eval_server import SharedTensorNNEvalServer
+
+    with pytest.raises(NotImplementedError, match="canonical_v3"):
+        SharedTensorNNEvalServer(
+            weights_path=None, device="cpu",
+            architecture=ARCHITECTURE_STRUCTURED, n_slots=1,
+            structured_action_vocab_size=805,
+        )

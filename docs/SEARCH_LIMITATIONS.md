@@ -288,7 +288,7 @@ the heuristic PIMC and NN-PIMC, in data-gen / self-play, the worker
 production runner, eval / arena, ladder and capture, and the policy
 head has slots for them (action encoding `canonical_v3`, 805 slots =
 `canonical_v2`'s 517 + a 288-slot resolution block). What remains are
-the narrower shortcuts (a)-(j) below.
+the narrower shortcuts (a)-(k) below.
 
 **Location**: harness `src/mtg_bot/search/engine_adapter.py`
 (`_run_with_resolution_capture`, `_rollback_to_snapshot`,
@@ -400,6 +400,13 @@ Measured throughput: see `docs/RESOLUTION_DECISIONS.md` §12 and
 priors; every option is expanded and valued; legal order breaks ties).
 Freshly extended NN checkpoints start near-uniform on the resolution
 slots (N(0, 0.02) queries) until a resolution-aware training cycle.
+
+**(k) The SHM / NN eval servers stay 517-wide.**
+`SharedTensorNNEvalServer` refuses a `canonical_v3` head
+(`NotImplementedError`); `NNEvalClient` / `NNServerPimcConfig` seats
+are tagged as unable to prior resolution pauses, so a searched PUCT
+seat on them is refused at game construction. Neither is on a
+production path (`docs/BENCHMARKING_FINDINGS.md` §5).
 
 **Training data**: shards written before the flip have no resolution
 supervision (their games auto-targeted). In a `canonical_v3` window
