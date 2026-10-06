@@ -336,6 +336,30 @@ evolve without breaking trained weights.
   assignment. Two canonically-equivalent states share their slot
   mappings, making the slot_fingerprint workaround a no-op.
 
+- `"canonical_v3"` (2026-10-06, `feature/s2-resolution-decisions`):
+  `canonical_v2`'s 517 slots unchanged + a 288-slot resolution block
+  (targets by zone/side, discard, mode(s), sacrifice, X, surveil,
+  shock life, yes/no, tutor / opponent-hand picks, devour) = 805.
+  `action_encoding.action_vocab_size(version)` is the width. Each
+  option's slot is fixed at pause time by the resolution channel agent
+  (`mtg_bot.search.resolution_slots`). Full design:
+  [`docs/RESOLUTION_DECISIONS.md`](docs/RESOLUTION_DECISIONS.md).
+  A v2 checkpoint becomes v3 WITHOUT retraining via `mtg_bot
+  extend-resolution-slots` (bit-identical outside resolution pauses).
+
+**Resolution decisions are searched in production** (since
+2026-10-06): `HeuristicsConfig.search_resolution_decisions` (default
+ON; `MTG_BOT_SEARCH_RESOLUTION_DECISIONS=0` restores the old
+all-`DefaultTacticalAgent` behaviour; the test session runs with it
+OFF via `tests/conftest.py`, new-default tests opt in). Per-agent
+opt-out: `PimcConfig` / `NNPimcConfig` `search_resolution_decisions`
+(ladder `+autotarget`). A searched PUCT seat needs a v3 policy head --
+v1/v2 are refused, never run on all-zero priors. Training a v3 model on
+a window that still holds legacy 517-wide shards needs
+`--legacy-policy-encoding canonical_v2` (or
+`MTG_BOT_LEGACY_POLICY_ENCODING=canonical_v2`): they are zero-padded
+explicitly, with counts in `training.policy_report`.
+
 **Metadata flag:**
 
 Each registered model's `metadata.json` carries

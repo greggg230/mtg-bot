@@ -119,9 +119,25 @@ engine callback asked = `adapter.active_player()` at the pause).
 288 resolution slots; **vocab 517 -> 805**. (`RES_SACRIFICE_CARD`
 exists because the engine reuses `choose_sacrifice` as a generic
 "pick an id" hook: Close Encounter designates a warped creature card in
-exile, Anticausal Vestige puts a card from hand onto the battlefield.) Caps reuse the v2 constants
-where a v2 family exists (hand 16, graveyard / exile / own battlefield
-24) and are pinned by `test_vocab_size_constant_is_fixed`.
+exile, Anticausal Vestige puts a card from hand onto the battlefield.)
+Caps reuse the v2 constants where a v2 family exists (hand 16,
+graveyard / exile / own battlefield 24); the layout is pinned by
+`tests/search/test_resolution_slots.py` (families tile the block, size
+288) and `tests/training/test_action_encoding_v3.py`.
+
+**Slots are fixed at pause time, from the live state.** The channel
+agent computes every option's slot when it raises the pause
+(`resolution_slots.compute_offsets(kind, live_state, decider,
+options)`) and the adapter stores them next to the options
+(`adapter.resolution_slot_offsets`). `encode` / `decode` /
+`legal_action_mask` only read them. Reason: the adapter then rolls back
+to the pre-action snapshot, in which the objects a choice refers to may
+not be where they were -- an ETB trigger's own creature is not on the
+snapshot's battlefield yet, a card drawn earlier in the same resolution
+is still in the snapshot's library. Card choices (discard, opponent
+hand, library, non-battlefield sacrifice picks) therefore rank among the
+pause's own (deduplicated) options by canonical key instead of indexing
+a zone.
 
 Why the canonical battlefield order (and not v2's raw battlefield order,
 which `ACTIVATE_ABILITY` / `TURN_FACE_UP` keep for compatibility): the
@@ -231,10 +247,21 @@ logits for an extended checkpoint.
   `action_encoding_version` unless metadata records
   `structured_action_vocab_size` explicitly; a mismatch with the
   state dict is a loud `load_state_dict` error.
-* A v1 / v2 structured checkpoint cannot prior a resolution pause.
-  `NNPimcConfig.build` refuses to build it as a searched-resolution seat
-  (`ValueError` naming the two fixes: extend it, or `+autotarget`) --
-  never a silent flat prior.
+* A v1 / v2 policy head cannot prior a resolution pause. Every built
+  strategy is tagged (`search_resolution_decisions`,
+  `can_prior_resolution_decisions`); the game constructor
+  (`engine_adapter_factory.resolution_seats_for`) refuses a searched
+  PUCT seat without resolution slots (`ResolutionPriorUnavailableError`,
+  naming the two fixes: extend it, or `+autotarget`) and `mtg_bot
+  ladder` refuses the label up front -- never a silent all-zero prior.
+  UCB1 seats (heuristic, `+valueonly`) need no priors.
+* `iterate` runs a cycle under the bootstrap's encoding, except that a
+  `current_best` which is the `canonical_v3` extension of a
+  `canonical_v2` lineage carries the lineage into `canonical_v3`
+  (`iterate.resolve_lineage_action_encoding`; any other mismatch exits).
+  `mtg_bot extend-resolution-slots --register --set-current-best`
+  registers the extension as the next version and points
+  `iterate_state.json` at it.
 * Shards: new npzs record `action_encoding_version` and
   `resolution_policy_rows` / `resolution_overflow_visits`. Legacy
   (unstamped, 517-wide) shards are zero-padded into a v3 training
@@ -270,6 +297,10 @@ pin; ISMCTS's `_fresh_determinization` gets the same treatment.
   resolution rows are trained.
 * The opponent's resolution choices inside the tree are searched too
   (min/max) instead of being modelled as first-legal.
+* Self-play move temperature counts a resolution pause with more than
+  one option as a non-forced decision, so the first-30-decisions
+  temperature window now also samples early target / mode choices
+  (and covers correspondingly fewer priority decisions).
 
 ## 11. Keeping the trained network
 

@@ -278,44 +278,138 @@ at current model strength + EoE-only pool. See
 
 ---
 
-## 5. Resolution decisions are NOT exposed in production training (vocab gap)
+## 5. Resolution decisions: SEARCHED in production since 2026-10-06 (remaining shortcuts listed here)
 
-**Location**: `src/mtg_bot/training/data_gen.py:503` and `src/mtg_bot/training/self_play.py:438` construct `MtgGameStateAdapter(engine, expose_combat_decisions=True)` with the implicit `expose_resolution_decisions=False` default. Production data-gen and self-play therefore route every mid-resolution callback (target picks, sacrifice choice, X-cost, modes, "may" yes/no, surveil keep/mill, directed discard, devour land subset, etc.) through `DefaultTacticalAgent` (`src/mtg_bot/search/tactical.py`).
+**Status**: the vocab gap this entry used to describe is CLOSED by
+`feature/s2-resolution-decisions` (design + measurements:
+[`docs/RESOLUTION_DECISIONS.md`](RESOLUTION_DECISIONS.md)). Every
+mid-resolution choice of the kinds below is a search decision for both
+the heuristic PIMC and NN-PIMC, in data-gen / self-play, the worker
+production runner, eval / arena, ladder and capture, and the policy
+head has slots for them (action encoding `canonical_v3`, 805 slots =
+`canonical_v2`'s 517 + a 288-slot resolution block). What remains are
+the narrower shortcuts (a)-(j) below.
 
-**What we do today**: at any mid-resolution decision point, the engine asks the controlling player's installed agent — which the adapter has rewritten to `DefaultTacticalAgent`. Defaults: `choose_target → first legal`, `choose_sacrifice → first legal`, `choose_x → upper_bound` (commit-everything), `choose_mode → 0`, `choose_modes → [0]`, `choose_yes_no → True` (opts into ALL "may" effects), `choose_surveil → False` (always keep), `choose_discard → first legal`, `choose_devour_lands → []`. None of these go through search; none of them get policy supervision.
+**Location**: harness `src/mtg_bot/search/engine_adapter.py`
+(`_run_with_resolution_capture`, `_rollback_to_snapshot`,
+`_bookkeeping_snapshot`, per-seat `_install_agents`); callbacks
+`src/mtg_bot/search/resolution_channel.py`; slot layout + per-option
+slots `src/mtg_bot/search/resolution_slots.py`; codec
+`src/mtg_bot/training/action_encoding.py` (`canonical_v3`,
+`_encode_resolution`); production switch
+`src/mtg_bot/search/heuristics_config.py`
+(`HeuristicsConfig.search_resolution_decisions`, default ON,
+`$MTG_BOT_SEARCH_RESOLUTION_DECISIONS=0` restores the old behaviour) +
+`src/mtg_bot/search/engine_adapter_factory.py::resolution_seats_for`
+(per seat; `PimcConfig` / `NNPimcConfig.search_resolution_decisions`,
+ladder `+autotarget`).
 
-**Why we can't just flip the flag**: the adapter and search infrastructure for `expose_resolution_decisions=True` are fully implemented (`ResolutionChannelAgent`, the pause / rollback / replay harness, the `Resolution*Decision` types, search-side handling in PIMC and ISMCTS). The dedicated tests in `tests/search/test_resolution_integration.py`, `tests/search/test_pimc.py`, `tests/search/test_info_set.py`, and `tests/search/test_engine_adapter_legal_cache.py` exercise the path with the flag on. **What's missing is the policy-head vocab.** `src/mtg_bot/training/action_encoding.py` has zero slots for any `Resolution*Decision` subclass; `ACTION_VOCAB_SIZE = 517` covers PassPriority, PlayLand, CastSpell, UnlockRoomHalf, ActivateAbility, ActivateStation, TurnFaceUp, AttackerDecision, BlockerDecision and nothing else. `encode(d, state, viewer)` raises `EncodingOverflowError` for every Resolution*Decision; `legal_action_mask` silently drops them.
+**Searched kinds**: `choose_target` (incl. "up to one" declines),
+`choose_discard`, `choose_mode`, `choose_modes` ("choose one or both",
+every non-empty subset), `choose_sacrifice` (also the engine's generic
+"pick an id" uses), `choose_x`, `choose_surveil`,
+`choose_pay_shock_life`, `choose_card_from_library`,
+`choose_card_from_opponent_hand`, `choose_devour_lands`,
+`choose_yes_no`.
 
-**Failure mode if the flag were flipped without extending the vocab**:
-- `data_gen.py` line ~757 inside `_play_one_game_recording`: `slot = encode(d, engine, active)` raises for every resolution-pause visit; the `except EncodingOverflowError: continue` then silently drops them. At a resolution-pause sample point `counted` ends up at zero and the row falls through to `active_policy = zero_policy / zero_mask`. **Every resolution-pause sample is silent no-op policy supervision** — the row trains nothing. This is exactly the "silent no-op pipelines are pipeline bugs" anti-pattern in `feedback_silent_noop_pipelines.md`.
-- `legal_action_mask` at a resolution-pause moment returns all-False (every Resolution*Decision is `EncodingOverflowError`-skipped). NN evaluator's `evaluate_with_policy` defensively returns `np.zeros(vocab_size)` when `mask_np.any() == False` — so the NN delivers ZERO prior at every resolution-pause leaf. PIMC / ISMCTS PUCT then has flat priors over Resolution children; tree search still backs Q-values up, but the network contributes nothing.
-- `decode(slot_idx, state, viewer)` cannot return any Resolution*Decision because no slot maps to one. If a search loop ever picked a slot from the policy distribution at a resolution-pause moment (e.g., via fallback or a bug), it would deserialize back to a priority action; the adapter's `_apply_resolution_decision` does `isinstance(decision, expected_type)` and would `TypeError` immediately.
+**What the old harness got wrong (fixed with the flip)**: rollback did
+not restore the adapter's bookkeeping (`_pass_count`) -- a pause in the
+stack-resolving `PassPriority` replayed as "pass priority" forever
+(198/200 random EoE games hit the decision cap); callbacks fired from
+factored combat decisions / the constructor escaped the harness (2/200
+crashed); the channel agent fell back to `Agent` base defaults
+(`choose_card_from_hand` raised); PIMC / ISMCTS rolled resolution
+answers back to the true (un-determinized) snapshot; the canonical /
+info-set keys ignored the replay queue. Pinned by
+`tests/search/test_resolution_harness.py`.
 
-**Strength cost of leaving the flag off (today)**: the NN never gets supervision on target picks / X-values / mode choices / surveil keep-vs-mill / "may" triggers / directed discards / sacrifice picks. These are the highest-leverage tactical choices in MTG and they are all locked at `DefaultTacticalAgent`'s deterministic first-legal / commit-everything / always-yes defaults. The bot picks the wrong target, sacrifices the wrong creature, opts into bad mandatory triggers via `choose_yes_no = True`, and always X=max even when smaller X is correct. Estimated strength cost: substantial — meaningfully larger than any single combat-side limitation in this doc.
+### Remaining shortcuts
 
-**Fix scope when prioritized**:
-- Extend `action_encoding.py` to add slot ranges for each `Resolution*Decision` subclass:
-  - `RESOLUTION_TARGET[target_kind][target_pos_within_kind]` — needs a stable kind enumeration (battlefield-permanent / hand-card / graveyard-card / player-id / decline) and a per-kind position cap. Battlefield-permanent positions are tricky because they reference both controllers' permanents (can't share `bf_own_pos`).
-  - `RESOLUTION_DISCARD[hand_pos]` and `RESOLUTION_SACRIFICE[bf_own_pos]` — both reuse existing positional axes.
-  - `RESOLUTION_X[x_value in 0..X_VALUE_CAP]` — needs an X cap (observed: 0-7 in current pool; 16 is generous).
-  - `RESOLUTION_MODE[mode_index in 0..MODE_INDEX_CAP]` — modal "choose one" for 1-of-N; cap at 4 (longest current modal is 3 modes).
-  - `RESOLUTION_SURVEIL[mill in {True, False}]` — 2 slots.
-  - `RESOLUTION_SHOCK_LIFE[pay in {True, False}]` — 2 slots.
-  - `RESOLUTION_YES_NO[yes in {True, False}]` — 2 slots.
-  - `RESOLUTION_CARD_FROM_LIBRARY[lib_pos]` — needs a library-position cap; tutors typically search the whole library, so the cap is the deck size (60 in standard, can blow out the vocab if naively encoded). Alternative: encode by printing-id within the deck pool's vocabulary. Bigger design call.
-  - `RESOLUTION_CARD_FROM_OPPONENT_HAND[opp_hand_pos]` — uses opponent hand position; valid because the caster has revealed the hand at this point.
-  - `RESOLUTION_DEVOUR_LANDS[subset_size]` — already V1-collapsed to (empty, full); 2 slots.
-- Update `encode` / `decode` / `legal_action_mask` / `_enumerate_legal` to handle the resolution-pause adapter phase (analogous to the existing combat phases — `_combat_phase` already returns kind tags from the adapter; add resolution-kind tags too).
-- Update `replay_decisions.py` (which already covers resolution decisions for serialization, no change there).
-- The NN architecture: extending `ACTION_VOCAB_SIZE` reshapes the policy head's output `Linear(h_last, ACTION_VOCAB_SIZE)`. **Existing trained weights become unusable** — the policy head will need to be re-initialized for the new slot count and trained from scratch. Value head and feature encoder are unchanged.
-- Tests pinning: `test_vocab_size_constant_is_fixed` updates to the new `ACTION_VOCAB_SIZE`. New tests for `encode` / `decode` round-trip at each resolution-pause kind. `legal_action_mask` produces non-empty masks at resolution-pause moments. End-to-end test that `_play_one_game_recording` with `expose_resolution_decisions=True` writes non-zero policy-supervision rows for resolution-decision sample points.
-- After all of the above lands, flip the flag in `data_gen.py:503` and `self_play.py:438`.
+**(a) Cost-payment / SBA callbacks stay on `DefaultTacticalAgent`.**
+`choose_permanent_to_tap` (Gene-Pollinator-style "tap an untapped
+permanent you control" costs; ~0.6 calls per random-play game, first
+legal), `choose_convoke_creatures` (convoke everything needed),
+`choose_sac_for_mana`, `choose_mana_color`, `choose_legend_keep`,
+`choose_replacement_order`, mulligan / bottom (heuristic). Also
+`choose_card_from_hand` (Terminal Velocity -- no EoE card in the pool
+calls it). Why OK: cost payments are rarely the decisive choice and
+each would need its own vocab family. Failure mode: tapping the wrong
+permanent for a cost (e.g. a would-be attacker). Fix scope: one
+channel-agent override + one slot family each (the harness generalises).
+Impact: small.
 
-**Bootstrap concern after the flag flip**: the trained NN policy head will be re-initialized (new vocab size). Iter-1 onward will have to learn target-picking / X-choice / mode-choice from scratch, on top of learning everything else. For the first few iters, search at resolution-pause moments will be effectively flat-prior PUCT — strictly weaker than `DefaultTacticalAgent`'s first-legal heuristic in those few iters. Long-term gain is large; short-term may regress one or two iterations.
+**(b) Devour stays "none / all"** (V1 collapse in the channel agent).
+Fix: expose counts. Impact: tiny (devour is rare in EoE).
 
-**Impact estimate**: large (10s of percentage points strength once trained). The cost of leaving it off scales with how often resolution decisions arise — every burn spell, every modal spell, every X-cost cast, every "may" trigger, every Mind-Rot-style discard. Already significant in the current EoE pool; will only grow as more cards come online.
+**(c) "Choose one or more" with > 6 modes** offers singletons + all
+modes only (`resolution_channel.mode_subsets`); every EoE "or both"
+card has 2 modes. Slot family covers subsets of modes 0-3.
 
-**Why this is doc'd here instead of a code fix**: the fix is a substantial vocab extension + NN-retrain that warrants its own dedicated PR. This entry exists so the gap is tracked rather than rediscovered. See `feature/expose-resolution-decisions` history (closed without code changes; documentation-only update of this entry) for the audit that produced this writeup.
+**(d) The NN sees the pre-action snapshot at a pause.** The replay
+harness rolls back, so the state tokens are those before the priority
+action that paused; the action that paused (e.g. `CastSpell X`) and
+the answers already given are the last history tokens, and the legal
+mask names the choice kind. The pending callback's own context (which
+trigger / effect is asking -- e.g. an upkeep trigger after a step
+transition) is only implicit. Fix scope: a "pause context" token type
+(model input change -> new version). Impact: weaker NN priors / values
+at pauses; search decides.
+
+**(e) Positional slot queries cannot identify objects.** Like every
+positional family since Step 1, a target slot ("opponent's battlefield
+position 3" in the canonical battlefield order) has a learned query but
+no ordinal link to the object's token, so the head can learn kind /
+side priors ("target an opponent's permanent", "decline") but not
+"target THAT creature". Tutor picks rank among distinct option keys
+(see the design note for why per-printing slots were rejected). Fix:
+pointer-style policy logits from object tokens (new encoding version).
+
+**(f) Overflow options are prior-0 search children.** A target past a
+cap (battlefield position >= 24, stack position >= 8, ...) or outside
+the vocabulary (a card in hand / library as a target), X > 20, mode >=
+8: the option stays legal for search with prior 0 and no policy
+target; counted per kind (`resolution_slots.overflow_counts()`,
+`resolution_overflow_visits` per shard), WARNING once per kind and
+process. Random-play census (1000 EoE games, 20,776 pauses): 42
+overflow options (0.2 %), no codec collisions. A game whose sampled
+pauses produce zero encodable resolution rows raises
+`ResolutionSupervisionError` (never a silent no-op shard).
+
+**(g) Interchangeable card options are deduplicated.** Discard /
+tutor / opponent-hand options with the same canonical zone key (name +
+modifier flags) are offered once (first id). Same equivalence the
+legal-action hand dedup and `canonical_state` rely on; not a CR
+divergence, listed because the option set differs from the engine's raw
+list.
+
+**(h) Hidden information revealed mid-resolution is only partly
+pinned.** Determinizations pin the cards a pause itself revealed to the
+decider (tutor matches, an opponent's hand for a Thoughtseize-style
+pick, the surveilled top card). A "may" (`choose_yes_no`) that follows
+a "look at the top card" inside the same effect does not record what was
+looked at, so that decision is searched over re-sampled worlds. Fix:
+record revealed ids in the effects that look. Impact: small.
+
+**(i) Search cost.** Every exposed `apply` takes a pre-action snapshot
+(an engine clone) and each resolution answer replays the action from
+it; the tree also branches on the OPPONENT's resolution choices.
+Measured throughput: see `docs/RESOLUTION_DECISIONS.md` §12 and
+`docs/BENCHMARKING_FINDINGS.md`.
+
+**(j) Heuristic PIMC searches pauses with a flat prior** (UCB1 has no
+priors; every option is expanded and valued; legal order breaks ties).
+Freshly extended NN checkpoints start near-uniform on the resolution
+slots (N(0, 0.02) queries) until a resolution-aware training cycle.
+
+**Training data**: shards written before the flip have no resolution
+supervision (their games auto-targeted). In a `canonical_v3` window
+they are zero-padded explicitly (`--legacy-policy-encoding
+canonical_v2`), with counts in `training.policy_report`; their policy
+targets on the 517 base slots are unchanged.
+
+**History**: the pre-2026-10-06 version of this entry (the vocab-gap
+analysis and fix scope) is in git history
+(`git show 5d3d871a:docs/SEARCH_LIMITATIONS.md`).
 
 ---
 
