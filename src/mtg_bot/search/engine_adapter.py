@@ -421,6 +421,32 @@ class MtgGameStateAdapter:
         if self._resolution_paused and self._pre_action_clone is not None:
             self._pre_action_clone = self._state.clone()
 
+    def replay_reaches_same_pause(self) -> bool:
+        """At a resolution pause: does re-running the pending action
+        from the pre-action snapshot, with the answers already queued,
+        stop at the same callback (kind, decider, options)? Always True
+        in the world the pause was observed in; a determinized world can
+        fail it when hidden cards the action touches were re-sampled.
+        Runs on a throwaway clone. True when not paused."""
+        if not self._resolution_paused:
+            return True
+        probe = self.clone()
+        expected = (
+            self._resolution_kind, self._resolution_player,
+            self._resolution_options,
+        )
+        probe._resolution_paused = False
+        probe._rollback_to_snapshot()
+        probe._channel_agent.rewind()
+        try:
+            probe._attempt_pending_action()
+        except Exception:  # noqa: BLE001 - any divergence = inconsistent
+            return False
+        return probe._resolution_paused and (
+            probe._resolution_kind, probe._resolution_player,
+            probe._resolution_options,
+        ) == expected
+
     def _bookkeeping_snapshot(self) -> tuple:
         """Every adapter-side field an action can mutate besides the
         engine state itself."""

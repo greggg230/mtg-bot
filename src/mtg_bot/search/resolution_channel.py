@@ -439,5 +439,36 @@ class ResolutionChannelAgent(Agent):
             slot_offsets=resolution_slots.compute_offsets(
                 kind, state, player_id, options,
             ),
-            revealed_ids=revealed_ids,
+            revealed_ids=self._known_at_pause(
+                state, player_id, kind, options, revealed_ids,
+            ),
         )
+
+    def _known_at_pause(
+        self, state: Any, player_id: int, kind: str, options: tuple,
+        revealed_ids: tuple,
+    ) -> tuple:
+        """Card ids the decider can identify at this callback that may
+        be HIDDEN in the pre-action snapshot the adapter rolls back to:
+        the callback's explicit reveals, every card option, the
+        decider's live hand (cards drawn earlier in this action are
+        still library cards in the snapshot -- Alpharael's "draw two,
+        then discard two unless you discard an artifact"), and the
+        cards earlier answers of this action named. PIMC / ISMCTS pin
+        them so a determinized world replays to the same pause
+        (``determinize.determinized_clone``)."""
+        ids: list = list(revealed_ids)
+        if kind in (
+            KIND_DISCARD, KIND_CARD_FROM_LIBRARY,
+            KIND_CARD_FROM_OPPONENT_HAND, KIND_SACRIFICE,
+        ):
+            ids.extend(o for o in options if isinstance(o, int))
+        try:
+            ids.extend(c.id for c in state.player_by_id(player_id).hand)
+        except (AttributeError, KeyError, StopIteration):
+            pass
+        for answer in self._queue:
+            cid = getattr(answer, "card_id", None)
+            if isinstance(cid, int):
+                ids.append(cid)
+        return tuple(dict.fromkeys(ids))

@@ -44,7 +44,7 @@ from typing import Any, Callable, Optional, Protocol
 
 from mtg_bot.cancellation import raise_if_cancelled
 from mtg_bot.search.determinize import (
-    determinize as _default_determinize, determinize_adapter_in_place,
+    determinize as _default_determinize, determinized_clone,
 )
 from mtg_bot.search.engine_adapter import MtgGameStateAdapter
 from mtg_bot.search.protocol import Decision, GameState, PlayerID
@@ -390,14 +390,13 @@ class PIMC(SearchStrategy):
         — re-cloning would be wasteful and the clone() already paid
         for one.
         """
-        sub = source.clone()
-        # At a resolution pause this also pins the cards the pending
-        # callback revealed and re-takes the pre-action snapshot from
-        # the determinized state (no rollback to the true state).
-        determinize_adapter_in_place(
-            sub, viewer_id, random.Random(sub_seed), self._determinize,
+        # At a resolution pause this also pins the cards the decider can
+        # see, re-takes the pre-action snapshot from the determinized
+        # state (no rollback to the true state) and checks the world
+        # replays to the same pause (``determinized_clone``).
+        return determinized_clone(
+            source, viewer_id, random.Random(sub_seed), self._determinize,
         )
-        return sub
 
 
 def _aggregate_subtree_candidates(

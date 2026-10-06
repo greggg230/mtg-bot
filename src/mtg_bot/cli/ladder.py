@@ -906,8 +906,13 @@ def build_parser() -> argparse.ArgumentParser:
             "(then defaults to the resumed run's agents). Search "
             "modifiers after '+': b<N> (leaf batch), nocal, valueonly / "
             "heurvalue, boardonly (don't imagine the opponent's hidden "
-            "cards), s<K> (K worlds sharing nodes x samples), e.g. "
-            "v30+b1+boardonly+s1."
+            "cards), s<K> (K worlds sharing nodes x samples), autotarget "
+            "(this seat's targets / modes / X / 'may' choices are "
+            "DefaultTacticalAgent's instead of searched -- the "
+            "pre-2026-10-06 behaviour; required for an NN version whose "
+            "encoding has no resolution slots, e.g. v30 -- extend it with "
+            "`mtg_bot extend-resolution-slots`), e.g. "
+            "v30+b1+boardonly+s1, heuristic+autotarget."
         ),
     )
     p.add_argument(

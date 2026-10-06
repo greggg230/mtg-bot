@@ -264,6 +264,27 @@ def register_extended(
         )
 
 
+ITERATE_STATE_FILENAME = "iterate_state.json"
+
+
+def set_current_best(registry_root: Path, version: str) -> Optional[str]:
+    """Point ``<registry_root>/iterate_state.json``'s ``current_best`` at
+    ``version`` (atomic tmp + replace; every other key untouched).
+    Returns the previous value (``None`` when the file didn't exist --
+    then nothing is written: there is no lineage to switch)."""
+    path = Path(registry_root) / ITERATE_STATE_FILENAME
+    if not path.is_file():
+        return None
+    state = json.loads(path.read_text(encoding="utf-8"))
+    previous = state.get("current_best")
+    state["current_best"] = version
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    import os
+    os.replace(tmp, path)
+    return previous
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mtg_bot extend-resolution-slots",
@@ -294,11 +315,21 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(default {DEFAULT_SEED})")
     p.add_argument("--overwrite", action="store_true",
                    help="allow a non-empty --out-dir")
+    p.add_argument(
+        "--set-current-best", action="store_true",
+        help="with --register: also point the registry's "
+             "iterate_state.json current_best at the new version (the "
+             "next iterate cycle then self-plays, trains and evals under "
+             "canonical_v3)",
+    )
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.set_current_best and not args.register:
+        parser.error("--set-current-best needs --register")
     if args.register:
         new_version = register_extended(
             args.registry_root, args.version, seed=args.seed,
@@ -307,6 +338,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"registered {new_version} = {args.version} + canonical_v3 "
             f"resolution slots in {args.registry_root}"
         )
+        if args.set_current_best:
+            previous = set_current_best(args.registry_root, new_version)
+            if previous is None:
+                print(
+                    f"no {ITERATE_STATE_FILENAME} in {args.registry_root}; "
+                    f"current_best not set"
+                )
+            else:
+                print(f"current_best: {previous} -> {new_version}")
         return 0
     meta = extend_checkpoint_dir(
         args.registry_root / args.version, args.out_dir,

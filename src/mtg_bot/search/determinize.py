@@ -156,6 +156,83 @@ def determinize(
     return target
 
 
+class _WorldStats:
+    """Process-wide counters for determinized worlds at a resolution
+    pause (``determinized_clone``)."""
+
+    resampled = 0
+    fallback_true_world = 0
+    warned = False
+
+
+def world_fallback_counts() -> dict[str, int]:
+    """``{"resampled": n, "fallback_true_world": n}`` since process
+    start (see ``determinized_clone``)."""
+    return {
+        "resampled": _WorldStats.resampled,
+        "fallback_true_world": _WorldStats.fallback_true_world,
+    }
+
+
+DEFAULT_WORLD_ATTEMPTS = 4
+"""Determinizations tried at a resolution pause before falling back to
+the undetermined clone (``determinized_clone``)."""
+
+
+def determinized_clone(
+    source, viewer_id: int, rng: random.Random,
+    determinize_fn: Callable = None,
+    *,
+    attempts: int = DEFAULT_WORLD_ATTEMPTS,
+):
+    """A determinized clone of a search adapter for ``viewer_id`` --
+    the PIMC / ISMCTS world builder.
+
+    Away from a resolution pause this is exactly one
+    ``clone`` + :func:`determinize_adapter_in_place`. AT a pause the
+    pause itself is an observation: the answers already given and the
+    pending callback must replay identically in the sampled world
+    (otherwise the root's options are meaningless there and the replay
+    of an answer can hit a different callback). Each candidate world is
+    checked with ``adapter.replay_reaches_same_pause()``; an
+    inconsistent one is re-sampled (fresh draws from ``rng``) up to
+    ``attempts`` times, then the UNDETERMINED clone is used for this
+    sub-search -- a counted, warned-once fallback
+    (``world_fallback_counts``) that leaks the hidden zones to that
+    one search rather than crashing the game. Pinning the cards the
+    decider can see (``ResolutionChannelAgent._known_at_pause``) makes
+    inconsistent worlds rare; they remain possible when an earlier
+    callback of the same action depended on the OPPONENT's hidden
+    cards.
+    """
+    paused = bool(getattr(source, "is_resolution_paused", False))
+    if not paused:
+        sub = source.clone()
+        determinize_adapter_in_place(sub, viewer_id, rng, determinize_fn)
+        return sub
+    for i in range(max(1, int(attempts))):
+        sub = source.clone()
+        determinize_adapter_in_place(sub, viewer_id, rng, determinize_fn)
+        if sub.replay_reaches_same_pause():
+            if i:
+                _WorldStats.resampled += i
+            return sub
+    _WorldStats.resampled += max(1, int(attempts))
+    _WorldStats.fallback_true_world += 1
+    if not _WorldStats.warned:
+        _WorldStats.warned = True
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "determinized_clone: no sampled world replayed to the pending "
+            "%s pause in %d attempts; using the undetermined state for this "
+            "sub-search (counted in determinize.world_fallback_counts(); "
+            "warned once)", getattr(source, "resolution_kind", "?"),
+            attempts,
+        )
+    return source.clone()
+
+
 def determinize_adapter_in_place(
     adapter, viewer_id: int, rng: random.Random,
     determinize_fn: Callable = None,

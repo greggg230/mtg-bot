@@ -372,6 +372,32 @@ def _load_iterate_state(registry_root: Path) -> dict:
         return json.load(f)
 
 
+def resolve_lineage_action_encoding(
+    bootstrap_encoding: str, current_best_encoding: Optional[str],
+) -> str:
+    """The action encoding an iterate run self-plays, trains and evals
+    under: the bootstrap's, except that a ``current_best`` produced by
+    ``mtg_bot extend-resolution-slots`` (``canonical_v3`` on a
+    ``canonical_v2`` lineage) carries the lineage into ``canonical_v3``
+    -- it IS the bootstrap network plus resolution slots. Any other
+    disagreement is a v-chain break the run can't paper over, so it
+    raises (self-play would otherwise load current_best under the wrong
+    slot mapping)."""
+    if current_best_encoding is None or current_best_encoding == bootstrap_encoding:
+        return bootstrap_encoding
+    if (
+        bootstrap_encoding == "canonical_v2"
+        and current_best_encoding == "canonical_v3"
+    ):
+        return current_best_encoding
+    raise ValueError(
+        f"current_best uses action encoding {current_best_encoding!r} "
+        f"but the bootstrap uses {bootstrap_encoding!r}; only the "
+        f"canonical_v2 -> canonical_v3 resolution-slot extension is "
+        f"carried forward automatically"
+    )
+
+
 def _save_iterate_state(registry_root: Path, state: dict) -> None:
     """Write the iterate-loop bookkeeping atomically (tmp + replace)."""
     path = registry_root / _STATE_FILENAME
@@ -2504,6 +2530,30 @@ def main(argv=None) -> None:  # pragma: no cover
             f"current_best={state['current_best']}, "
             f"iterations_completed={state['iterations_completed']}"
         )
+        # A current_best extended with the canonical_v3 resolution
+        # slots (``mtg_bot extend-resolution-slots``) carries the
+        # lineage's encoding forward (self-play / training / eval all
+        # run canonical_v3 from here on).
+        if registry.has(state["current_best"]):
+            cb_encoding = getattr(
+                registry.load_metadata(state["current_best"]),
+                "action_encoding_version", None,
+            )
+            try:
+                lineage_encoding = resolve_lineage_action_encoding(
+                    iter_action_encoding_version, cb_encoding,
+                )
+            except ValueError as exc:
+                sys.exit(f"[iterate] {exc}")
+            if lineage_encoding != iter_action_encoding_version:
+                print(
+                    f"[iterate] action_encoding_version: current_best "
+                    f"{state['current_best']} is {lineage_encoding} "
+                    f"(resolution-slot extension of the "
+                    f"{iter_action_encoding_version} lineage); running "
+                    f"this cycle under {lineage_encoding}"
+                )
+                iter_action_encoding_version = lineage_encoding
         # Slice G: detect a clearly-mismatched resume where
         # ``current_best`` in the state file is on a different
         # architecture lineage than the iter is being told to run.

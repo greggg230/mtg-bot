@@ -59,7 +59,7 @@ from mtg_bot.search._lethal_detect import detect_lethal_attack
 from mtg_bot.search.budget import Budget
 from mtg_bot.search.combat_decisions import AttackerDecision
 from mtg_bot.search.determinize import (
-    determinize as _default_determinize, determinize_adapter_in_place,
+    determinize as _default_determinize, determinized_clone,
 )
 from mtg_bot.search.engine_adapter import MtgGameStateAdapter
 from mtg_bot.search.evaluator import Evaluator
@@ -872,16 +872,15 @@ class ISMCTS(SearchStrategy):
         resolution-pause bookkeeping; in-place determinization
         permutes hidden-zone printings without re-running step entry.
         """
-        sub = source.clone()
         # Independent rng per iteration so iterations are reproducible
         # from the outer rng alone. At a resolution pause the helper
-        # also pins revealed cards and re-takes the pre-action
-        # snapshot (see ``determinize_adapter_in_place``).
+        # also pins the decider's known cards, re-takes the pre-action
+        # snapshot and checks the world replays to the same pause
+        # (see ``determinized_clone``).
         sub_seed = self.rng.randrange(1 << 62)
-        determinize_adapter_in_place(
-            sub, viewer, random.Random(sub_seed), self._determinize,
+        return determinized_clone(
+            source, viewer, random.Random(sub_seed), self._determinize,
         )
-        return sub
 
     def _grow_union_mask(
         self,
