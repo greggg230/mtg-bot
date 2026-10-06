@@ -635,8 +635,22 @@ class StructuredModel(nn.Module):
     def forward(
         self,
         batch: dict[str, torch.Tensor],
+        *,
+        policy_slot_range: Optional[tuple[int, int]] = None,
     ) -> dict[str, torch.Tensor]:
         """Run the full trunk + heads on a packed-batch dict.
+
+        ``policy_slot_range=(lo, hi)`` runs the policy decoder for slot
+        queries ``lo .. hi-1`` only and returns ``policy_logits`` of
+        shape ``(B, hi - lo)``. Each slot query attends independently,
+        so the logits equal the corresponding columns of the full
+        forward; inference uses it to score only the slot family that
+        can be legal (the 517 priority / combat slots at a priority
+        moment, the ``canonical_v3`` resolution block at a
+        resolution pause -- ``docs/RESOLUTION_DECISIONS.md`` §7). The
+        range ``(0, 517)`` on an extended v2 checkpoint is the exact
+        computation the unextended checkpoint ran. ``None`` (training,
+        default) scores every slot.
 
         Required keys in ``batch``:
 
@@ -724,7 +738,16 @@ class StructuredModel(nn.Module):
         # The slot queries are shared across the batch — we expand to
         # B and run cross-attention against the trunk output.
         batch_size = trunk_out.shape[0]
-        slot_q = self.policy_slot_queries.unsqueeze(0).expand(
+        queries = self.policy_slot_queries
+        if policy_slot_range is not None:
+            lo, hi = policy_slot_range
+            if not (0 <= lo < hi <= queries.shape[0]):
+                raise ValueError(
+                    f"policy_slot_range {policy_slot_range!r} outside "
+                    f"[0, {queries.shape[0]}]"
+                )
+            queries = queries[lo:hi]
+        slot_q = queries.unsqueeze(0).expand(
             batch_size, -1, -1,
         )
         # Trunk output rows are keys/values. Mask out padding so the

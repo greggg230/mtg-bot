@@ -811,7 +811,37 @@ class NNEvaluator(Evaluator):
         # first ``legal_action_mask`` call. Validation goes via the
         # action_encoding module's helper to keep the supported set
         # definition single-sourced.
-        _action_encoding()._check_version(action_encoding_version)
+        ae = _action_encoding()
+        ae._check_version(action_encoding_version)
+        # Policy-head width is a property of the action-encoding
+        # version (517 for positional_v1 / canonical_v2, 797+ for
+        # canonical_v3 -- ``action_encoding.action_vocab_size``).
+        self.action_vocab_size = ae.action_vocab_size(action_encoding_version)
+        if (
+            structured_action_vocab_size is not None
+            and int(structured_action_vocab_size) != self.action_vocab_size
+        ):
+            raise ValueError(
+                f"structured_action_vocab_size={structured_action_vocab_size}"
+                f" disagrees with action_encoding_version="
+                f"{action_encoding_version!r} ({self.action_vocab_size} "
+                f"slots); the checkpoint metadata is inconsistent"
+            )
+        if (
+            ae.has_resolution_slots(action_encoding_version)
+            and architecture != ARCHITECTURE_STRUCTURED
+        ):
+            raise ValueError(
+                f"action_encoding_version={action_encoding_version!r} is "
+                f"only supported by the structured architecture (the MLP "
+                f"policy heads are {ae.ACTION_VOCAB_SIZE} wide)"
+            )
+        # The resolution block is scored only at resolution pauses
+        # (``_policy_slot_range``); None for versions without one.
+        self._resolution_slot_range = (
+            (ae.SLOT_RESOLUTION_BASE, self.action_vocab_size)
+            if ae.has_resolution_slots(action_encoding_version) else None
+        )
         self.device = torch.device(device)
         # ``is_structured`` is the per-call branch the evaluate /
         # batch_evaluate / evaluate_with_policy / ... paths consult.
@@ -841,7 +871,7 @@ class NNEvaluator(Evaluator):
                 hidden_dim=structured_hidden_dim,
                 action_history_n=structured_action_history_n,
                 n_printings=structured_n_printings,
-                action_vocab_size=structured_action_vocab_size,
+                action_vocab_size=self.action_vocab_size,
                 enable_hand_belief_head=(
                     structured_enable_hand_belief_head
                 ),
@@ -1057,7 +1087,7 @@ class NNEvaluator(Evaluator):
                 "NNEvaluator construction"
             )
         ae = _action_encoding()
-        vocab_size = ae.ACTION_VOCAB_SIZE
+        vocab_size = self.action_vocab_size
         # Terminal short-circuit. Mirrors Evaluator.evaluate: +1 if the
         # asked-for player won, -1 if they lost, 0 for a draw. Policy
         # is the all-zeros vector (no legal action at a terminal).
@@ -1077,20 +1107,27 @@ class NNEvaluator(Evaluator):
             state, player_id, version=self.action_encoding_version,
         )
         if self.is_structured:
+            lo, hi = self._policy_slot_range([state], [mask_np])
             values_t, logits_t = self._structured_forward(
-                [state], player_id,
+                [state], player_id, policy_slot_range=(lo, hi),
             )
             value = float(values_t[0].item())
             row_logits = logits_t[0]
-            mask_t = torch.from_numpy(mask_np).to(self.device)
+            sub_mask = mask_np[lo:hi]
+            mask_t = torch.from_numpy(sub_mask).to(self.device)
             masked = row_logits.masked_fill(~mask_t, float("-inf"))
-            if not mask_np.any():
+            if not sub_mask.any():
                 policy = np.zeros(vocab_size, dtype=np.float32)
             else:
                 policy_t = F.softmax(masked, dim=-1)
-                policy = policy_t.cpu().numpy().astype(
+                sub_policy = policy_t.cpu().numpy().astype(
                     np.float32, copy=False,
                 )
+                if (lo, hi) == (0, vocab_size):
+                    policy = sub_policy
+                else:
+                    policy = np.zeros(vocab_size, dtype=np.float32)
+                    policy[lo:hi] = sub_policy
             return value, policy
         engine = self._engine_state(state)
         features = extract_features(engine, player_id)
@@ -1143,7 +1180,7 @@ class NNEvaluator(Evaluator):
                 "at NNEvaluator construction"
             )
         ae = _action_encoding()
-        vocab_size = ae.ACTION_VOCAB_SIZE
+        vocab_size = self.action_vocab_size
         out: list[tuple[float, np.ndarray]] = [
             (0.0, np.zeros(vocab_size, dtype=np.float32))
             for _ in states
@@ -1189,13 +1226,17 @@ class NNEvaluator(Evaluator):
             eval_counters.record_nn_eval(len(nonterminal_indices))
         if self.is_structured:
             if nonterminal_states:
+                lo, hi = self._policy_slot_range(
+                    nonterminal_states, nonterminal_masks,
+                )
                 values_t, logits_t = self._structured_forward(
                     nonterminal_states, player_id,
+                    policy_slot_range=(lo, hi),
                 )
                 values = values_t.tolist()
                 logits_np = logits_t.cpu().numpy()
                 for k, idx in enumerate(nonterminal_indices):
-                    mask_np = nonterminal_masks[k]
+                    mask_np = nonterminal_masks[k][lo:hi]
                     if not mask_np.any():
                         policy = np.zeros(
                             vocab_size, dtype=np.float32,
@@ -1205,9 +1246,14 @@ class NNEvaluator(Evaluator):
                         row[~mask_np] = -np.inf
                         row -= row.max()
                         exp = np.exp(row)
-                        policy = (exp / exp.sum()).astype(
+                        sub_policy = (exp / exp.sum()).astype(
                             np.float32, copy=False,
                         )
+                        if (lo, hi) == (0, vocab_size):
+                            policy = sub_policy
+                        else:
+                            policy = np.zeros(vocab_size, dtype=np.float32)
+                            policy[lo:hi] = sub_policy
                     out[idx] = (values[k], policy)
             return out
 
@@ -1269,8 +1315,7 @@ class NNEvaluator(Evaluator):
                 "evaluate_logits requires with_policy=True at "
                 "NNEvaluator construction"
             )
-        ae = _action_encoding()
-        vocab_size = ae.ACTION_VOCAB_SIZE
+        vocab_size = self.action_vocab_size
         if state.is_terminal():
             winner = state.winner()
             if winner is None:
@@ -1315,8 +1360,7 @@ class NNEvaluator(Evaluator):
                 "batch_evaluate_logits requires with_policy=True at "
                 "NNEvaluator construction"
             )
-        ae = _action_encoding()
-        vocab_size = ae.ACTION_VOCAB_SIZE
+        vocab_size = self.action_vocab_size
         out: list[tuple[float, np.ndarray]] = [
             (0.0, np.zeros(vocab_size, dtype=np.float32))
             for _ in states
@@ -1378,10 +1422,43 @@ class NNEvaluator(Evaluator):
     # Structured-architecture forward pipeline
     # ----------------------------------------------------------------
 
+    def _policy_slot_range(
+        self, states: Sequence[GameState], masks: Sequence[np.ndarray],
+    ) -> tuple[int, int]:
+        """Slot range the policy decoder must score for a batch.
+
+        Versions without a resolution block: the full width. With one
+        (``canonical_v3``): the base 517 slots when no state in the
+        batch is at a resolution pause, the resolution block when all
+        are, the full width for a mixed batch. A mask with legal bits
+        outside the chosen range (never produced by
+        ``legal_action_mask``) falls back to the full width rather
+        than dropping them. See ``docs/RESOLUTION_DECISIONS.md`` §7.
+        """
+        full = (0, self.action_vocab_size)
+        res = self._resolution_slot_range
+        if res is None:
+            return full
+        paused = [
+            bool(getattr(s, "_resolution_paused", False)) for s in states
+        ]
+        if all(paused):
+            rng = res
+        elif not any(paused):
+            rng = (0, res[0])
+        else:
+            return full
+        lo, hi = rng
+        for m in masks:
+            if m[:lo].any() or m[hi:].any():
+                return full
+        return rng
+
     def _structured_forward(
         self,
         states: Sequence[GameState],
         viewer_id: PlayerID,
+        policy_slot_range: Optional[tuple[int, int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize each state, collate into a padded batch, and run
         the structured model.
@@ -1391,10 +1468,11 @@ class NNEvaluator(Evaluator):
         - ``values`` is a 1-D ``FloatTensor`` of length ``len(states)``
           in ``[-1, +1]`` (the trunk's value head is tanh-activated).
         - ``policy_logits`` is a ``FloatTensor`` of shape
-          ``(B, ACTION_VOCAB_SIZE)`` — raw logits straight off the
-          cross-attention policy decoder. Callers mask + softmax
-          themselves (matching the pre-existing dual-head MLP path's
-          contract).
+          ``(B, action_vocab_size)`` — raw logits straight off the
+          cross-attention policy decoder — or ``(B, hi - lo)`` for the
+          slots ``policy_slot_range=(lo, hi)`` selects. Callers mask +
+          softmax themselves (matching the pre-existing dual-head MLP
+          path's contract).
 
         All terminal-state short-circuiting is the caller's
         responsibility — this helper assumes every state in ``states``
@@ -1436,7 +1514,15 @@ class NNEvaluator(Evaluator):
             token_dicts, device=self.device,
         )
         with torch.no_grad():
-            out = self.model(batch)
+            if (
+                policy_slot_range is None
+                or tuple(policy_slot_range) == (0, self.action_vocab_size)
+            ):
+                out = self.model(batch)
+            else:
+                out = self.model(
+                    batch, policy_slot_range=tuple(policy_slot_range),
+                )
         values = out["value"]
         if values.dim() == 0:
             # Single-element batch on some PyTorch versions returns a
