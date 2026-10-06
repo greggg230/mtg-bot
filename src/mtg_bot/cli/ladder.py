@@ -115,6 +115,57 @@ def split_calibration_modifier(label: str) -> tuple[str, bool]:
         raise ValueError(f"{label!r}: '+{NOCAL_MODIFIER}' given twice")
     return "+".join(kept), n_nocal == 0
 
+# ``<label>+boardonly``: the seat's search does not imagine the
+# opponent's hidden cards -- every opponent hand / library card it
+# can't see becomes an inert placeholder in each PIMC world
+# (``opponent_hidden_model="board_only"``, see
+# ``mtg_bot.search.determinize``). ``<label>+s<K>``: K determinizations
+# sharing the ladder's TOTAL node budget (``--nodes`` x ``--samples``),
+# i.e. ``inner_nodes = nodes * samples // K`` -- ``+s1`` gives one world
+# every node. Both compose with every other modifier and work for
+# ``heuristic`` too (2026-10-05).
+BOARD_ONLY_MODIFIER = "boardonly"
+
+
+def split_search_modifiers(
+    label: str, *, nodes: int, samples: int,
+) -> tuple[str, str, int, int]:
+    """Strip ``+boardonly`` / ``+s<K>`` from ``label``.
+
+    Returns ``(label_without_them, opponent_hidden_model, samples,
+    inner_nodes)`` where the last two are the seat's PIMC shape:
+    unchanged ``(samples, nodes)`` without ``+s<K>``, else ``(K,
+    nodes * samples // K)`` (total node budget preserved). Each
+    modifier may appear once; ``K`` must be >= 1 and leave >= 1 node
+    per world.
+    """
+    parts = label.split("+")
+    kept = [parts[0]]
+    model = "sampled"
+    k: Optional[int] = None
+    for mod in parts[1:]:
+        if mod == BOARD_ONLY_MODIFIER:
+            if model != "sampled":
+                raise ValueError(f"{label!r}: '+{BOARD_ONLY_MODIFIER}' given twice")
+            model = "board_only"
+        elif len(mod) > 1 and mod[0] == "s" and mod[1:].isdigit():
+            if k is not None:
+                raise ValueError(f"{label!r}: more than one '+s<K>' modifier")
+            k = int(mod[1:])
+            if k < 1:
+                raise ValueError(f"{label!r}: '+s<K>' needs K >= 1")
+        else:
+            kept.append(mod)
+    if k is None:
+        return "+".join(kept), model, samples, nodes
+    inner = (nodes * samples) // k
+    if inner < 1:
+        raise ValueError(
+            f"{label!r}: {k} worlds leave no node each "
+            f"(total budget {nodes} x {samples})"
+        )
+    return "+".join(kept), model, k, inner
+
 RESULTS_FILENAME = "results.json"
 REPORT_FILENAME = "ladder.md"
 DEFAULT_GAMES = 500
@@ -177,6 +228,16 @@ def resolve_agent(
     )
 
     version, apply_value_calibration = split_calibration_modifier(label)
+    # ``+boardonly`` / ``+s<K>`` reshape this seat's search only.
+    stripped, opponent_hidden_model, samples, nodes = split_search_modifiers(
+        version, nodes=nodes, samples=samples,
+    )
+    if stripped != version and stripped.split("+")[0] == RANDOM_LABEL:
+        raise ValueError(
+            f"{label!r}: '+{BOARD_ONLY_MODIFIER}' / '+s<K>' reshape a "
+            f"search; '{RANDOM_LABEL}' does not search"
+        )
+    version = stripped
     if not apply_value_calibration and version.split("+")[0] in (
         RANDOM_LABEL, HEURISTIC_LABEL,
     ):
@@ -199,6 +260,7 @@ def resolve_agent(
         cfg = PimcConfig(
             samples=samples, inner_nodes=nodes,
             heuristic=HeuristicConfig(), batch_size=batch or 1,
+            opponent_hidden_model=opponent_hidden_model,
         )
         return AgentSpec(
             label=label, factory=cfg.build,
@@ -238,6 +300,7 @@ def resolve_agent(
         policy_hidden_sizes=policy_hidden,
         action_encoding_version=meta.action_encoding_version,
         apply_value_calibration=apply_value_calibration,
+        opponent_hidden_model=opponent_hidden_model,
     )
     if variant == "heurvalue":
         from mtg_bot.search.hybrid_evaluator import HybridPimcConfig
@@ -767,7 +830,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Participants: 'random', 'heuristic', and/or registered "
             "version labels (e.g. v5 v13s). Required unless --resume "
-            "(then defaults to the resumed run's agents)."
+            "(then defaults to the resumed run's agents). Search "
+            "modifiers after '+': b<N> (leaf batch), nocal, valueonly / "
+            "heurvalue, boardonly (don't imagine the opponent's hidden "
+            "cards), s<K> (K worlds sharing nodes x samples), e.g. "
+            "v30+b1+boardonly+s1."
         ),
     )
     p.add_argument(
